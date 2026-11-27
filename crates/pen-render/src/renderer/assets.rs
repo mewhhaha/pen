@@ -173,6 +173,20 @@ pub(super) fn texture_from(
     format: wgpu::TextureFormat,
     mipmapped: bool,
 ) -> Result<wgpu::Texture> {
+    texture_from_batched(device, queue, mipmaps, None, (width, height), pixels, format, mipmapped)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn texture_from_batched(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    mipmaps: &mut Mipmapper,
+    mip_encoder: Option<&mut Option<wgpu::CommandEncoder>>,
+    (width, height): (u32, u32),
+    pixels: &[u8],
+    format: wgpu::TextureFormat,
+    mipmapped: bool,
+) -> Result<wgpu::Texture> {
     let limit = device.limits().max_texture_dimension_2d;
     ensure!(width <= limit && height <= limit, "texture exceeds device dimensions");
     let levels = if mipmapped { mip_levels(width, height) } else { 1 };
@@ -200,7 +214,14 @@ pub(super) fn texture_from(
         extent(width, height),
     );
     if levels > 1 {
-        mipmaps.generate(device, queue, &texture);
+        if let Some(slot) = mip_encoder {
+            let encoder = slot.get_or_insert_with(|| {
+                device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("mipmaps_batch") })
+            });
+            mipmaps.encode(device, encoder, &texture);
+        } else {
+            mipmaps.generate(device, queue, &texture);
+        }
     }
     Ok(texture)
 }
@@ -271,10 +292,10 @@ impl State {
     }
 
     /// Takes in one thing the loader brought.
-    pub(super) fn take(&mut self, message: Message, now: f64) {
+    pub(super) fn take(&mut self, message: Message, now: f64, mip_encoder: &mut Option<wgpu::CommandEncoder>) {
         match message {
             Message::Loaded { slot, revision, early, result } => {
-                let prepared = result.and_then(|loaded| self.prepare(slot, revision, early, loaded, now));
+                let prepared = result.and_then(|loaded| self.prepare(slot, revision, early, loaded, now, mip_encoder));
                 match prepared {
                     // A packed texture finishes loading once its first levels are in.
                     Ok(None) => {}
@@ -376,8 +397,12 @@ impl State {
 
     /// Takes in whatever the loader has brought since the last frame.
     pub(super) fn receive(&mut self, now: f64) {
+        let mut mip_encoder: Option<wgpu::CommandEncoder> = None;
         while let Ok(message) = self.loader.results.try_recv() {
-            self.take(message, now);
+            self.take(message, now, &mut mip_encoder);
+        }
+        if let Some(encoder) = mip_encoder {
+            self.queue.submit([encoder.finish()]);
         }
         // Assets whose error scopes came back since the last frame.
         let mut index = 0;
@@ -411,7 +436,14 @@ impl State {
         };
         let Some(message) = message else { return false };
         let now = self.now();
-        self.take(message, now);
+        let mut mip_encoder: Option<wgpu::CommandEncoder> = None;
+        self.take(message, now, &mut mip_encoder);
+        while let Ok(more) = self.loader.results.try_recv() {
+            self.take(more, now, &mut mip_encoder);
+        }
+        if let Some(encoder) = mip_encoder {
+            self.queue.submit([encoder.finish()]);
+        }
         self.receive(now);
         true
     }
@@ -425,6 +457,7 @@ impl State {
         early: bool,
         loaded: Loaded,
         now: f64,
+        mip_encoder: &mut Option<wgpu::CommandEncoder>,
     ) -> Result<Option<(GpuAsset, Option<shader::Check>)>, String> {
         let device = self.device.clone();
         match loaded {
@@ -666,10 +699,11 @@ impl State {
                 let id = self.view_id();
                 let (queue, mipmaps) = (&self.queue, &mut self.mipmaps);
                 let (texture, check) = shader::scoped(&device, || {
-                    texture_from(
+                    texture_from_batched(
                         &device,
                         queue,
                         mipmaps,
+                        Some(mip_encoder),
                         (image.width, image.height),
                         &image.pixels,
                         wgpu::TextureFormat::Rgba8UnormSrgb,
@@ -805,7 +839,6 @@ impl State {
                     match levels.try_recv() {
                         Ok(LevelMessage::Level(level)) => {
                             upload_level(&self.queue, &texture.texture, &level);
-                            (texture.view, texture.linear) = texture_views(&texture.texture, level.level);
                             texture.resident = level.level;
                             new_views = true;
                             // A level nobody saw the coarser one before needs
@@ -823,6 +856,9 @@ impl State {
                         }
                         Err(TryRecvError::Empty) => break,
                     }
+                }
+                if new_views {
+                    (texture.view, texture.linear) = texture_views(&texture.texture, texture.resident);
                 }
             } else {
                 ended = true;

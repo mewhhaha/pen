@@ -230,26 +230,26 @@ impl State {
 
         // Binding 4 holds standalone layer / emissive / ORM texture, or the GPU-packed 4x3 SurfaceMapAtlas.
         let (mut outline, mut outline_setting, tile_mask) = if needs_atlas {
-            let mut key: Vec<(u32, u64, u64)> = Vec::new();
+            let mut key = [(0u64, 0u64); 12];
             let view_id =
                 |slot: Option<usize>| -> u64 { slot.map_or(0, |s| self.texture(TextureRef::Slot(s)).view_id) };
-            let push_pair = |key: &mut Vec<(u32, u64, u64)>, tile: SurfaceTile, a: Option<usize>, b: Option<usize>| {
+            let set_pair = |key: &mut [(u64, u64); 12], tile: SurfaceTile, a: Option<usize>, b: Option<usize>| {
                 if a.is_some() || b.is_some() {
-                    key.push((tile as u32, view_id(a), view_id(b)));
+                    key[tile as usize] = (view_id(a), view_id(b));
                 }
             };
-            push_pair(&mut key, SurfaceTile::Orm, loaded_orm, None);
-            push_pair(&mut key, SurfaceTile::Emissive, loaded_emissive, None);
-            push_pair(&mut key, SurfaceTile::Layer, loaded_outline, None);
-            push_pair(&mut key, SurfaceTile::Clearcoat, loaded_cc, loaded_ccr);
-            push_pair(&mut key, SurfaceTile::ClearcoatNormal, loaded_ccn, None);
-            push_pair(&mut key, SurfaceTile::Sheen, loaded_sheen_c, loaded_sheen_r);
-            push_pair(&mut key, SurfaceTile::Anisotropy, loaded_aniso, None);
-            push_pair(&mut key, SurfaceTile::Transmission, loaded_trans, loaded_thick);
-            push_pair(&mut key, SurfaceTile::Specular, loaded_spec_c, loaded_spec);
-            push_pair(&mut key, SurfaceTile::Iridescence, loaded_irid, None);
-            push_pair(&mut key, SurfaceTile::Lightmap, loaded_lm, None);
-            push_pair(&mut key, SurfaceTile::LightmapDir, loaded_lm_dir, None);
+            set_pair(&mut key, SurfaceTile::Orm, loaded_orm, None);
+            set_pair(&mut key, SurfaceTile::Emissive, loaded_emissive, None);
+            set_pair(&mut key, SurfaceTile::Layer, loaded_outline, None);
+            set_pair(&mut key, SurfaceTile::Clearcoat, loaded_cc, loaded_ccr);
+            set_pair(&mut key, SurfaceTile::ClearcoatNormal, loaded_ccn, None);
+            set_pair(&mut key, SurfaceTile::Sheen, loaded_sheen_c, loaded_sheen_r);
+            set_pair(&mut key, SurfaceTile::Anisotropy, loaded_aniso, None);
+            set_pair(&mut key, SurfaceTile::Transmission, loaded_trans, loaded_thick);
+            set_pair(&mut key, SurfaceTile::Specular, loaded_spec_c, loaded_spec);
+            set_pair(&mut key, SurfaceTile::Iridescence, loaded_irid, None);
+            set_pair(&mut key, SurfaceTile::Lightmap, loaded_lm, None);
+            set_pair(&mut key, SurfaceTile::LightmapDir, loaded_lm_dir, None);
 
             let (atlas_idx, tile_mask) = if let Some(&(idx, mask)) = self.surface_atlas_ids.get(&key) {
                 (idx, mask)

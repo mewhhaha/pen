@@ -170,7 +170,7 @@ impl TerrainPipeline {
                 })],
             }),
             multiview_mask: None,
-            cache: None,
+            cache: crate::pipeline_cache::active().as_ref(),
         });
         let align = device.limits().min_uniform_buffer_offset_alignment.max(256);
         let uniform_stride = (std::mem::size_of::<TerrainUniform>() as u32).next_multiple_of(align);
@@ -452,7 +452,7 @@ impl WaterPipeline {
                 })],
             }),
             multiview_mask: None,
-            cache: None,
+            cache: crate::pipeline_cache::active().as_ref(),
         });
         let align = device.limits().min_uniform_buffer_offset_alignment.max(256);
         let uniform_stride = (std::mem::size_of::<WaterUniform>() as u32).next_multiple_of(align);
@@ -606,7 +606,7 @@ impl FoliagePipeline {
                 })],
             }),
             multiview_mask: None,
-            cache: None,
+            cache: crate::pipeline_cache::active().as_ref(),
         });
         let align = device.limits().min_uniform_buffer_offset_alignment.max(256);
         let uniform_stride = (std::mem::size_of::<FoliageUniform>() as u32).next_multiple_of(align);

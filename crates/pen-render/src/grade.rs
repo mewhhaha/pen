@@ -333,7 +333,7 @@ mod tests {
                 module: &module,
                 entry_point: Some("run"),
                 compilation_options: Default::default(),
-                cache: None,
+                cache: crate::pipeline_cache::active().as_ref(),
             });
             Some(Rig { device, queue, pipeline })
         }

@@ -112,7 +112,7 @@ fn renderer(
     display: pen_render::Display,
     assets: &Path,
 ) -> Result<pen_render::Renderer> {
-    pen_render::Renderer::new(
+    let mut renderer = pen_render::Renderer::new(
         device.clone(),
         queue.clone(),
         pen_render::RendererOptions {
@@ -123,7 +123,9 @@ fn renderer(
             // Compiled pipelines, kept per adapter between runs.
             pipeline_cache: dirs::cache_dir().map(|cache| cache.join("pen/pipelines")),
         },
-    )
+    )?;
+    renderer.culling_stats(false);
+    Ok(renderer)
 }
 
 impl Gpu {

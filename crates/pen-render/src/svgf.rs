@@ -218,7 +218,7 @@ impl SvgfDenoiser {
             module: &module,
             entry_point: Some("svgf_temporal"),
             compilation_options: Default::default(),
-            cache: None,
+            cache: crate::pipeline_cache::active().as_ref(),
         });
         let atrous_pipe = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("svgf_atrous_pipe"),
@@ -226,7 +226,7 @@ impl SvgfDenoiser {
             module: &module,
             entry_point: Some("svgf_atrous"),
             compilation_options: Default::default(),
-            cache: None,
+            cache: crate::pipeline_cache::active().as_ref(),
         });
         // 6 dynamic uniform slots: 1 temporal + up to 5 A-Trous iterations uploaded in one copy.
         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
@@ -412,9 +412,10 @@ impl SvgfDenoiser {
         let tbg = &st.temporal_bgs[t_slot].as_ref().unwrap().1;
         let (gx, gy) = (size.0.div_ceil(8), size.1.div_ceil(8));
         {
+            let ts = crate::renderer::timing::scope(crate::renderer::timing::Span::Scene);
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("svgf_temporal"),
-                timestamp_writes: None,
+                timestamp_writes: ts.compute(),
             });
             pass.set_pipeline(&self.temporal_pipe);
             pass.set_bind_group(0, tbg, &[0]);
@@ -460,9 +461,10 @@ impl SvgfDenoiser {
             let abg = &st.atrous_bgs[a_slot].as_ref().unwrap().1;
             let dyn_off = (1 + iter) * self.uniform_stride;
             {
+                let ts = crate::renderer::timing::scope(crate::renderer::timing::Span::Scene);
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("svgf_atrous"),
-                    timestamp_writes: None,
+                    timestamp_writes: ts.compute(),
                 });
                 pass.set_pipeline(&self.atrous_pipe);
                 pass.set_bind_group(0, abg, &[dyn_off]);

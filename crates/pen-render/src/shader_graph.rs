@@ -1512,7 +1512,7 @@ mod tests {
                 })],
             }),
             multiview_mask: None,
-            cache: None,
+            cache: crate::pipeline_cache::active().as_ref(),
         });
         let u = GraphUniform {
             time_and_params: [1.0, 0.0, 0.0, 0.0],

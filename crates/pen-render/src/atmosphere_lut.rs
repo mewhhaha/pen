@@ -315,7 +315,7 @@ impl PhysicalAtmosphere {
                 module: &module,
                 entry_point: Some(entry),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
-                cache: None,
+                cache: crate::pipeline_cache::active().as_ref(),
             })
         };
         let pipe_trans = make_pipe("transmittance_lut");
@@ -362,7 +362,7 @@ impl PhysicalAtmosphere {
             module: &cloud_module,
             entry_point: Some("main"),
             compilation_options: wgpu::PipelineCompilationOptions::default(),
-            cache: None,
+            cache: crate::pipeline_cache::active().as_ref(),
         });
         let cloud_uniform = make_ubuf("clouds_u", std::mem::size_of::<CloudUniform>() as u64);
 
@@ -557,8 +557,11 @@ impl PhysicalAtmosphere {
                         pipe: &wgpu::ComputePipeline,
                         bg: &wgpu::BindGroup,
                         (w, h): (u32, u32)| {
-            let mut pass =
-                enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(label), timestamp_writes: None });
+            let ts = crate::renderer::timing::scope(crate::renderer::timing::Span::Post);
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some(label),
+                timestamp_writes: ts.compute(),
+            });
             pass.set_pipeline(pipe);
             pass.set_bind_group(0, bg, &[]);
             pass.dispatch_workgroups(w.div_ceil(8), h.div_ceil(8), 1);
@@ -669,9 +672,10 @@ impl PhysicalAtmosphere {
         };
         encode_uniform_upload(device, encoder, &self.cloud_uniform, bytemuck::bytes_of(&u));
         let (_, _, _, _, bg) = self.cloud_tex.as_ref().unwrap();
+        let ts = crate::renderer::timing::scope(crate::renderer::timing::Span::Post);
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("volumetric_clouds"),
-            timestamp_writes: None,
+            timestamp_writes: ts.compute(),
         });
         pass.set_pipeline(&self.cloud_pipe);
         pass.set_bind_group(0, bg, &[]);

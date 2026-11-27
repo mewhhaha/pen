@@ -70,7 +70,7 @@ impl Program {
         #[cfg(feature = "devtools")]
         let gauge = memory.clone();
         #[cfg(feature = "devtools")]
-        let probe = blot_host::Probe::new();
+        let probe = blot_host::Probe::new_lazy();
         #[cfg(feature = "devtools")]
         let probing = probe.clone();
         let thread = std::thread::Builder::new()

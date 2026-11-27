@@ -64,7 +64,7 @@ fn pipeline(
         depth_stencil: None,
         multisample: Default::default(),
         multiview_mask: None,
-        cache: None,
+        cache: crate::pipeline_cache::active().as_ref(),
     })
 }
 

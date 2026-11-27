@@ -610,7 +610,7 @@ impl Render2dWiredState {
                     })],
                 }),
                 multiview_mask: None,
-                cache: None,
+                cache: crate::pipeline_cache::active().as_ref(),
             })
         });
         let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -860,7 +860,7 @@ impl State {
                                     })],
                                 }),
                                 multiview_mask: None,
-                                cache: None,
+                                cache: crate::pipeline_cache::active().as_ref(),
                             });
                             let viewport_buf = device.create_buffer(&wgpu::BufferDescriptor {
                                 label: Some("wired_rc2d_emitter_vp"),

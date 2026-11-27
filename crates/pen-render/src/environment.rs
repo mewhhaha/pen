@@ -781,7 +781,7 @@ fn direction_at(pixel: vec2f) -> vec3f {{
                 targets: &[Some(wgpu::TextureFormat::Rgba32Float.into())],
             }),
             multiview_mask: None,
-            cache: None,
+            cache: crate::pipeline_cache::active().as_ref(),
         });
         let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,

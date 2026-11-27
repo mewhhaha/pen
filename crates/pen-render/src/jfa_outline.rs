@@ -145,7 +145,7 @@ impl JfaOutlinePass {
             module: &shader,
             entry_point: Some("init_seeds"),
             compilation_options: Default::default(),
-            cache: None,
+            cache: crate::pipeline_cache::active().as_ref(),
         });
         let jump_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("JFA jump bindings"),
@@ -166,7 +166,7 @@ impl JfaOutlinePass {
             module: &shader,
             entry_point: Some("jfa_step"),
             compilation_options: Default::default(),
-            cache: None,
+            cache: crate::pipeline_cache::active().as_ref(),
         });
         Self {
             shader,
@@ -564,8 +564,10 @@ impl JfaOutlinePass {
             self.composite_bg = Some((*seed, mask.clone(), clamped_radius, target_format, bindings));
         }
         let (_, _, _, _, bindings) = self.composite_bg.as_ref().unwrap();
+        let ts = crate::renderer::timing::scope(crate::renderer::timing::Span::Post);
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("JFA composite"),
+            timestamp_writes: ts.render(),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: target_view,
                 depth_slice: None,
@@ -598,9 +600,10 @@ impl JfaOutlinePass {
         let targets = self.targets();
         let x = targets.mask.width().div_ceil(WORKGROUP_SIZE);
         let y = targets.mask.height().div_ceil(WORKGROUP_SIZE);
+        let ts = crate::renderer::timing::scope(crate::renderer::timing::Span::Post);
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("JFA outline flood"),
-            timestamp_writes: None,
+            timestamp_writes: ts.compute(),
         });
         pass.set_pipeline(&self.init);
         pass.set_bind_group(0, init, &[]);
@@ -663,7 +666,7 @@ impl JfaOutlinePass {
                 })],
             }),
             multiview_mask: None,
-            cache: None,
+            cache: crate::pipeline_cache::active().as_ref(),
         })
     }
 
@@ -691,7 +694,7 @@ impl JfaOutlinePass {
                 })],
             }),
             multiview_mask: None,
-            cache: None,
+            cache: crate::pipeline_cache::active().as_ref(),
         })
     }
 }
@@ -873,7 +876,7 @@ mod tests {
                 multisample: Default::default(),
                 fragment: None,
                 multiview_mask: None,
-                cache: None,
+                cache: crate::pipeline_cache::active().as_ref(),
             });
             let mut pass = self.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("JFA witness occluder"),

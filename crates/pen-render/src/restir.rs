@@ -351,7 +351,7 @@ impl Pass {
             module,
             entry_point: Some(entry),
             compilation_options: Default::default(),
-            cache: None,
+            cache: crate::pipeline_cache::active().as_ref(),
         });
         Self { layout, pipeline, entry, bindings }
     }
@@ -373,8 +373,11 @@ impl Pass {
             layout: &self.layout,
             entries: &entries,
         });
-        let mut pass = encoder
-            .begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(self.entry), timestamp_writes: None });
+        let ts = crate::renderer::timing::scope(crate::renderer::timing::Span::Scene);
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some(self.entry),
+            timestamp_writes: ts.compute(),
+        });
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &group, &[]);
         pass.dispatch_workgroups(size.0.div_ceil(8), size.1.div_ceil(8), 1);
@@ -456,7 +459,7 @@ impl SharcAuxPipelines {
                 module: &module,
                 entry_point: Some(label),
                 compilation_options: Default::default(),
-                cache: None,
+                cache: crate::pipeline_cache::active().as_ref(),
             })
         };
         Self {
@@ -842,9 +845,10 @@ impl RestirRenderer {
                         wgpu::BindGroupEntry { binding: 7, resource: sharc.resolved_buffer().as_entire_binding() },
                     ],
                 });
+                let ts = crate::renderer::timing::scope(crate::renderer::timing::Span::Scene);
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("restir_gi_sharc_bounce"),
-                    timestamp_writes: None,
+                    timestamp_writes: ts.compute(),
                 });
                 pass.set_pipeline(&aux.bounce_pipe);
                 pass.set_bind_group(0, &bg, &[]);
@@ -876,9 +880,10 @@ impl RestirRenderer {
                         },
                     ],
                 });
+                let ts = crate::renderer::timing::scope(crate::renderer::timing::Span::Scene);
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("restir_gi_sharc_deposit"),
-                    timestamp_writes: None,
+                    timestamp_writes: ts.compute(),
                 });
                 pass.set_pipeline(&aux.deposit_pipe);
                 pass.set_bind_group(0, &bg, &[]);

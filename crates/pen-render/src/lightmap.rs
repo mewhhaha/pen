@@ -601,7 +601,7 @@ impl GpuLightmapBaker {
                 module: &module,
                 entry_point: Some(entry),
                 compilation_options: Default::default(),
-                cache: None,
+                cache: crate::pipeline_cache::active().as_ref(),
             })
         };
         Self {

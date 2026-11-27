@@ -1063,7 +1063,7 @@ impl MeshletDagCuller {
             module: shader,
             entry_point: Some(entry_point),
             compilation_options: Default::default(),
-            cache: None,
+            cache: crate::pipeline_cache::active().as_ref(),
         })
     }
 

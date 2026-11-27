@@ -490,8 +490,10 @@ impl OitPass {
                 .entry(samples)
                 .or_insert_with(|| Self::build_composite_pipeline(device, pl, module, fmt, samples, None))
         };
+        let ts = crate::renderer::timing::scope(crate::renderer::timing::Span::Scene);
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("oit_composite"),
+            timestamp_writes: ts.render(),
             color_attachments: &[Some(attachment)],
             depth_stencil_attachment: None,
             ..Default::default()
@@ -566,7 +568,7 @@ mod tests {
                 targets: &oit_color_targets(),
             }),
             multiview_mask: None,
-            cache: None,
+            cache: crate::pipeline_cache::active().as_ref(),
         });
 
         let make_quad = |rgba: [f32; 4], depth: f32| {

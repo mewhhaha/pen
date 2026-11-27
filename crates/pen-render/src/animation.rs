@@ -407,14 +407,111 @@ impl Rig {
     /// The joint matrices for `layers` into `palette`: each joint's node in
     /// the mesh's space, times its inverse bind matrix.
     pub fn palette(&self, layers: &[Layer], palette: &mut Vec<Matrix>) {
-        let world = self.world(&self.pose(layers));
-        palette.clear();
-        palette.extend(
-            self.joints
-                .iter()
-                .map(|joint| multiply(&world[joint.node as usize], &joint.inverse_bind.map(f64::from)).map(narrow)),
-        );
+        let mut scratch = PoseScratch::default();
+        self.palette_with_scratch(layers, palette, &mut scratch);
     }
+
+    /// The joint matrices for `layers` into `palette`, reusing `scratch` to avoid per-draw heap allocations.
+    pub fn palette_with_scratch(&self, layers: &[Layer], palette: &mut Vec<Matrix>, scratch: &mut PoseScratch) {
+        self.pose_into(layers, scratch);
+        scratch.world.clear();
+        scratch.world.reserve(self.nodes.len().saturating_sub(scratch.world.capacity()));
+        for (node, local) in self.nodes.iter().zip(&scratch.pose) {
+            let local = local.matrix();
+            let placed = match node.parent {
+                Some(parent) => multiply(&scratch.world[parent as usize], &local),
+                None => local,
+            };
+            scratch.world.push(placed);
+        }
+        palette.clear();
+        palette.extend(self.joints.iter().map(|joint| {
+            multiply(&scratch.world[joint.node as usize], &joint.inverse_bind.map(f64::from)).map(narrow)
+        }));
+    }
+
+    /// Writes `layers`'s sampled pose into `scratch.pose`, reusing `scratch`.
+    fn pose_into(&self, layers: &[Layer], scratch: &mut PoseScratch) {
+        scratch.rest.clear();
+        scratch.rest.extend(self.nodes.iter().map(|node| node.rest));
+        scratch.layers.clear();
+        scratch.layers.extend(layers.iter().copied().filter(|layer| {
+            (layer.clip as usize) < self.clips.len() && layer.weight > 0.0 && layer.weight.is_finite()
+        }));
+        scratch.pose.clear();
+        match scratch.layers.as_slice() {
+            [] => scratch.pose.extend_from_slice(&scratch.rest),
+            [layer] => {
+                let layer = *layer;
+                self.sample_into(&scratch.rest, layer, &mut scratch.pose);
+            }
+            _ => {
+                let total: f64 = scratch.layers.iter().map(|layer| f64::from(layer.weight)).sum();
+                scratch.sums.clear();
+                scratch.sums.resize(scratch.rest.len(), [0.0f64; 10]);
+                for i in 0..scratch.layers.len() {
+                    let layer = scratch.layers[i];
+                    let weight = f64::from(layer.weight) / total;
+                    self.sample_into(&scratch.rest, layer, &mut scratch.sampled);
+                    for (sum, local) in scratch.sums.iter_mut().zip(&scratch.sampled) {
+                        // Quaternions q and -q turn alike: each is added on
+                        // the side of the first layer's.
+                        let rotation = local.rotation.map(f64::from);
+                        let aligned = (0..4).map(|axis| sum[3 + axis] * rotation[axis]).sum::<f64>() >= 0.0;
+                        let sign = if aligned { weight } else { -weight };
+                        for axis in 0..3 {
+                            sum[axis] += weight * f64::from(local.translation[axis]);
+                            sum[7 + axis] += weight * f64::from(local.scale[axis]);
+                        }
+                        for axis in 0..4 {
+                            sum[3 + axis] += sign * rotation[axis];
+                        }
+                    }
+                }
+                scratch.pose.extend(scratch.sums.iter().map(|sum| Transform {
+                    translation: [sum[0], sum[1], sum[2]].map(narrow),
+                    rotation: normalized([sum[3], sum[4], sum[5], sum[6]]),
+                    scale: [sum[7], sum[8], sum[9]].map(narrow),
+                }));
+            }
+        }
+    }
+
+    fn sample_into(&self, rest: &[Transform], layer: Layer, out: &mut Vec<Transform>) {
+        out.clear();
+        out.extend_from_slice(rest);
+        let clip = &self.clips[layer.clip as usize];
+        let time = if clip.duration > 0.0 && layer.time.is_finite() {
+            f64::from(layer.time).rem_euclid(f64::from(clip.duration))
+        } else {
+            0.0
+        };
+        for channel in &clip.channels {
+            if channel.path == Path::Weights {
+                continue;
+            }
+            let node = &mut out[channel.node as usize];
+            let mut value = [0.0; 4];
+            sample(channel, time, &mut value);
+            match channel.path {
+                Path::Translation => node.translation = [value[0], value[1], value[2]].map(narrow),
+                Path::Rotation => node.rotation = normalized(value),
+                Path::Scale => node.scale = [value[0], value[1], value[2]].map(narrow),
+                Path::Weights => {}
+            }
+        }
+    }
+}
+
+/// Reusable working storage for [`Rig::palette_with_scratch`] to avoid per-draw allocations.
+#[derive(Default)]
+pub struct PoseScratch {
+    layers: Vec<Layer>,
+    rest: Vec<Transform>,
+    sampled: Vec<Transform>,
+    pose: Vec<Transform>,
+    sums: Vec<[f64; 10]>,
+    world: Vec<[f64; 16]>,
 }
 
 fn finite_transform(transform: &Transform) -> Result<()> {

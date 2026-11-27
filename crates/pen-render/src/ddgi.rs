@@ -357,7 +357,7 @@ impl DdgiVolume {
                 module: m,
                 entry_point: Some(entry),
                 compilation_options: Default::default(),
-                cache: None,
+                cache: crate::pipeline_cache::active().as_ref(),
             })
         };
 
@@ -774,9 +774,10 @@ impl DdgiVolume {
                 ));
             }
             let (_, _, trace_bg) = self.trace_bg.as_ref().unwrap();
+            let ts = crate::renderer::timing::scope(crate::renderer::timing::Span::Scene);
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("ddgi_trace_hw"),
-                timestamp_writes: None,
+                timestamp_writes: ts.compute(),
             });
             pass.set_pipeline(pipe_hw);
             pass.set_bind_group(0, trace_bg, &[]);
@@ -829,8 +830,11 @@ impl DdgiVolume {
                 ));
             }
             let (_, _, trace_bg) = self.trace_bg.as_ref().unwrap();
-            let mut pass = encoder
-                .begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("ddgi_trace"), timestamp_writes: None });
+            let ts = crate::renderer::timing::scope(crate::renderer::timing::Span::Scene);
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("ddgi_trace"),
+                timestamp_writes: ts.compute(),
+            });
             pass.set_pipeline(&self.trace_pipe);
             pass.set_bind_group(0, trace_bg, &[]);
             pass.dispatch_workgroups(total_rays.div_ceil(64), 1, 1);
@@ -839,8 +843,11 @@ impl DdgiVolume {
         // 2. Blend interior octahedral texels into tmp atlases.
         let cols = nx * nz;
         {
-            let mut pass = encoder
-                .begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("ddgi_blend"), timestamp_writes: None });
+            let ts = crate::renderer::timing::scope(crate::renderer::timing::Span::Scene);
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("ddgi_blend"),
+                timestamp_writes: ts.compute(),
+            });
             pass.set_pipeline(&self.blend_irr_pipe);
             pass.set_bind_group(0, &self.blend_bg, &[]);
             pass.dispatch_workgroups(
@@ -860,9 +867,10 @@ impl DdgiVolume {
 
         // 3. Copy interior + wrap borders from tmp -> curr so curr is always sampling-ready!
         {
+            let ts = crate::renderer::timing::scope(crate::renderer::timing::Span::Scene);
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("ddgi_borders"),
-                timestamp_writes: None,
+                timestamp_writes: ts.compute(),
             });
             pass.set_pipeline(&self.border_irr_pipe);
             pass.set_bind_group(0, &self.border_irr_bg, &[]);

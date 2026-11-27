@@ -11,7 +11,7 @@ use std::sync::Arc;
 use pen_protocol::RenderFrame;
 
 use super::{GpuAsset, INSET_SAMPLES, Item, MeshAsset, ReadyEntry, Scratch, Shape, Source, State};
-use crate::animation::{Layer, Matrix, Rig};
+use crate::animation::{Layer, Matrix, PoseScratch, Rig};
 use crate::asset_store::Material;
 use crate::matrix::IDENTITY;
 use crate::shader::{Stage, Variants};
@@ -60,11 +60,12 @@ impl Scratch {
             for index in 1..self.pose_first.len() {
                 self.pose_first[index] += self.pose_first[index - 1];
             }
-            let mut next: Vec<u32> = self.pose_first[..total].to_vec();
+            self.group_cursor.clear();
+            self.group_cursor.extend_from_slice(&self.pose_first[..total]);
             self.pose_order.resize(frame.poses.len(), 0);
             for (index, pose) in frame.poses.iter().enumerate() {
                 if let Some(target) = self.draw_target_index(pose.inset, pose.draw) {
-                    let slot = &mut next[target];
+                    let slot = &mut self.group_cursor[target];
                     self.pose_order[*slot as usize] = u32::try_from(index).unwrap_or(u32::MAX);
                     *slot += 1;
                 }
@@ -83,11 +84,12 @@ impl Scratch {
             for index in 1..self.bone_first.len() {
                 self.bone_first[index] += self.bone_first[index - 1];
             }
-            let mut next: Vec<u32> = self.bone_first[..total].to_vec();
+            self.group_cursor.clear();
+            self.group_cursor.extend_from_slice(&self.bone_first[..total]);
             self.bone_order.resize(frame.bone_matrices.len(), 0);
             for (index, bone) in frame.bone_matrices.iter().enumerate() {
                 if let Some(target) = self.draw_target_index(bone.inset, bone.draw) {
-                    let slot = &mut next[target];
+                    let slot = &mut self.group_cursor[target];
                     self.bone_order[*slot as usize] = u32::try_from(index).unwrap_or(u32::MAX);
                     *slot += 1;
                 }
@@ -187,6 +189,7 @@ pub(super) struct Skinning {
     current: usize,
     layers: Vec<Layer>,
     palette: Vec<Matrix>,
+    pose_scratch: PoseScratch,
 }
 
 /// What became of a posed draw.
@@ -210,6 +213,7 @@ impl Skinning {
             current: 0,
             layers: Vec::new(),
             palette: Vec::new(),
+            pose_scratch: PoseScratch::default(),
         }
     }
 
@@ -241,7 +245,7 @@ impl Skinning {
             self.palette.clear();
             self.palette.resize(rig.joints.len(), IDENTITY);
         } else {
-            rig.palette(&self.layers, &mut self.palette);
+            rig.palette_with_scratch(&self.layers, &mut self.palette, &mut self.pose_scratch);
         }
         for (joint, matrix) in overrides {
             if let Some(slot) = self.palette.get_mut(joint as usize) {

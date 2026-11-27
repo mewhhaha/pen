@@ -225,6 +225,7 @@ impl Host for Shell<'_> {
             || audited
             || (has_overlay_shots && !viewport_overlay_active);
         let gpu = &mut *self.gpu;
+        gpu.renderer.culling_stats(self.overlay.is_some());
         let viewport = [gpu.size.0.max(1) as f32, gpu.size.1.max(1) as f32];
         #[cfg(feature = "devtools")]
         {
@@ -247,7 +248,7 @@ impl Host for Shell<'_> {
                 timings: &mut gpu.draw_timings,
             };
             let mut target = CaptureTarget { output, texture: texture.clone(), view: view.clone() };
-            gpu.renderer.submit(frame, catalog, &mut target)?;
+            gpu.renderer.submit_validated(frame, catalog, &mut target)?;
         }
         let clean_texture = clean_capture.map(|(texture, _)| texture);
         let overlay_texture = if separate_overlay_pass || (!need_clean_texture && has_overlay_shots) {
@@ -266,7 +267,7 @@ impl Host for Shell<'_> {
                     timings: &mut gpu.draw_timings,
                 };
                 let mut target = CaptureTarget { output, texture: texture.clone(), view };
-                gpu.renderer.submit(frame, catalog, &mut target)?;
+                gpu.renderer.submit_validated(frame, catalog, &mut target)?;
                 Some(texture)
             } else {
                 let output = Output {
@@ -279,7 +280,7 @@ impl Host for Shell<'_> {
                     timings: &mut gpu.draw_timings,
                 };
                 let mut target = SurfaceTarget { output, texture: None };
-                gpu.renderer.submit(frame, catalog, &mut target)?;
+                gpu.renderer.submit_validated(frame, catalog, &mut target)?;
                 target.present();
                 None
             }
@@ -297,7 +298,7 @@ impl Host for Shell<'_> {
                 timings: &mut gpu.draw_timings,
             };
             let mut target = SurfaceTarget { output, texture: None };
-            gpu.renderer.submit(frame, catalog, &mut target)?;
+            gpu.renderer.submit_validated(frame, catalog, &mut target)?;
             target.present();
             None
         } else {

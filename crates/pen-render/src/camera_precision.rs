@@ -268,7 +268,7 @@ mod tests {
                     })],
                 }),
                 multiview_mask: None,
-                cache: None,
+                cache: crate::pipeline_cache::active().as_ref(),
             });
             let color_tex = device.create_texture(&wgpu::TextureDescriptor {
                 label: None,

@@ -411,7 +411,7 @@ impl SvgfRtState {
             module: &module,
             entry_point: Some("prep"),
             compilation_options: Default::default(),
-            cache: None,
+            cache: crate::pipeline_cache::active().as_ref(),
         });
         let prep_u = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("svgf_rt_prep_u"),
@@ -519,7 +519,7 @@ impl WiredPasses {
                     })],
                 }),
                 multiview_mask: None,
-                cache: None,
+                cache: crate::pipeline_cache::active().as_ref(),
             });
             let uniform = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("rt_comp_u"),
@@ -918,9 +918,10 @@ impl State {
             }
             let (_, prep_bg) = bufs.prep_bgs[curr].as_ref().unwrap();
             {
+                let ts = crate::renderer::timing::scope(crate::renderer::timing::Span::Scene);
                 let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("svgf_rt_prep"),
-                    timestamp_writes: None,
+                    timestamp_writes: ts.compute(),
                 });
                 pass.set_pipeline(&svgf.prep_pipe);
                 pass.set_bind_group(0, prep_bg, &[]);

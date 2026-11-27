@@ -128,7 +128,7 @@ impl RadianceCascades2d {
                 module: &shader,
                 entry_point: Some(name),
                 compilation_options: Default::default(),
-                cache: None,
+                cache: crate::pipeline_cache::active().as_ref(),
             })
         };
         let packet_buffer = |label, size| {

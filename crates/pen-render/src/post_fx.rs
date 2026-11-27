@@ -253,7 +253,7 @@ impl TaauUpscaler {
             module: &module,
             entry_point: Some("taau_upscale"),
             compilation_options: Default::default(),
-            cache: None,
+            cache: crate::pipeline_cache::active().as_ref(),
         });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("taau_sampler"),
@@ -457,9 +457,10 @@ impl TaauUpscaler {
         }
         let bg = &self.cached_bgs[read_idx].as_ref().unwrap().1;
         {
+            let ts = crate::renderer::timing::scope(crate::renderer::timing::Span::Post);
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("taau_upscale"),
-                timestamp_writes: None,
+                timestamp_writes: ts.compute(),
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, bg, &[]);
@@ -532,7 +533,7 @@ impl FsrEasuUpscaler {
             module: &module,
             entry_point: Some("easu_upscale"),
             compilation_options: Default::default(),
-            cache: None,
+            cache: crate::pipeline_cache::active().as_ref(),
         });
         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("easu_u"),
@@ -608,8 +609,11 @@ impl FsrEasuUpscaler {
             self.cached_bg = Some((input.clone(), bg));
         }
         let bg = &self.cached_bg.as_ref().unwrap().1;
-        let mut pass = encoder
-            .begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("easu_upscale"), timestamp_writes: None });
+        let ts = crate::renderer::timing::scope(crate::renderer::timing::Span::Post);
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("easu_upscale"),
+            timestamp_writes: ts.compute(),
+        });
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, bg, &[]);
         pass.dispatch_workgroups(out_size.0.div_ceil(8), out_size.1.div_ceil(8), 1);
@@ -678,7 +682,7 @@ impl RcasSharpener {
             module: &module,
             entry_point: Some("rcas_sharpen"),
             compilation_options: Default::default(),
-            cache: None,
+            cache: crate::pipeline_cache::active().as_ref(),
         });
         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("rcas_u"),
@@ -764,8 +768,11 @@ impl RcasSharpener {
             self.cached_bg = Some((input.clone(), bg));
         }
         let bg = &self.cached_bg.as_ref().unwrap().1;
-        let mut pass = encoder
-            .begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("rcas_sharpen"), timestamp_writes: None });
+        let ts = crate::renderer::timing::scope(crate::renderer::timing::Span::Post);
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("rcas_sharpen"),
+            timestamp_writes: ts.compute(),
+        });
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, bg, &[]);
         pass.dispatch_workgroups(size.0.div_ceil(8), size.1.div_ceil(8), 1);
@@ -907,7 +914,7 @@ impl PostFxPass {
             module: &module,
             entry_point: Some("post_fx"),
             compilation_options: Default::default(),
-            cache: None,
+            cache: crate::pipeline_cache::active().as_ref(),
         });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("post_fx_linear"),
@@ -1028,8 +1035,11 @@ impl PostFxPass {
             self.cached_bg = Some(([color_in.clone(), depth_in.clone()], bg));
         }
         let bg = &self.cached_bg.as_ref().unwrap().1;
-        let mut pass =
-            encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("post_fx"), timestamp_writes: None });
+        let ts = crate::renderer::timing::scope(crate::renderer::timing::Span::Post);
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("post_fx"),
+            timestamp_writes: ts.compute(),
+        });
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, bg, &[]);
         pass.dispatch_workgroups(size.0.div_ceil(8), size.1.div_ceil(8), 1);

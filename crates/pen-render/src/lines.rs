@@ -825,7 +825,7 @@ fn create_pipeline(
             })],
         }),
         multiview_mask: None,
-        cache: None,
+        cache: crate::pipeline_cache::active().as_ref(),
     })
 }
 
@@ -1012,7 +1012,7 @@ mod tests {
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
-            cache: None,
+            cache: crate::pipeline_cache::active().as_ref(),
             multiview_mask: None,
         })
     }

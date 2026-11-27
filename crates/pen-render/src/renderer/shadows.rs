@@ -7,7 +7,7 @@
 // (local_shadows.rs) are layers of another, bound with the lights at group 2.
 // A frame that asks for contact shadows also draws its casters' depth from
 // the camera into a texture of the scene's size (binding 9).
-use pen_protocol::RenderFrame;
+use pen_protocol::{Matrix, RenderFrame};
 
 use super::cascades::{Cascade, cascades};
 use super::timing::Span;
@@ -40,10 +40,21 @@ pub(super) fn scene_floats_at(
     count: usize,
     elapsed_s: f32,
 ) -> Floats<SCENE_FLOATS> {
+    scene_floats_with(frame, maps, count, elapsed_s, None, 0.0)
+}
+
+pub(super) fn scene_floats_with(
+    frame: &RenderFrame,
+    maps: &[Cascade; MAX_CASCADES],
+    count: usize,
+    elapsed_s: f32,
+    projection: Option<&Matrix>,
+    mip_bias: f32,
+) -> Floats<SCENE_FLOATS> {
     let sun = frame.shadow.texels > 0 && count > 0;
     let texel = 1.0 / frame.shadow.texels.max(1) as f32;
     let mut scene = Floats::<SCENE_FLOATS>::new();
-    scene.extend(frame.view).extend(frame.projection);
+    scene.extend(frame.view).extend(*projection.unwrap_or(&frame.projection));
     lighting(&mut scene, &frame.ambient, &frame.light_direction, &frame.light_color);
     // Binding 1's map, the farthest, for shaders that read the game's alone.
     let last = &maps[count.max(1) - 1];
@@ -53,7 +64,7 @@ pub(super) fn scene_floats_at(
     // The maps: how many, the band they blend over, the filter and the
     // contact shadow's steps; what each sees, and each one's texel in
     // texture coordinates and in the world, where its slice ends and its
-    // depth range; then the soft shadows' settings and elapsed renderer time.
+    // depth range; then the soft shadows' settings, elapsed renderer time, and FSR mip bias.
     let contact = if sun { frame.shadow.contact } else { 0 };
     #[allow(clippy::cast_precision_loss, reason = "at most MAX_CASCADES")]
     scene.extend([count as f32, BAND, frame.shadow.filter as f32, contact as f32]);
@@ -64,7 +75,7 @@ pub(super) fn scene_floats_at(
         let range = if map.projection[10] != 0.0 { 1.0 / map.projection[10].abs() } else { 0.0 };
         scene.extend([texel, map.texel, map.far, range]);
     }
-    scene.extend([frame.shadow.softness, frame.shadow.contact_length, elapsed_s, 0.0]);
+    scene.extend([frame.shadow.softness, frame.shadow.contact_length, elapsed_s, mip_bias]);
     scene
 }
 
@@ -336,7 +347,16 @@ impl State {
         self.local = local;
     }
 
-    /// Writes the scene's uniform and each shadow pass's, making the maps if
+    /// Writes the scene uniform once with the final (possibly TAA-jittered) projection and mip bias.
+    pub(super) fn write_scene_uniform(&self, frame: &RenderFrame, projection: Option<&Matrix>, mip_bias: f32) {
+        let (maps, count) = self.cascades;
+        #[allow(clippy::cast_possible_truncation, reason = "f32 shader time uniform")]
+        let elapsed_s = self.now() as f32;
+        let scene = scene_floats_with(frame, &maps, count, elapsed_s, projection, mip_bias);
+        self.queue.write_buffer(&self.scene_uniform, 0, scene.bytes());
+    }
+
+    /// Updates environment lighting and shadow pass uniforms, making the maps if
     /// need be; whether anything casts a shadow: the sun or a local light.
     pub(super) fn light(&mut self, frame: &RenderFrame) -> bool {
         // The game fits its shadow maps' view; 0 texels for none.
@@ -344,10 +364,6 @@ impl State {
         let sun = (shadow_texels > 0 && self.cascades.1 > 0).then_some(&frame.shadow);
         let (maps, count) = self.cascades;
         let contact = if sun.is_some() { frame.shadow.contact } else { 0 };
-        #[allow(clippy::cast_possible_truncation, reason = "f32 shader time uniform")]
-        let elapsed_s = self.now() as f32;
-        let scene = scene_floats_at(frame, &maps, count, elapsed_s);
-        self.queue.write_buffer(&self.scene_uniform, 0, scene.bytes());
         self.environment.update(&self.queue, frame);
         // Each shadow pass sees the scene from its light.
         let device = self.device.clone();

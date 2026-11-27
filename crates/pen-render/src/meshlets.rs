@@ -700,7 +700,7 @@ impl MeshletCuller {
             module: shader,
             entry_point: Some(entry_point),
             compilation_options: Default::default(),
-            cache: None,
+            cache: crate::pipeline_cache::active().as_ref(),
         })
     }
 
@@ -1299,7 +1299,7 @@ mod tests {
                 })],
             }),
             multiview_mask: None,
-            cache: None,
+            cache: crate::pipeline_cache::active().as_ref(),
         });
         let rt_tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("m_rt"),

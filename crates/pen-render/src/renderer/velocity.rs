@@ -193,7 +193,7 @@ impl Velocity {
                     })],
                 }),
                 multiview_mask: None,
-                cache: None,
+                cache: crate::pipeline_cache::active().as_ref(),
             })
         };
         let pos_buf = Some(wgpu::VertexBufferLayout {

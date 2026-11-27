@@ -130,7 +130,7 @@ fn witness(@builtin(global_invocation_id) id: vec3u) {{
             module: &module,
             entry_point: Some("witness"),
             compilation_options: Default::default(),
-            cache: None,
+            cache: crate::pipeline_cache::active().as_ref(),
         });
         let input = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None,

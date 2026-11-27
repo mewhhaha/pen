@@ -377,10 +377,32 @@ impl State {
     }
 
     pub fn submit(&mut self, frame: &RenderFrame, catalog: &Catalog, target: &mut dyn RenderTarget) -> Result<()> {
+        self.submit_inner(frame, catalog, target, true)
+    }
+
+    /// Submits a frame that the caller already verified with `validate_frame`,
+    /// avoiding a second full per-draw validation pass.
+    pub fn submit_validated(
+        &mut self,
+        frame: &RenderFrame,
+        catalog: &Catalog,
+        target: &mut dyn RenderTarget,
+    ) -> Result<()> {
+        self.submit_inner(frame, catalog, target, false)
+    }
+
+    fn submit_inner(
+        &mut self,
+        frame: &RenderFrame,
+        catalog: &Catalog,
+        target: &mut dyn RenderTarget,
+        validate: bool,
+    ) -> Result<()> {
         // What a frame works out reuses the last one's memory.
         let mut scratch = std::mem::take(&mut self.scratch);
         scratch.clear();
-        let drawn = self.draw(frame, catalog, target, &mut scratch);
+        let cache = self.context.cache.clone();
+        let drawn = cache.with_active(|| self.draw_inner(frame, catalog, target, &mut scratch, validate));
         self.scratch = scratch;
         if drawn.is_err() {
             #[cfg(feature = "render-rt")]
@@ -396,14 +418,17 @@ impl State {
         drawn
     }
 
-    pub(super) fn draw(
+    fn draw_inner(
         &mut self,
         frame: &RenderFrame,
         catalog: &Catalog,
         target: &mut dyn RenderTarget,
         scratch: &mut Scratch,
+        validate: bool,
     ) -> Result<()> {
-        validate_frame(frame)?;
+        if validate {
+            validate_frame(frame)?;
+        }
         self.check_names(frame, catalog)?;
         if let Some(detected) = crate::camera_precision::detect_depth_mode(&frame.projection) {
             self.set_depth_mode(detected);
@@ -604,17 +629,11 @@ impl State {
             self.hiz.invalidate();
         }
         // With TAA the scene draws through a projection jittered within its
-        // pixels: the scene uniform's, after its view.
+        // pixels; write the complete scene uniform once with jitter and FSR mip bias.
         let jittered = self.post.as_ref().unwrap().jittered();
         let previous_vp = self.post.as_ref().unwrap().previous_vp();
-        if let Some(projection) = jittered {
-            self.queue.write_buffer(&self.scene_uniform, 64, bytemuck::cast_slice(&projection));
-        }
-        // FSR 2.2/3.1 negative texture mip-bias (`-log2(out_w / in_w)`) stored in `scene.shadow_params.w`
-        // so textured surfaces rendered at reduced scale retain full native detail.
         let mip_bias = if quality.upscale { crate::taa::fsr_mip_bias(targets.size.0, output_width) } else { 0.0 };
-        let mip_bias_offset = ((super::SCENE_FLOATS - 1) * 4) as u64;
-        self.queue.write_buffer(&self.scene_uniform, mip_bias_offset, bytemuck::bytes_of(&mip_bias));
+        self.write_scene_uniform(frame, jittered.as_ref(), mip_bias);
         self.volumetrics.set_projection(&frame.view, &jittered.unwrap_or(frame.projection));
         self.prepare_screen(reflected);
         self.prepare_contact(frame, targets.size, reflected > 0);
@@ -637,14 +656,14 @@ impl State {
         );
         let device = self.device.clone();
         let mut encoder = device.create_command_encoder(&Default::default());
+        // Timestamps around all GPU passes, read back a few frames later, while
+        // the host or a frame budget wants them.
+        self.timer.begin(self.timing || self.resolution.budgeted());
         self.clusters.encode_cookies(&device, &mut encoder, &cookie_uploads);
         // The sky's reflection, drawn again if its colors changed.
         self.environment.encode(&device, &mut encoder);
         // Physical atmosphere LUTs and raymarched 3D volumetric clouds when enabled (matching jittered rays).
         self.encode_physical_sky(&mut encoder, frame, &active_proj_for_trails, targets.size)?;
-        // Timestamps around the passes, read back a few frames later, while
-        // the host or a frame budget wants them.
-        self.timer.begin(self.timing || self.resolution.budgeted());
         // Evaluate morph targets and cull instanced batches on the GPU before any pass draws them.
         self.morphing.dispatch(&device, &mut encoder, &self.assets);
         self.culling.dispatch(&mut encoder, &self.timer, &self.instance_buffer, &self.hiz);
@@ -869,7 +888,7 @@ impl State {
             )?;
         }
         let wants_hiz_build = self.hiz.enabled()
-            && ((self.culling.supported() && self.culling.from.is_some())
+            && ((self.culling.active() && depth_mode == crate::camera_precision::DepthMode::ForwardZ)
                 || self.wired.last_meshlet_cull_draws > 0
                 || self.wired.last_meshlet_dag_draws > 0);
         if wants_hiz_build {
@@ -886,6 +905,8 @@ impl State {
                 self.context.cache.get(),
                 &self.timer,
             );
+        } else {
+            self.hiz.invalidate();
         }
         if wants_meshlet_phase2 {
             Self::encode_meshlet_culling_phase2(
@@ -1138,6 +1159,7 @@ impl State {
                     let mut oit_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("translucent_oit"),
                         color_attachments: &oit.attachments(),
+                        timestamp_writes: self.timer.pass(Span::Scene),
                         depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                             view: &targets.depth,
                             depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
@@ -1174,6 +1196,7 @@ impl State {
                     let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some("translucent_after_oit"),
                         color_attachments: &[Some(targets.color(wgpu::Color::BLACK, false, true))],
+                        timestamp_writes: self.timer.pass(Span::Scene),
                         depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                             view: &targets.depth,
                             depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),

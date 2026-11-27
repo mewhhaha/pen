@@ -256,7 +256,7 @@ impl Screen {
         if overlay.is_some() && self.overlay.is_none() {
             self.overlay = Some(self.renderer.share(self.assets.clone().into())?);
         }
-        self.renderer.submit(game, catalog, &mut self.canvas)?;
+        self.renderer.submit_validated(game, catalog, &mut self.canvas)?;
         #[cfg(feature = "devtools")]
         if let (Some(overlay), Some(renderer)) = (overlay, &mut self.overlay) {
             renderer.prepare_sprites(&overlay.sprites, catalog)?;

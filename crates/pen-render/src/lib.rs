@@ -96,7 +96,6 @@ mod motion_blur;
 #[cfg(feature = "render-3d")]
 pub mod oit;
 mod packed_texture;
-#[cfg(feature = "render-3d")]
 mod pipeline_cache;
 mod platform;
 #[cfg(feature = "render-3d")]
@@ -498,6 +497,16 @@ impl Renderer {
         self.state.submit(frame, catalog, target)
     }
 
+    /// Submits a frame already validated with [`validate_frame`], skipping a duplicate pass.
+    pub fn submit_validated(
+        &mut self,
+        frame: &RenderFrame,
+        catalog: &Catalog,
+        target: &mut dyn RenderTarget,
+    ) -> anyhow::Result<()> {
+        self.state.submit_validated(frame, catalog, target)
+    }
+
     pub fn prepare_sprites(&mut self, sprites: &[pen_protocol::Sprite], catalog: &Catalog) -> anyhow::Result<bool> {
         self.state.prepare_sprites(sprites, catalog)
     }
@@ -585,6 +594,16 @@ impl Renderer {
         target: &mut dyn RenderTarget,
     ) -> anyhow::Result<()> {
         self.state.submit(frame, catalog, target)
+    }
+
+    /// Submits a frame already validated with [`validate_frame`], skipping a duplicate pass.
+    pub fn submit_validated(
+        &mut self,
+        frame: &RenderFrame,
+        catalog: &Catalog,
+        target: &mut dyn RenderTarget,
+    ) -> anyhow::Result<()> {
+        self.state.submit_validated(frame, catalog, target)
     }
 
     /// Starts loading what `sprites` draw with; whether it is all ready.
@@ -713,6 +732,11 @@ impl Renderer {
     /// culling pass (enabled by default).
     pub fn occlusion_culling(&mut self, enabled: bool) {
         self.state.occlusion_culling(enabled);
+    }
+
+    /// Enables or disables indirect draw-arg CPU readback for GPU culling stats.
+    pub fn culling_stats(&mut self, enabled: bool) {
+        self.state.culling_stats(enabled);
     }
 
     /// Total GPU memory (bytes) currently held by resident meshes and textures.

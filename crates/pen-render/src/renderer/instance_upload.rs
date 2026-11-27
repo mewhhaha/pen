@@ -51,8 +51,19 @@ impl Uploads {
             self.ranges.clear();
             self.ranges.push(0..words.len());
         }
-        self.previous.clear();
-        self.previous.extend_from_slice(words);
+        if self.ranges.len() == 1 && self.ranges[0] == (0..words.len()) {
+            self.previous.clear();
+            self.previous.extend_from_slice(words);
+        } else {
+            if words.len() < self.previous.len() {
+                self.previous.truncate(words.len());
+            } else if words.len() > self.previous.len() {
+                self.previous.resize(words.len(), 0);
+            }
+            for range in &self.ranges {
+                self.previous[range.clone()].copy_from_slice(&words[range.clone()]);
+            }
+        }
         &self.ranges
     }
 }

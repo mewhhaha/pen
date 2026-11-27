@@ -292,7 +292,7 @@ mod tests {
                 module: &shader,
                 entry_point: Some("main"),
                 compilation_options: Default::default(),
-                cache: None,
+                cache: crate::pipeline_cache::active().as_ref(),
             });
             let size = u64::from(width * height) * 4;
             let storage = state.device.create_buffer(&wgpu::BufferDescriptor {

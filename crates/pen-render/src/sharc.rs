@@ -213,7 +213,7 @@ impl SharcCache {
                 module: &module,
                 entry_point: Some(entry),
                 compilation_options: Default::default(),
-                cache: None,
+                cache: crate::pipeline_cache::active().as_ref(),
             })
         };
         Ok(Self {
@@ -281,8 +281,9 @@ impl SharcCache {
     }
 
     fn dispatch(&self, encoder: &mut wgpu::CommandEncoder, pipeline: &wgpu::ComputePipeline, label: &str) {
-        let mut pass =
-            encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(label), timestamp_writes: None });
+        let ts = crate::renderer::timing::scope(crate::renderer::timing::Span::Scene);
+        let mut pass = encoder
+            .begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(label), timestamp_writes: ts.compute() });
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, &self.group, &[]);
         pass.dispatch_workgroups(self.config.capacity.div_ceil(WORKGROUP_SIZE), 1, 1);
@@ -373,7 +374,7 @@ fn query(@builtin(global_invocation_id) id: vec3u) {
                     module: &shader,
                     entry_point: Some(entry),
                     compilation_options: Default::default(),
-                    cache: None,
+                    cache: crate::pipeline_cache::active().as_ref(),
                 })
             };
             let deposit = pipeline("deposit");

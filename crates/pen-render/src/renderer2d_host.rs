@@ -79,6 +79,8 @@ pub(crate) struct State2d {
     inbox: Arc<Mutex<Vec<LoadedAsset>>>,
     events: Vec<GameEvent>,
     stats: RenderStats,
+    sprite_batches: Vec<SpriteBatch>,
+    sprite_order: Vec<u32>,
     #[cfg(feature = "render-2d")]
     sprites2d_pass: Option<Sprites2dPass>,
     #[cfg(feature = "render-2d")]
@@ -165,6 +167,8 @@ impl State2d {
             inbox: Arc::new(Mutex::new(Vec::new())),
             events: Vec::new(),
             stats: RenderStats::default(),
+            sprite_batches: Vec::new(),
+            sprite_order: Vec::new(),
             #[cfg(feature = "render-2d")]
             sprites2d_pass: None,
             #[cfg(feature = "render-2d")]
@@ -362,7 +366,7 @@ impl State2d {
                 })],
             }),
             multiview_mask: None,
-            cache: None,
+            cache: crate::pipeline_cache::active().as_ref(),
         })
     }
 
@@ -462,63 +466,85 @@ impl State2d {
         }
     }
 
-    fn build_sprite_batches(&mut self, sprites: &[Sprite], catalog: &Catalog) -> (Vec<SpriteBatch>, Vec<u32>, bool) {
-        let mut batches: Vec<SpriteBatch> = Vec::new();
-        let mut order: Vec<u32> = Vec::new();
+    fn build_sprite_batches(&mut self, sprites: &[Sprite], catalog: &Catalog) -> bool {
+        self.sprite_batches.clear();
+        self.sprite_order.clear();
         let mut all_ready = true;
+        struct CachedSprite2d {
+            pipeline: wgpu::RenderPipeline,
+            texture: wgpu::TextureView,
+            key: (u64, usize),
+            scene_filter: bool,
+        }
+        let mut last_mat: Option<(u32, Option<CachedSprite2d>)> = None;
         for (index, sprite) in sprites.iter().enumerate() {
-            let mat_key = catalog.material(sprite.material);
-            if mat_key.is_empty() {
-                continue;
-            }
-            let Some(mat) = self.materials.get(mat_key).cloned() else {
-                self.request_material(mat_key);
-                all_ready = false;
-                continue;
-            };
-            let Some(shader_key) = mat.shader.as_deref() else { continue };
-            let Some((pipeline, shader_id)) = self.shaders.get(shader_key).cloned() else {
-                self.request_shader(shader_key);
-                all_ready = false;
-                continue;
-            };
-            let tex = match mat.texture.as_deref() {
-                Some(tex_key) => match self.textures.get(tex_key) {
-                    Some(tex) => tex.clone(),
-                    None => {
-                        self.request_texture(tex_key);
-                        all_ready = false;
-                        continue;
+            if last_mat.as_ref().is_none_or(|(id, _)| *id != sprite.material) {
+                let mat_key = catalog.material(sprite.material);
+                let resolved = if mat_key.is_empty() {
+                    None
+                } else if let Some(mat) = self.materials.get(mat_key) {
+                    let scene_filter = mat.scene_filter;
+                    let shader_key = mat.shader.clone();
+                    let tex_key = mat.texture.clone();
+                    if let Some(shader_key) = shader_key.as_deref() {
+                        if let Some((pipeline, shader_id)) = self.shaders.get(shader_key).cloned() {
+                            let tex = match tex_key.as_deref() {
+                                Some(tex_key) => match self.textures.get(tex_key) {
+                                    Some(tex) => Some(tex.clone()),
+                                    None => {
+                                        self.request_texture(tex_key);
+                                        all_ready = false;
+                                        None
+                                    }
+                                },
+                                None => Some(self.white.clone()),
+                            };
+                            tex.map(|tex| CachedSprite2d {
+                                pipeline,
+                                texture: tex.view,
+                                key: (tex.view_id, shader_id),
+                                scene_filter,
+                            })
+                        } else {
+                            self.request_shader(shader_key);
+                            all_ready = false;
+                            None
+                        }
+                    } else {
+                        None
                     }
-                },
-                None => self.white.clone(),
-            };
-            let key = (tex.view_id, shader_id);
-            let pos = u32::try_from(order.len()).unwrap_or(u32::MAX);
-            order.push(u32::try_from(index).unwrap_or(u32::MAX));
-            if let Some(last) = batches.last_mut()
-                && last.key == key
-                && last.scene_filter == mat.scene_filter
+                } else {
+                    self.request_material(mat_key);
+                    all_ready = false;
+                    None
+                };
+                last_mat = Some((sprite.material, resolved));
+            }
+            let Some(resolved) = last_mat.as_ref().and_then(|(_, m)| m.as_ref()) else { continue };
+            let pos = u32::try_from(self.sprite_order.len()).unwrap_or(u32::MAX);
+            self.sprite_order.push(u32::try_from(index).unwrap_or(u32::MAX));
+            if let Some(last) = self.sprite_batches.last_mut()
+                && last.key == resolved.key
+                && last.scene_filter == resolved.scene_filter
             {
                 last.count += 1;
             } else {
-                batches.push(SpriteBatch {
-                    pipeline,
-                    texture: tex.view,
-                    key,
+                self.sprite_batches.push(SpriteBatch {
+                    pipeline: resolved.pipeline.clone(),
+                    texture: resolved.texture.clone(),
+                    key: resolved.key,
                     first: pos,
                     count: 1,
-                    scene_filter: mat.scene_filter,
+                    scene_filter: resolved.scene_filter,
                 });
             }
         }
-        (batches, order, all_ready)
+        all_ready
     }
 
     pub fn prepare_sprites(&mut self, sprites: &[Sprite], catalog: &Catalog) -> Result<bool> {
         self.drain_inbox();
-        let (_, _, ready) = self.build_sprite_batches(sprites, catalog);
-        Ok(ready)
+        Ok(self.build_sprite_batches(sprites, catalog))
     }
 
     pub fn overlay(
@@ -532,13 +558,23 @@ impl State2d {
         if sprites.is_empty() {
             return Ok(());
         }
-        let (batches, order, _) = self.build_sprite_batches(sprites, catalog);
-        if order.is_empty() {
+        self.build_sprite_batches(sprites, catalog);
+        if self.sprite_order.is_empty() {
             return Ok(());
         }
         let mut encoder =
             self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("overlay2d") });
-        self.sprites.draw(&self.device, &self.queue, &mut encoder, output, size, &batches, sprites, &order, None);
+        self.sprites.draw(
+            &self.device,
+            &self.queue,
+            &mut encoder,
+            output,
+            size,
+            &self.sprite_batches,
+            sprites,
+            &self.sprite_order,
+            None,
+        );
         self.queue.submit([encoder.finish()]);
         Ok(())
     }
@@ -572,6 +608,15 @@ impl State2d {
 
     pub fn submit(&mut self, frame: &RenderFrame, catalog: &Catalog, target: &mut dyn RenderTarget) -> Result<()> {
         validate_frame(frame)?;
+        self.submit_validated(frame, catalog, target)
+    }
+
+    pub fn submit_validated(
+        &mut self,
+        frame: &RenderFrame,
+        catalog: &Catalog,
+        target: &mut dyn RenderTarget,
+    ) -> Result<()> {
         self.drain_inbox();
         let size = target.size();
         if size.0 == 0 || size.1 == 0 {
@@ -615,18 +660,18 @@ impl State2d {
         self.draw_sdf_shapes(&mut encoder, draw_target, size, &sdf_base);
 
         // Protocol sprites (MSDF text, UI, sprite shaders).
-        let (batches, order, _) = self.build_sprite_batches(&frame.sprites, catalog);
-        let draw_calls = u32::try_from(batches.len()).unwrap_or(0);
-        if !order.is_empty() {
+        self.build_sprite_batches(&frame.sprites, catalog);
+        let draw_calls = u32::try_from(self.sprite_batches.len()).unwrap_or(0);
+        if !self.sprite_order.is_empty() {
             self.sprites.draw(
                 &self.device,
                 &self.queue,
                 &mut encoder,
                 draw_target,
                 size,
-                &batches,
+                &self.sprite_batches,
                 &frame.sprites,
-                &order,
+                &self.sprite_order,
                 None,
             );
         }

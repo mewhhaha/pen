@@ -31,7 +31,7 @@ pub(super) struct Morphing {
 }
 
 impl Morphing {
-    pub fn new(device: &wgpu::Device) -> Self {
+    pub fn new(device: &wgpu::Device, cache: Option<&wgpu::PipelineCache>) -> Self {
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("morph"),
             entries: &[
@@ -102,7 +102,7 @@ impl Morphing {
             module: &module,
             entry_point: Some("main"),
             compilation_options: Default::default(),
-            cache: None,
+            cache,
         });
         let params_alignment = (device.limits().min_uniform_buffer_offset_alignment as usize).max(16);
         Self {
@@ -289,11 +289,12 @@ impl Scratch {
         for index in 1..self.morph_first.len() {
             self.morph_first[index] += self.morph_first[index - 1];
         }
-        let mut next: Vec<u32> = self.morph_first[..total].to_vec();
+        self.group_cursor.clear();
+        self.group_cursor.extend_from_slice(&self.morph_first[..total]);
         self.morph_order.resize(frame.morph_weights.len(), 0);
         for (index, weight) in frame.morph_weights.iter().enumerate() {
             if let Some(target) = self.draw_target_index(weight.inset, weight.draw) {
-                let slot = &mut next[target];
+                let slot = &mut self.group_cursor[target];
                 self.morph_order[*slot as usize] = u32::try_from(index).unwrap_or(u32::MAX);
                 *slot += 1;
             }

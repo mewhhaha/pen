@@ -523,7 +523,7 @@ mod tests {
             module: &module,
             entry_point: Some("test_eval"),
             compilation_options: wgpu::PipelineCompilationOptions::default(),
-            cache: None,
+            cache: crate::pipeline_cache::active().as_ref(),
         });
         let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("area_light_bg"),

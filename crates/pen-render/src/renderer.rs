@@ -34,7 +34,7 @@ mod shadow_tests;
 mod shadows;
 mod skinning;
 mod thin_gbuffer;
-mod timing;
+pub(crate) mod timing;
 mod validate;
 mod veil;
 mod velocity;
@@ -635,6 +635,8 @@ struct Scratch {
     /// Morph target weights by draw target index.
     morph_first: Vec<u32>,
     morph_order: Vec<u32>,
+    /// Reusable per-target cursor for grouping poses, bones, and morphs.
+    group_cursor: Vec<u32>,
     /// Previous-frame model transform index in `frame.motions` per scene draw (`u32::MAX` for static).
     motion_for_draw: Vec<u32>,
     /// The frame's emitters and ribbons ready to draw, in order.
@@ -827,7 +829,7 @@ fn extent(width: u32, height: u32) -> wgpu::Extent3d {
     wgpu::Extent3d { width, height, depth_or_array_layers: 1 }
 }
 
-type SurfaceAtlasKey = Vec<(u32, u64, u64)>;
+type SurfaceAtlasKey = [(u64, u64); 12];
 
 pub(crate) struct State {
     device: wgpu::Device,
@@ -1167,6 +1169,16 @@ pub(crate) fn draw_layout_entries() -> Vec<wgpu::BindGroupLayoutEntry> {
 
 impl State {
     pub fn new(device: wgpu::Device, queue: wgpu::Queue, options: RendererOptions) -> Result<Self> {
+        let cache = PipelineCache::open(&device, options.pipeline_cache.as_deref());
+        cache.with_active(|| Self::new_inner(device, queue, options, cache.clone()))
+    }
+
+    fn new_inner(
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        options: RendererOptions,
+        cache: PipelineCache,
+    ) -> Result<Self> {
         let scene_group = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("scene"),
             entries: &scene_layout_entries(),
@@ -1207,7 +1219,7 @@ impl State {
             sprite_group,
             format: options.display.drawing_format(options.format),
             display: options.display,
-            cache: PipelineCache::open(&device, options.pipeline_cache.as_deref()),
+            cache,
             depth_mode: Arc::new(std::sync::atomic::AtomicU8::new(0)),
         };
         let screen = crate::display::Screen::new(&device, options.display, options.format);
@@ -1231,7 +1243,7 @@ impl State {
     pub fn sharing(&self, assets: std::path::PathBuf) -> Result<Self> {
         let loader = self.loader.sharing(assets, self.context.clone());
         let (device, queue, context) = (self.device.clone(), self.queue.clone(), self.context.clone());
-        Self::with(device, queue, context, loader, None, self.screen.clone())
+        context.cache.clone().with_active(|| Self::with(device, queue, context, loader, None, self.screen.clone()))
     }
 
     fn with(
@@ -1352,7 +1364,7 @@ impl State {
             waiting: false,
             scratch: Scratch::default(),
             skinning: skinning::Skinning::new(&device),
-            morphing: morphing::Morphing::new(&device),
+            morphing: morphing::Morphing::new(&device, context.cache.get()),
             velocity: velocity::Velocity::new(&device),
             thin_gbuffer: thin_gbuffer::ThinGbuffer::new(&device),
             particles: None,
@@ -1390,6 +1402,10 @@ impl State {
 
     pub fn occlusion_culling(&mut self, enabled: bool) {
         self.hiz.set_enabled(enabled);
+    }
+
+    pub fn culling_stats(&mut self, enabled: bool) {
+        self.culling.set_stats_readback(enabled);
     }
 
     pub fn gpu_asset_bytes(&self) -> u64 {

@@ -8,9 +8,67 @@
 // waits on the GPU; the latest frame read back is what `RenderStats::gpu`
 // shows.
 use std::cell::RefCell;
+use std::sync::{Arc, Mutex};
 
 use super::readback::Readbacks;
 use crate::GpuTimes;
+
+#[derive(Clone)]
+struct ActiveSlot {
+    set: wgpu::QuerySet,
+    passes: Arc<Mutex<Vec<Span>>>,
+}
+
+thread_local! {
+    static ACTIVE_TIMER: RefCell<Option<ActiveSlot>> = const { RefCell::new(None) };
+}
+
+/// A reserved `(begin, end)` timestamp pair for a single pass on the active frame.
+pub(crate) struct PassTimestamp {
+    set: Option<wgpu::QuerySet>,
+    first: u32,
+}
+
+impl PassTimestamp {
+    pub(crate) fn compute(&self) -> Option<wgpu::ComputePassTimestampWrites<'_>> {
+        self.set.as_ref().map(|set| wgpu::ComputePassTimestampWrites {
+            query_set: set,
+            beginning_of_pass_write_index: Some(self.first),
+            end_of_pass_write_index: Some(self.first + 1),
+        })
+    }
+
+    pub(crate) fn render(&self) -> Option<wgpu::RenderPassTimestampWrites<'_>> {
+        self.set.as_ref().map(|set| wgpu::RenderPassTimestampWrites {
+            query_set: set,
+            beginning_of_pass_write_index: Some(self.first),
+            end_of_pass_write_index: Some(self.first + 1),
+        })
+    }
+}
+
+/// Reserves a `(begin, end)` timestamp query pair from the currently active frame's `GpuTimer`, if any.
+pub(crate) fn scope(span: Span) -> PassTimestamp {
+    ACTIVE_TIMER.with(|cell| {
+        let slot = cell.borrow();
+        let Some(active) = slot.as_ref() else {
+            return PassTimestamp { set: None, first: 0 };
+        };
+        let mut passes = active.passes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(first) = u32::try_from(passes.len() * 2).ok().filter(|&first| first + 2 <= QUERIES) else {
+            return PassTimestamp { set: None, first: 0 };
+        };
+        passes.push(span);
+        PassTimestamp { set: Some(active.set.clone()), first }
+    })
+}
+
+/// Clears the thread-local active timer slot.
+fn clear_active() {
+    ACTIVE_TIMER.with(|cell| {
+        *cell.borrow_mut() = None;
+    });
+}
 
 /// Which part of a frame a timed pass belongs to.
 #[cfg_attr(not(all(feature = "render-volume", feature = "render-subsurface")), allow(dead_code))]
@@ -36,10 +94,9 @@ pub(crate) enum Span {
     Overlay,
 }
 
-// Timestamps a frame can write: a begin and an end for each of 64 passes (the
-// shadow passes may take 23 of them: four sun maps, 18 local faces and the
-// camera's depth). Passes past them go untimed.
-const QUERIES: u32 = 128;
+// Timestamps a frame can write: a begin and an end for each of 128 passes
+// (shadows, culling/Hi-Z, atmosphere/clouds, RT/ReSTIR/SVGF, scene, post, and overlays).
+const QUERIES: u32 = 256;
 
 // Frames whose timestamps may be on their way back at once.
 const READBACKS: usize = 4;
@@ -60,8 +117,8 @@ pub(crate) struct GpuTimer {
     queries: Option<Queries>,
     /// The readback this frame's timestamps go to, while it is timed.
     frame: Option<usize>,
-    /// This frame's timed passes' spans, in query order.
-    passes: RefCell<Vec<Span>>,
+    /// This frame's timed passes' spans, in query order (shared with thread-local scopes).
+    passes: Arc<Mutex<Vec<Span>>>,
     latest: Option<GpuTimes>,
     /// Whether `latest` came back since `fresh` last said.
     fresh: bool,
@@ -74,7 +131,7 @@ impl GpuTimer {
             queue: queue.clone(),
             queries: None,
             frame: None,
-            passes: RefCell::new(Vec::new()),
+            passes: Arc::new(Mutex::new(Vec::new())),
             latest: None,
             fresh: false,
         }
@@ -100,7 +157,8 @@ impl GpuTimer {
     /// about to be encoded, if `wanted` and a readback is free.
     pub fn begin(&mut self, wanted: bool) {
         self.frame = None;
-        self.passes.borrow_mut().clear();
+        clear_active();
+        self.passes.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
         if !self.timed() || (!wanted && self.queries.is_none()) {
             return;
         }
@@ -129,6 +187,12 @@ impl GpuTimer {
         });
         if wanted {
             self.frame = queries.readbacks.free(device, u64::from(QUERIES) * 8);
+            if self.frame.is_some() {
+                let slot = ActiveSlot { set: queries.set.clone(), passes: self.passes.clone() };
+                ACTIVE_TIMER.with(|cell| {
+                    *cell.borrow_mut() = Some(slot);
+                });
+            }
         } else {
             self.latest = None;
         }
@@ -158,7 +222,7 @@ impl GpuTimer {
     fn next(&self, span: Span) -> Option<(&wgpu::QuerySet, u32)> {
         self.frame?;
         let queries = self.queries.as_ref()?;
-        let mut passes = self.passes.borrow_mut();
+        let mut passes = self.passes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let first = u32::try_from(passes.len() * 2).ok().filter(|&first| first + 2 <= QUERIES)?;
         passes.push(span);
         Some((&queries.set, first))
@@ -167,8 +231,10 @@ impl GpuTimer {
     /// Copies the frame's timestamps out to its readback; `submitted`
     /// follows once the encoder is submitted.
     pub fn resolve(&self, encoder: &mut wgpu::CommandEncoder) {
+        clear_active();
         let (Some(frame), Some(queries)) = (self.frame, &self.queries) else { return };
-        let count = u32::try_from(self.passes.borrow().len() * 2).expect("at most QUERIES");
+        let count = u32::try_from(self.passes.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len() * 2)
+            .expect("at most QUERIES");
         if count == 0 {
             return;
         }
@@ -179,8 +245,9 @@ impl GpuTimer {
 
     /// Reads the frame's timestamps back once the GPU is done with them.
     pub fn submitted(&mut self) {
+        clear_active();
         let (Some(frame), Some(queries)) = (self.frame.take(), &mut self.queries) else { return };
-        let spans = std::mem::take(&mut *self.passes.borrow_mut());
+        let spans = std::mem::take(&mut *self.passes.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
         if !spans.is_empty() {
             queries.readbacks.submitted(frame, spans.len() as u64 * 16, spans);
         }

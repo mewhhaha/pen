@@ -3839,15 +3839,21 @@ fn invoke_aot_import(
         gauge.store(mem_len, Ordering::Relaxed);
     }
     if let Some(probe) = probe {
-        let mut vals = Vec::with_capacity(lib.counter_names.len());
-        for name in &lib.counter_names {
-            let (mut val, mut kind) = (0u64, 0u8);
-            let rc =
-                unsafe { (lib.syms.active_get_global)(active_call, name.as_ptr(), name.len(), &mut val, &mut kind) };
-            let c = if rc == 0 && (kind == 0 || kind == 1) { (val & 0xffff_ffff) as u32 } else { 0 };
-            vals.push(u64::from(c));
+        let mem = if uses_arrays { mem_len } else { 0 };
+        if probe.wants_counters() && !lib.counter_names.is_empty() {
+            let mut vals = Vec::with_capacity(lib.counter_names.len());
+            for name in &lib.counter_names {
+                let (mut val, mut kind) = (0u64, 0u8);
+                let rc = unsafe {
+                    (lib.syms.active_get_global)(active_call, name.as_ptr(), name.len(), &mut val, &mut kind)
+                };
+                let c = if rc == 0 && (kind == 0 || kind == 1) { (val & 0xffff_ffff) as u32 } else { 0 };
+                vals.push(u64::from(c));
+            }
+            probe.called_host(mem, vals.into_iter());
+        } else {
+            probe.called_host(mem, std::iter::empty());
         }
-        probe.called_host(if uses_arrays { mem_len } else { 0 }, vals.into_iter());
     }
 
     let result = callback(argument);

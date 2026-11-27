@@ -451,7 +451,7 @@ impl CookiePacker {
             module: &module,
             entry_point: Some("main"),
             compilation_options: Default::default(),
-            cache: None,
+            cache: crate::pipeline_cache::active().as_ref(),
         });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("area_cookie_pack_samp"),

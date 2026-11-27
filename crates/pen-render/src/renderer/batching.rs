@@ -597,10 +597,9 @@ impl State {
         let floats = (self.stride / 4) as usize;
         self.skinning.begin(frame.exposure.cut);
         self.morphing.begin();
-        // Fast 1-entry caches avoid repeated material/dress/bind-group and mesh lookups
-        // across contiguous runs of identical solo draws (e.g. wakes, earth patches, buildings).
+        // Per-frame material cache avoids repeated material/dress/bind-group lookups
+        // even when solo draws alternate across different materials.
         struct MatCache {
-            index: u32,
             material: std::sync::Arc<super::MaterialAsset>,
             shader: usize,
             dressed: super::materials::Dressed,
@@ -612,46 +611,61 @@ impl State {
             default_params: [f32; 4],
             maps_tail: [f32; 8],
         }
-        let mut mat_cache: Option<MatCache> = None;
+        let mut mat_cache: std::collections::HashMap<u32, Option<MatCache>> =
+            std::collections::HashMap::with_capacity(item_count.min(64));
         let mut mesh_cache: Option<(u32, usize, bool)> = None;
         for index in 0..item_count {
             let item = scratch.items[index];
-            if mat_cache.as_ref().is_none_or(|c| c.index != item.material) {
-                let Some(material) = self.material(catalog, item.material)? else { continue };
-                let Some(shader) = self.shader(&material.material)? else { continue };
-                let field = if self.field_ids.is_empty() {
-                    None
-                } else {
-                    self.field_ids.get(catalog.material(item.material)).copied()
-                };
-                let Some(dressed) = self.dress(&material.material, field)? else { continue };
-                let m = &material.material;
-                let (_, normal_setting, outline_setting, orm_setting, emissive_setting, tile_mask, has_base_texture) =
-                    dressed;
-                mat_cache = Some(MatCache {
-                    index: item.material,
-                    surface_vecs: m.surface.vectors(),
-                    uv_maps: m.uv_transform.vectors(orm_setting, emissive_setting),
-                    color: m.color.map(narrow),
-                    settings: [if m.lit { 1.0 } else { 0.0 }, narrow(m.alpha_cutoff), normal_setting, outline_setting],
-                    default_params: m.instance_parameters.map(|values| values.map(narrow)).unwrap_or([0.0; 4]),
-                    maps_tail: [
-                        tile_mask as f32,
+            if let std::collections::hash_map::Entry::Vacant(entry) = mat_cache.entry(item.material) {
+                let built = (|| -> Result<Option<MatCache>> {
+                    let Some(material) = self.material(catalog, item.material)? else { return Ok(None) };
+                    let Some(shader) = self.shader(&material.material)? else { return Ok(None) };
+                    let field = if self.field_ids.is_empty() {
+                        None
+                    } else {
+                        self.field_ids.get(catalog.material(item.material)).copied()
+                    };
+                    let Some(dressed) = self.dress(&material.material, field)? else { return Ok(None) };
+                    let m = &material.material;
+                    let (
+                        _,
+                        normal_setting,
+                        outline_setting,
+                        orm_setting,
+                        emissive_setting,
+                        tile_mask,
                         has_base_texture,
-                        0.0,
-                        0.0,
-                        m.surface.iridescence,
-                        m.surface.iridescence_ior,
-                        m.surface.iridescence_thickness_min,
-                        m.surface.iridescence_thickness_max,
-                    ],
-                    material,
-                    shader,
-                    dressed,
-                    group: None,
-                });
+                    ) = dressed;
+                    Ok(Some(MatCache {
+                        surface_vecs: m.surface.vectors(),
+                        uv_maps: m.uv_transform.vectors(orm_setting, emissive_setting),
+                        color: m.color.map(narrow),
+                        settings: [
+                            if m.lit { 1.0 } else { 0.0 },
+                            narrow(m.alpha_cutoff),
+                            normal_setting,
+                            outline_setting,
+                        ],
+                        default_params: m.instance_parameters.map(|values| values.map(narrow)).unwrap_or([0.0; 4]),
+                        maps_tail: [
+                            tile_mask as f32,
+                            has_base_texture,
+                            0.0,
+                            0.0,
+                            m.surface.iridescence,
+                            m.surface.iridescence_ior,
+                            m.surface.iridescence_thickness_min,
+                            m.surface.iridescence_thickness_max,
+                        ],
+                        material,
+                        shader,
+                        dressed,
+                        group: None,
+                    }))
+                })()?;
+                entry.insert(built);
             }
-            let cached = mat_cache.as_mut().unwrap();
+            let Some(cached) = mat_cache.get_mut(&item.material).and_then(Option::as_mut) else { continue };
             let (mesh, persistent) = match item.shape {
                 Shape::Mesh(m) => {
                     if let Some((cm, slot, p)) = mesh_cache
@@ -701,7 +715,8 @@ impl State {
                     g
                 }
             };
-            let data = &mut self.uniform_data[index * floats..(index + 1) * floats];
+            let ready_index = scratch.ready.len();
+            let data = &mut self.uniform_data[ready_index * floats..(ready_index + 1) * floats];
             let m = &cached.material.material;
             let draw = item.draw(frame);
             if matches!(item.source, Source::World) {
@@ -794,8 +809,8 @@ impl State {
                     morph = self.morph_draw(frame, scratch, target, mesh);
                 }
             }
-            let offset =
-                u32::try_from(index as u64 * self.stride).context("draw uniforms lie past a dynamic offset's reach")?;
+            let offset = u32::try_from(ready_index as u64 * self.stride)
+                .context("draw uniforms lie past a dynamic offset's reach")?;
             scratch.ready.push(ReadyEntry {
                 item: index,
                 offset,
@@ -814,11 +829,12 @@ impl State {
         }
         self.skinning.upload(&self.device, &self.queue, &self.context.skin_group);
         self.morphing.upload(&self.device, &self.queue);
-        if item_count > 0 {
+        let ready_count = scratch.ready.len();
+        if ready_count > 0 {
             self.queue.write_buffer(
                 &self.draw_uniform,
                 0,
-                bytemuck::cast_slice(&self.uniform_data[..item_count * floats]),
+                bytemuck::cast_slice(&self.uniform_data[..ready_count * floats]),
             );
         }
         Ok(())
@@ -974,29 +990,51 @@ impl State {
         batches: &mut Vec<SpriteBatch>,
         order: &mut Vec<u32>,
     ) -> Result<()> {
+        struct SpriteMat {
+            pipeline: wgpu::RenderPipeline,
+            texture: wgpu::TextureView,
+            scene_filter: bool,
+            key: (u64, usize),
+        }
+        let mut last_mat: Option<(u32, Option<SpriteMat>)> = None;
         for (index, sprite) in sprites.iter().enumerate() {
-            let Some(material) = self.material(catalog, sprite.material)? else { continue };
-            let shader_slot = self.resolve(AssetKind::SpriteShader, &material.material.shader)?;
-            let texture_slot = match &material.material.texture {
-                None => None,
-                Some(key) => Some(self.resolve(AssetKind::Texture, key)?),
-            };
-            let Some(GpuAsset::SpriteShader(pipeline)) = self.assets.current(shader_slot) else { continue };
-            let texture = match texture_slot.map(|slot| self.assets.current(slot)) {
-                None => &self.white,
-                Some(Some(GpuAsset::Texture(texture))) => texture,
-                Some(_) => continue,
-            };
-            let key = (texture.view_id, shader_slot);
+            if last_mat.as_ref().is_none_or(|(id, _)| *id != sprite.material) {
+                let resolved = (|| -> Result<Option<SpriteMat>> {
+                    let Some(material) = self.material(catalog, sprite.material)? else { return Ok(None) };
+                    let shader_slot = self.resolve(AssetKind::SpriteShader, &material.material.shader)?;
+                    let texture_slot = match &material.material.texture {
+                        None => None,
+                        Some(key) => Some(self.resolve(AssetKind::Texture, key)?),
+                    };
+                    let Some(GpuAsset::SpriteShader(pipeline)) = self.assets.current(shader_slot) else {
+                        return Ok(None);
+                    };
+                    let texture = match texture_slot.map(|slot| self.assets.current(slot)) {
+                        None => &self.white,
+                        Some(Some(GpuAsset::Texture(texture))) => texture,
+                        Some(_) => return Ok(None),
+                    };
+                    Ok(Some(SpriteMat {
+                        pipeline: pipeline.clone(),
+                        texture: texture.view.clone(),
+                        scene_filter: material.material.scene_filter,
+                        key: (texture.view_id, shader_slot),
+                    }))
+                })()?;
+                last_mat = Some((sprite.material, resolved));
+            }
+            let Some(resolved) = last_mat.as_ref().and_then(|(_, m)| m.as_ref()) else { continue };
             let first = u32::try_from(order.len())?;
             order.push(u32::try_from(index)?);
             match batches.last_mut() {
-                Some(last) if last.key == key && last.scene_filter == material.material.scene_filter => last.count += 1,
+                Some(last) if last.key == resolved.key && last.scene_filter == resolved.scene_filter => {
+                    last.count += 1;
+                }
                 _ => batches.push(SpriteBatch {
-                    pipeline: pipeline.clone(),
-                    texture: texture.view.clone(),
-                    scene_filter: material.material.scene_filter,
-                    key,
+                    pipeline: resolved.pipeline.clone(),
+                    texture: resolved.texture.clone(),
+                    scene_filter: resolved.scene_filter,
+                    key: resolved.key,
                     first,
                     count: 1,
                 }),

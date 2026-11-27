@@ -148,6 +148,7 @@ pub(crate) struct GpuCulling {
     latest: Kept,
     /// Whether the last frame culled any batch on the GPU.
     dispatched: bool,
+    stats_readback: bool,
 }
 
 impl GpuCulling {
@@ -177,6 +178,7 @@ impl GpuCulling {
             readback: None,
             latest: Kept::default(),
             dispatched: false,
+            stats_readback: true,
         }
     }
 
@@ -209,9 +211,17 @@ impl GpuCulling {
         self.supported && self.requested && self.pipeline.is_none() && !self.failed
     }
 
-    /// Whether the device supports GPU compute culling.
-    pub fn supported(&self) -> bool {
-        self.supported
+    /// Whether GPU compute culling dispatched at least one batch this frame.
+    pub fn active(&self) -> bool {
+        self.dispatched
+    }
+
+    /// Enables or disables indirect draw-arg CPU readback for culling stats.
+    pub fn set_stats_readback(&mut self, enabled: bool) {
+        self.stats_readback = enabled;
+        if !enabled {
+            self.latest = Kept::default();
+        }
     }
 
     /// Whether a batch of `count` instances culls on the GPU this frame.
@@ -419,6 +429,9 @@ impl GpuCulling {
     /// follows once the encoder is submitted.
     pub fn finish(&mut self, encoder: &mut wgpu::CommandEncoder) {
         self.readback = None;
+        if !self.stats_readback {
+            return;
+        }
         let Some(draws) = &self.draws.buffer else { return };
         if self.counted.is_empty() || self.pipeline.is_none() {
             return;

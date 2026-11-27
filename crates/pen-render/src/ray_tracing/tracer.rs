@@ -129,7 +129,7 @@ impl GpuRayTracer {
             module: &module,
             entry_point: Some("raytrace_shadows_ao"),
             compilation_options: Default::default(),
-            cache: None,
+            cache: crate::pipeline_cache::active().as_ref(),
         });
         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("bvh_rt_u"),
@@ -486,7 +486,7 @@ impl TlasRayTracer {
             module: &module,
             entry_point: Some("trace_scene"),
             compilation_options: Default::default(),
-            cache: None,
+            cache: crate::pipeline_cache::active().as_ref(),
         });
 
         #[cfg(not(target_arch = "wasm32"))]
@@ -535,7 +535,7 @@ impl TlasRayTracer {
                 module: &hw_mod,
                 entry_point: Some("trace_scene"),
                 compilation_options: Default::default(),
-                cache: None,
+                cache: crate::pipeline_cache::active().as_ref(),
             });
             (Some(p_hw), Some(bgl_hw))
         } else {
@@ -914,9 +914,10 @@ impl TlasRayTracer {
                 ));
             }
             let (_, bg) = self.bg.as_ref().unwrap();
+            let ts = crate::renderer::timing::scope(crate::renderer::timing::Span::Scene);
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("tlas_raytrace_hw"),
-                timestamp_writes: None,
+                timestamp_writes: ts.compute(),
             });
             pass.set_pipeline(pipe_hw);
             pass.set_bind_group(0, bg, &[]);
@@ -989,9 +990,10 @@ impl TlasRayTracer {
                 ));
             }
             let (_, bg) = self.bg.as_ref().unwrap();
+            let ts = crate::renderer::timing::scope(crate::renderer::timing::Span::Scene);
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("tlas_raytrace"),
-                timestamp_writes: None,
+                timestamp_writes: ts.compute(),
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, bg, &[]);

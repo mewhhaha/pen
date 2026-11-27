@@ -327,7 +327,7 @@ impl GpuParticleSystem {
                 module: &sim_mod,
                 entry_point: Some(entry),
                 compilation_options: Default::default(),
-                cache: None,
+                cache: crate::pipeline_cache::active().as_ref(),
             })
         };
         let pipe_simulate = make_compute("simulate_step");
@@ -459,7 +459,7 @@ impl GpuParticleSystem {
                 })],
             }),
             multiview_mask: None,
-            cache: None,
+            cache: crate::pipeline_cache::active().as_ref(),
         })
     }
 

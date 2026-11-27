@@ -4,11 +4,32 @@
 // One file per adapter, as `wgpu::util::pipeline_cache_key` names it; wgpu
 // and the driver ignore data that does not fit, such as another driver
 // version's.
+use std::cell::RefCell;
 use std::path::Path;
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+thread_local! {
+    static ACTIVE_CACHE: RefCell<Option<PipelineCache>> = const { RefCell::new(None) };
+}
+
+/// Returns the active renderer's [`wgpu::PipelineCache`] on this thread, if any,
+/// marking it dirty so newly compiled pipelines persist to disk.
+pub(crate) fn active() -> Option<wgpu::PipelineCache> {
+    ACTIVE_CACHE.with(|slot| slot.borrow().as_ref().and_then(|cache| cache.get().cloned()))
+}
+
+struct ActiveGuard(Option<PipelineCache>);
+
+impl Drop for ActiveGuard {
+    fn drop(&mut self) {
+        ACTIVE_CACHE.with(|slot| {
+            *slot.borrow_mut() = self.0.take();
+        });
+    }
+}
 
 /// Cheap to clone; every clone is the same cache.
 #[derive(Clone, Default)]
@@ -58,6 +79,14 @@ impl PipelineCache {
         let stored = self.0.as_ref()?;
         stored.dirty.store(true, Ordering::Relaxed);
         Some(&stored.cache)
+    }
+
+    /// Runs `f` with this cache active on the current thread so lazily-created
+    /// pipelines automatically share it.
+    pub fn with_active<R>(&self, f: impl FnOnce() -> R) -> R {
+        let prev = ACTIVE_CACHE.with(|slot| slot.borrow_mut().replace(self.clone()));
+        let _guard = ActiveGuard(prev);
+        f()
     }
 
     /// Writes it to its file if pipelines were made since it was last

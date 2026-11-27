@@ -32,11 +32,23 @@ pub struct Seen {
 }
 
 /// Watches one guest for the dev tools; the guest updates it as it runs.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Probe {
     seen: Mutex<Seen>,
     profile: Mutex<Option<Arc<Profile>>>,
     attached: AtomicBool,
+    counters_enabled: AtomicBool,
+}
+
+impl Default for Probe {
+    fn default() -> Self {
+        Self {
+            seen: Mutex::new(Seen::default()),
+            profile: Mutex::new(None),
+            attached: AtomicBool::new(false),
+            counters_enabled: AtomicBool::new(true),
+        }
+    }
 }
 
 impl Probe {
@@ -44,7 +56,23 @@ impl Probe {
         Arc::new(Probe::default())
     }
 
+    /// Creates a probe with expensive per-callback global counter FFI reads disabled
+    /// until [`Self::seen`] or [`Self::set_counters_enabled`] activates them.
+    pub fn new_lazy() -> Arc<Probe> {
+        Arc::new(Probe { counters_enabled: AtomicBool::new(false), ..Probe::default() })
+    }
+
+    pub fn set_counters_enabled(&self, enabled: bool) {
+        self.counters_enabled.store(enabled, Ordering::Release);
+    }
+
+    #[inline]
+    pub(crate) fn wants_counters(&self) -> bool {
+        self.counters_enabled.load(Ordering::Acquire)
+    }
+
     pub fn seen(&self) -> Seen {
+        self.counters_enabled.store(true, Ordering::Release);
         self.seen.lock().unwrap().clone()
     }
 

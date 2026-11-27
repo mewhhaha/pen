@@ -30,8 +30,18 @@ impl Mipmapper {
         }
     }
 
-    /// Fills every level of `texture` below the first from the first.
+    /// Fills every level of `texture` below the first from the first, submitting immediately.
     pub fn generate(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, texture: &wgpu::Texture) {
+        if texture.mip_level_count() < 2 {
+            return;
+        }
+        let mut encoder = device.create_command_encoder(&Default::default());
+        self.encode(device, &mut encoder, texture);
+        queue.submit([encoder.finish()]);
+    }
+
+    /// Encodes mipmap generation for `texture` into `encoder` so multiple textures can share one submit.
+    pub fn encode(&mut self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, texture: &wgpu::Texture) {
         if texture.mip_level_count() < 2 {
             return;
         }
@@ -66,17 +76,14 @@ impl Mipmapper {
                 ..Default::default()
             })
         };
-        let mut encoder = device.create_command_encoder(&Default::default());
+        let mut prev_view = level_view(0);
         for level in 1..texture.mip_level_count() {
             let target = level_view(level);
             let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
                 layout: &pipeline.get_bind_group_layout(0),
                 entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&level_view(level - 1)),
-                    },
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&prev_view) },
                     wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
                 ],
             });
@@ -95,7 +102,7 @@ impl Mipmapper {
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, &group, &[]);
             pass.draw(0..3, 0..1);
+            prev_view = target;
         }
-        queue.submit([encoder.finish()]);
     }
 }

@@ -712,7 +712,7 @@ impl VideoTexture {
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
             multiview_mask: None,
-            cache: None,
+            cache: crate::pipeline_cache::active().as_ref(),
         });
         Ok(Self { width, height, y_tex, u_tex, v_tex, output, output_view, srgb_view, params, bind_group, pipeline })
     }

@@ -139,11 +139,6 @@ impl TcpTransport {
         Ok(transport)
     }
 
-    #[allow(dead_code)]
-    pub fn is_closed(&self) -> bool {
-        self.closed
-    }
-
     fn flush_writes(&mut self) {
         if self.closed {
             return;

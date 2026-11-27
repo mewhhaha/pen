@@ -79,14 +79,9 @@ impl Profile {
 /// Formats `timings` as a Chrome Trace Event Format (`chrome://tracing` /
 /// Perfetto) JSON document with separate tracks for overlapped guest work
 /// (`tid: 1`), host decode/validate/housekeeping (`tid: 2`), GPU draw (`tid: 3`),
-/// whole-frame spans (`tid: 0`), and packet byte counters.
-#[allow(dead_code)]
-pub fn chrome_trace_json(timings: &[FrameTimings]) -> String {
-    chrome_trace_json_with_intervals(timings, &[])
-}
-
-/// Formats `timings` using measured frame-to-frame `intervals` (in ms) when
-/// available so frame start timestamps reflect real pacing instead of synthetic sums.
+/// whole-frame spans (`tid: 0`), and packet byte counters, using measured
+/// frame-to-frame `intervals_ms` when available so frame start timestamps reflect
+/// real pacing instead of synthetic sums.
 pub fn chrome_trace_json_with_intervals(timings: &[FrameTimings], intervals_ms: &[f64]) -> String {
     let mut events = Vec::with_capacity(timings.len() * 11);
     let mut cursor_us = 0.0f64;
@@ -161,11 +156,6 @@ pub fn chrome_trace_json_with_intervals(timings: &[FrameTimings], intervals_ms: 
 }
 
 /// Writes a Chrome Trace Event Format (`chrome://tracing` / Perfetto) JSON file.
-#[allow(dead_code)]
-pub fn write_chrome_trace(path: &std::path::Path, timings: &[FrameTimings]) -> Result<()> {
-    write_chrome_trace_with_intervals(path, timings, &[])
-}
-
 pub fn write_chrome_trace_with_intervals(
     path: &std::path::Path,
     timings: &[FrameTimings],

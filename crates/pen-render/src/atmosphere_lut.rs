@@ -158,13 +158,13 @@ pub struct PhysicalAtmosphere {
     multiscatter_view: wgpu::TextureView,
     sky_view: wgpu::Texture,
     sky_view_view: wgpu::TextureView,
-    dummy_tex: wgpu::Texture,
-    dummy_view: wgpu::TextureView,
-    sampler: wgpu::Sampler,
+    _dummy_tex: wgpu::Texture,
+    _dummy_view: wgpu::TextureView,
+    _sampler: wgpu::Sampler,
     uniform_trans: wgpu::Buffer,
     uniform_ms: wgpu::Buffer,
     uniform_sky: wgpu::Buffer,
-    bgl: wgpu::BindGroupLayout,
+    _bgl: wgpu::BindGroupLayout,
     bg_trans: wgpu::BindGroup,
     bg_ms: wgpu::BindGroup,
     bg_sky: wgpu::BindGroup,
@@ -175,13 +175,13 @@ pub struct PhysicalAtmosphere {
     cloud_pipe: wgpu::ComputePipeline,
     cloud_msaa_pipes: HashMap<u32, (wgpu::BindGroupLayout, wgpu::ComputePipeline)>,
     cloud_uniform: wgpu::Buffer,
-    cloud_noise_tex: wgpu::Texture,
+    _cloud_noise_tex: wgpu::Texture,
     cloud_noise_view: wgpu::TextureView,
     cloud_noise_sampler: wgpu::Sampler,
     cloud_bake_pipe: wgpu::ComputePipeline,
     cloud_bake_bg: wgpu::BindGroup,
     cloud_noise_baked: bool,
-    dummy_depth_tex: wgpu::Texture,
+    _dummy_depth_tex: wgpu::Texture,
     dummy_depth_view: wgpu::TextureView,
     cloud_tex: Option<(u32, u32, wgpu::Texture, wgpu::TextureView)>,
     cloud_bg: Option<(u64, u32, u64, wgpu::BindGroup)>,
@@ -488,13 +488,13 @@ impl PhysicalAtmosphere {
             multiscatter_view,
             sky_view,
             sky_view_view,
-            dummy_tex,
-            dummy_view,
-            sampler,
+            _dummy_tex: dummy_tex,
+            _dummy_view: dummy_view,
+            _sampler: sampler,
             uniform_trans,
             uniform_ms,
             uniform_sky,
-            bgl,
+            _bgl: bgl,
             bg_trans,
             bg_ms,
             bg_sky,
@@ -505,13 +505,13 @@ impl PhysicalAtmosphere {
             cloud_pipe,
             cloud_msaa_pipes: HashMap::new(),
             cloud_uniform,
-            cloud_noise_tex,
+            _cloud_noise_tex: cloud_noise_tex,
             cloud_noise_view,
             cloud_noise_sampler,
             cloud_bake_pipe,
             cloud_bake_bg,
             cloud_noise_baked: false,
-            dummy_depth_tex,
+            _dummy_depth_tex: dummy_depth_tex,
             dummy_depth_view,
             cloud_tex: None,
             cloud_bg: None,
@@ -886,12 +886,6 @@ impl PhysicalAtmosphere {
         pass.set_bind_group(0, bg, &[]);
         pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
         Ok(())
-    }
-
-    #[allow(dead_code)]
-    fn _keep_alive(&self) -> (&wgpu::Texture, &wgpu::TextureView, &wgpu::Sampler, &wgpu::BindGroupLayout) {
-        let _ = (&self.cloud_noise_tex, &self.dummy_depth_tex);
-        (&self.dummy_tex, &self.dummy_view, &self.sampler, &self.bgl)
     }
 }
 

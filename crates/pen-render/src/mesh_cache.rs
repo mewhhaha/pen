@@ -178,7 +178,7 @@ pub(crate) fn prepare_mesh_deferred(mut mesh: Mesh) -> PreparedMesh {
 
 /// Builds GPU meshlets and (for meshes >= 768 triangles) a continuous LOD Cluster DAG
 /// from a static unskinned mesh's LOD0 geometry. Shared by offline packaging (`pack_mesh_with_lods`)
-/// and runtime cache misses (`prepare_mesh`).
+/// and runtime cache misses (`MeshCache::load_or_build`).
 #[cfg(any(feature = "simplify", test))]
 pub(crate) fn build_meshlets_and_dag(mesh: &Mesh) -> (Option<MeshletMesh>, Option<MeshletDagMesh>) {
     if mesh.skin.is_some() || mesh.morphs.is_some() || mesh.instances.is_some() {
@@ -245,52 +245,6 @@ fn build_meshlets_and_dag_from_slice(
         })
         .flatten();
     (ml, dag)
-}
-
-/// Prepares meshlets and the Cluster DAG for GPU upload.
-/// Packaged `PMSH` meshes that already carry pre-baked meshlets/DAG skip building and
-/// disk-cache I/O completely; unpacked dev meshes use `cache` on worker threads.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn prepare_mesh(mut mesh: Mesh, cache: &MeshCache) -> PreparedMesh {
-    let baked_ml = mesh.meshlets.take();
-    let baked_dag = mesh.meshlet_dag.take();
-    #[cfg(target_arch = "wasm32")]
-    let (meshlets, meshlet_dag) = {
-        let _ = cache;
-        (baked_ml, baked_dag)
-    };
-    #[cfg(not(target_arch = "wasm32"))]
-    let (meshlets, meshlet_dag) = if baked_ml.is_some() || baked_dag.is_some() {
-        (baked_ml, baked_dag)
-    } else if mesh.skin.is_none() && mesh.morphs.is_none() && mesh.instances.is_none() {
-        let lod0_slice = mesh.lods.first().and_then(|lod0| {
-            let start = lod0.first as usize;
-            let end = start.checked_add(lod0.count as usize)?;
-            mesh.indices.get(start..end)
-        });
-        if let Some(idx_slice) = lod0_slice
-            && idx_slice.len() / 3 >= 128
-        {
-            let config = MeshletDagConfig::default();
-            let hash = cache.enabled().then(|| hash_mesh_inputs(&mesh.vertices, idx_slice, &config));
-            let cached = hash.as_ref().and_then(|hash| cache.load(hash));
-            if let Some(cached) = cached {
-                cached
-            } else {
-                let (ml, dag) = build_meshlets_and_dag_from_slice(&mesh_positions(&mesh.vertices), idx_slice, &config);
-                if let Some(hash) = &hash {
-                    cache.store(hash, ml.as_ref(), dag.as_ref());
-                }
-                (ml, dag)
-            }
-        } else {
-            (None, None)
-        }
-    } else {
-        (None, None)
-    };
-
-    PreparedMesh { mesh, meshlets, meshlet_dag }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -563,16 +517,17 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pen-mesh-cache-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let cache = MeshCache::open(Some(&dir));
-        let cold = prepare_mesh(sphere_mesh(28, 32), &cache);
-        assert!(cold.meshlets.is_some());
-        assert!(cold.meshlet_dag.is_some());
+        let mesh = sphere_mesh(28, 32);
+        let (ml_cold, dag_cold) = cache.load_or_build(&mesh.vertices, &mesh.indices, true);
+        let ml_cold = ml_cold.expect("cold meshlets");
+        let dag_cold = dag_cold.expect("cold dag");
 
-        let warm = prepare_mesh(sphere_mesh(28, 32), &cache);
-        let (ml_cold, ml_warm) = (cold.meshlets.as_ref().unwrap(), warm.meshlets.as_ref().unwrap());
+        let (ml_warm, dag_warm) = cache.load_or_build(&mesh.vertices, &mesh.indices, true);
+        let ml_warm = ml_warm.expect("warm meshlets");
+        let dag_warm = dag_warm.expect("warm dag");
         assert_eq!(bytemuck::cast_slice::<_, u8>(&ml_cold.meshlets), bytemuck::cast_slice::<_, u8>(&ml_warm.meshlets));
         assert_eq!(ml_cold.indices, ml_warm.indices);
 
-        let (dag_cold, dag_warm) = (cold.meshlet_dag.as_ref().unwrap(), warm.meshlet_dag.as_ref().unwrap());
         assert_eq!(dag_cold.level_count, dag_warm.level_count);
         assert_eq!(dag_cold.leaf_cluster_count, dag_warm.leaf_cluster_count);
         assert_eq!(dag_cold.root_cluster_count, dag_warm.root_cluster_count);
@@ -582,13 +537,13 @@ mod tests {
         );
         assert_eq!(dag_cold.indices, dag_warm.indices);
 
-        // Corrupt the cache file and verify decode rejects it and prepare_mesh rebuilds cleanly.
+        // Corrupt the cache file and verify decode rejects it and load_or_build rebuilds cleanly.
         let entry = std::fs::read_dir(&dir).unwrap().next().unwrap().unwrap().path();
         let mut corrupted = std::fs::read(&entry).unwrap();
         corrupted.truncate(corrupted.len() / 2);
         std::fs::write(&entry, &corrupted).unwrap();
-        let rebuilt = prepare_mesh(sphere_mesh(28, 32), &cache);
-        assert_eq!(rebuilt.meshlet_dag.as_ref().unwrap().indices, dag_cold.indices);
+        let (_ml_rebuilt, dag_rebuilt) = cache.load_or_build(&mesh.vertices, &mesh.indices, true);
+        assert_eq!(dag_rebuilt.unwrap().indices, dag_cold.indices);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -605,7 +560,7 @@ mod tests {
 
     #[cfg(feature = "simplify")]
     #[test]
-    fn prepare_mesh_uses_prebaked_meshlets_without_cache() {
+    fn prepare_mesh_deferred_uses_prebaked_meshlets_without_cache() {
         let mesh = sphere_mesh(28, 32);
         let mut positions = Vec::with_capacity(mesh.vertices.len() / MESH_VERTEX_FLOATS * 3);
         let mut normals = Vec::with_capacity(mesh.vertices.len() / MESH_VERTEX_FLOATS * 3);
@@ -628,18 +583,14 @@ mod tests {
         assert!(parsed.meshlets.is_some());
         assert!(parsed.meshlet_dag.is_some());
 
-        let dir = std::env::temp_dir().join(format!("pen-mesh-prebaked-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let cache = MeshCache::open(Some(&dir));
-        let prepared = prepare_mesh(parsed, &cache);
-        let cold = prepare_mesh(mesh, &MeshCache::default());
+        let prepared = prepare_mesh_deferred(parsed);
+        let (ml_cold, dag_cold) = MeshCache::default().load_or_build(&mesh.vertices, &mesh.indices, true);
 
-        assert!(!dir.exists(), "pre-baked meshes must not write to the runtime meshlet cache");
-        let (ml_baked, ml_cold) = (prepared.meshlets.as_ref().unwrap(), cold.meshlets.as_ref().unwrap());
+        let (ml_baked, ml_cold) = (prepared.meshlets.as_ref().unwrap(), ml_cold.as_ref().unwrap());
         assert_eq!(bytemuck::cast_slice::<_, u8>(&ml_baked.meshlets), bytemuck::cast_slice::<_, u8>(&ml_cold.meshlets));
         assert_eq!(ml_baked.indices, ml_cold.indices);
 
-        let (dag_baked, dag_cold) = (prepared.meshlet_dag.as_ref().unwrap(), cold.meshlet_dag.as_ref().unwrap());
+        let (dag_baked, dag_cold) = (prepared.meshlet_dag.as_ref().unwrap(), dag_cold.as_ref().unwrap());
         assert_eq!(dag_baked.level_count, dag_cold.level_count);
         assert_eq!(dag_baked.leaf_cluster_count, dag_cold.leaf_cluster_count);
         assert_eq!(dag_baked.root_cluster_count, dag_cold.root_cluster_count);

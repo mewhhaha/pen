@@ -9,6 +9,7 @@ pub mod diagnostic;
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "lanes checked before narrowing")]
 mod packets;
 pub mod protocol;
+pub mod sort;
 
 pub use boundary::canonical_render_packet;
 pub use protocol::*;

@@ -31,7 +31,7 @@ pub mod scale;
 pub mod semantic;
 pub mod services;
 pub mod snapshot;
-pub mod sort;
+pub use pen_protocol::sort;
 #[cfg(feature = "sound-recipes")]
 pub mod sound_recipe;
 pub mod state;

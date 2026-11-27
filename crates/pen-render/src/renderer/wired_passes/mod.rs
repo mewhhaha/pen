@@ -259,13 +259,10 @@ pub(super) struct WiredPasses {
     pub split_screen: Option<(wgpu::TextureFormat, SplitScreenCompositor)>,
     pub split_views: Vec<SplitViewSlot>,
     pub polish_input: Option<(u32, u32, wgpu::TextureFormat, wgpu::Texture, wgpu::TextureView)>,
-    #[allow(dead_code)]
     pub msaa_depth_resolve: Option<(u32, u32, wgpu::Texture, wgpu::TextureView)>,
-    #[allow(dead_code)]
     msaa_depth_resolve_bg: Option<(wgpu::TextureView, u32, wgpu::BindGroup)>,
-    #[allow(dead_code)]
     msaa_depth_resolved_key: Option<(wgpu::TextureView, u64, u32, (u32, u32))>,
-    #[allow(dead_code)]
+    #[cfg(feature = "render-post-fx")]
     pub dummy_depth: Option<(wgpu::Texture, wgpu::TextureView)>,
     #[cfg_attr(not(feature = "render-rt"), allow(dead_code))]
     pub dummy_vel: Option<(wgpu::Texture, wgpu::TextureView)>,
@@ -380,7 +377,7 @@ impl WiredPasses {
         self.polish_input.as_ref().unwrap().4.clone()
     }
 
-    #[allow(dead_code)]
+    #[cfg(feature = "render-post-fx")]
     pub fn dummy_depth_view(&mut self, device: &wgpu::Device) -> wgpu::TextureView {
         if self.dummy_depth.is_none() {
             let tex = device.create_texture(&wgpu::TextureDescriptor {
@@ -440,7 +437,6 @@ impl WiredPasses {
     /// Resolves a multisampled (or 1x `Depth24PlusStencil8`) depth view into a cached 1x
     /// `R32Float` texture via `BuiltIn::OpaqueDepth`. Deduplicates redundant resolves within
     /// the same frame when `depth_only`, `depth_write_epoch`, `samples`, and `size` match.
-    #[allow(dead_code)]
     pub fn resolve_msaa_depth(
         &mut self,
         device: &wgpu::Device,

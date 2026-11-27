@@ -192,8 +192,6 @@ struct AotSymbols {
     set_global: FnSetGlobal,
     active_mem_data: FnMemData,
     active_allocate: FnCallI32I32,
-    #[allow(dead_code)]
-    active_reset: FnCallI32I32,
     active_get_global: FnGetGlobal,
 }
 
@@ -3593,6 +3591,7 @@ impl AotModule {
         }
 
         let syms = unsafe {
+            let _active_reset: FnCallI32I32 = *lib.get(b"blot_aot_active_reset\0")?;
             AotSymbols {
                 trap_message: *lib.get(b"blot_aot_trap_message\0")?,
                 new: *lib.get(b"blot_aot_new\0")?,
@@ -3607,7 +3606,6 @@ impl AotModule {
                 set_global: *lib.get(b"blot_aot_set_global\0")?,
                 active_mem_data: *lib.get(b"blot_aot_active_mem_data\0")?,
                 active_allocate: *lib.get(b"blot_aot_active_allocate\0")?,
-                active_reset: *lib.get(b"blot_aot_active_reset\0")?,
                 active_get_global: *lib.get(b"blot_aot_active_get_global\0")?,
             }
         };

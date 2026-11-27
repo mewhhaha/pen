@@ -622,7 +622,7 @@ pub struct MeshletCuller {
     batch_phase2: Option<BatchBuffers>,
     two_phase: OnceLock<TwoPhasePipelines>,
     stats: wgpu::Buffer,
-    dummy_hiz: wgpu::Texture,
+    _dummy_hiz: wgpu::Texture,
     dummy_hiz_view: wgpu::TextureView,
 }
 
@@ -667,7 +667,7 @@ impl MeshletCuller {
             batch_phase2: None,
             two_phase: OnceLock::new(),
             stats,
-            dummy_hiz,
+            _dummy_hiz: dummy_hiz,
             dummy_hiz_view,
         }
     }
@@ -1047,11 +1047,6 @@ impl MeshletCuller {
         pass.set_bind_group(0, &group, &[0]);
         pass.dispatch_workgroups(dispatch.count.div_ceil(64), 1, 1);
         Ok(())
-    }
-
-    #[allow(dead_code)]
-    fn _keep_alive(&self) -> &wgpu::Texture {
-        &self.dummy_hiz
     }
 }
 

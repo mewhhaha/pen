@@ -127,7 +127,7 @@ pub mod sharc;
 mod simplify;
 #[cfg(feature = "render-3d")]
 mod solids;
-mod sort;
+pub(crate) use pen_protocol::sort;
 mod sprites;
 #[cfg(feature = "render-3d")]
 mod ssgi;

@@ -89,7 +89,7 @@ mod imp {
     }
 
     /// Async fetch for background pipeline jobs (`loader.rs`).
-    #[allow(dead_code)]
+    #[cfg_attr(not(feature = "render-gpu-culling"), allow(dead_code))]
     pub(crate) async fn load_async(name: &'static str) -> Result<&'static str, String> {
         if let Some(src) = CACHE.with(|cell| cell.borrow().loaded.get(name).copied()) {
             return Ok(src);

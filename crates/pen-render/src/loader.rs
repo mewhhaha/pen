@@ -287,9 +287,6 @@ pub(crate) struct Worker {
     /// Assets read and decoded before the renderer was made, for their
     /// first loads.
     prefetch: Arc<Mutex<Option<Prefetch>>>,
-    /// On-disk cache for CPU-built meshlets and Cluster DAGs.
-    #[allow(dead_code)]
-    mesh_cache: MeshCache,
 }
 
 /// What a material needs of its shader: which variants, and whether it
@@ -367,7 +364,6 @@ impl Loader {
             needs: needs.clone(),
             results: sender,
             prefetch: prefetch.clone(),
-            mesh_cache: mesh_cache.clone(),
         };
         (worker, move |jobs| Loader { jobs, results, needs, prefetch, mesh_cache, closed })
     }

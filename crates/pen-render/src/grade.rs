@@ -60,7 +60,7 @@ pub(crate) fn tables(grade: &Grade, a: Option<Lut>, b: Option<Lut>) -> [Option<L
 
 /// The uniform for `grade` with these `tables`; its last lane of `luts` is 1 when
 /// the present pass has anything to do.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn uniform(grade: &Grade, tables: &[Option<Lut>; 2]) -> GradeUniform {
     uniform_with_tonemap(grade, tables, crate::tonemap::TonemapOperator::Shoulder, 1.0)
 }

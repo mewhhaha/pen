@@ -10,6 +10,22 @@ pub fn sort_u64_u32(slice: &mut [(u64, u32)]) {
     slice.sort_unstable();
 }
 
+/// Bijection from `f32` to `u32` preserving `f32::total_cmp` order.
+#[inline]
+pub fn f32_sortable(x: f32) -> u32 {
+    let bits = x.to_bits();
+    let mask = (bits.cast_signed() >> 31).cast_unsigned() | 0x8000_0000;
+    bits ^ mask
+}
+
+/// Bijection from `f64` to `u64` preserving `f64::total_cmp` order.
+#[inline]
+pub fn f64_sortable(x: f64) -> u64 {
+    let bits = x.to_bits();
+    let mask = (bits.cast_signed() >> 63).cast_unsigned() | (1u64 << 63);
+    bits ^ mask
+}
+
 /// Stably sorts `slice` by a `u64` key using the shared [`sort_u64_u32`].
 pub fn sort_by_u64_key<T>(slice: &mut [T], mut key: impl FnMut(&T) -> u64) {
     if slice.len() <= 1 {
@@ -76,6 +92,54 @@ pub fn shell_sort_by<T>(slice: &mut [T], mut cmp: impl FnMut(&T, &T) -> Ordering
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn float_sortable_matches_total_cmp() {
+        let f32s = [
+            f32::from_bits(0xffff_ffff),
+            -f32::NAN,
+            f32::NEG_INFINITY,
+            -1e10,
+            -1.0,
+            -f32::MIN_POSITIVE,
+            -f32::from_bits(1),
+            -0.0,
+            0.0,
+            f32::from_bits(1),
+            f32::MIN_POSITIVE,
+            1.0,
+            1e10,
+            f32::INFINITY,
+            f32::NAN,
+            f32::from_bits(0x7fff_ffff),
+        ];
+        for &a in &f32s {
+            for &b in &f32s {
+                assert_eq!(f32_sortable(a).cmp(&f32_sortable(b)), a.total_cmp(&b));
+            }
+        }
+        let f64s = [
+            f64::from_bits(0xffff_ffff_ffff_ffff),
+            -f64::NAN,
+            f64::NEG_INFINITY,
+            -1e100,
+            -1.0,
+            -f64::from_bits(1),
+            -0.0,
+            0.0,
+            f64::from_bits(1),
+            1.0,
+            1e100,
+            f64::INFINITY,
+            f64::NAN,
+            f64::from_bits(0x7fff_ffff_ffff_ffff),
+        ];
+        for &a in &f64s {
+            for &b in &f64s {
+                assert_eq!(f64_sortable(a).cmp(&f64_sortable(b)), a.total_cmp(&b));
+            }
+        }
+    }
 
     #[test]
     fn sort_by_u64_key_is_stable_and_exact() {

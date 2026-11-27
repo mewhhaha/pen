@@ -15,7 +15,7 @@ async function loadKernels() {
   return (kernelsMod ??= await import('./kernels.js'));
 }
 export async function compileKernelModuleLazy(bytes) {
-  return (await loadKernels()).compileKernelModule(bytes);
+  return (await loadKernels()).compileKernelModuleAsync(bytes);
 }
 export async function openKernelPoolLazy(source, name, config) {
   return (await loadKernels()).BrowserKernelPool.open(source, name, config);

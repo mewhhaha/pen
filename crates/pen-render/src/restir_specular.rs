@@ -470,30 +470,14 @@ impl RestirSpecularRenderer {
             view_projection: params.view_projection,
             inverse_prev_view_projection: crate::matrix::invert(&params.prev_view_projection),
         };
-        // Pack lighting, transforms, and live local lights into a single encoder-ordered staging copy
-        // so multiple frames recorded into one encoder execute in order without allocating 12 KiB per frame.
+        // Encoder-ordered upload through the shared frame staging ring avoids per-frame buffer allocations.
         let lighting_bytes = bytemuck::bytes_of(&lighting);
         let transforms_bytes = bytemuck::bytes_of(&transforms);
         let live_lights: &[u8] = bytemuck::cast_slice(local_lights);
-        let total_stage = lighting_bytes.len() + transforms_bytes.len() + live_lights.len();
-        let stage = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("ReSTIR specular upload stage"),
-            size: total_stage as u64,
-            usage: wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: true,
-        });
-        let off_t = lighting_bytes.len() as u64;
-        let off_l = off_t + transforms_bytes.len() as u64;
-        stage.slice(0..off_t).get_mapped_range_mut().unwrap().copy_from_slice(lighting_bytes);
-        stage.slice(off_t..off_l).get_mapped_range_mut().unwrap().copy_from_slice(transforms_bytes);
+        crate::staging::encode_copy(device, encoder, &self.lighting_buf, 0, lighting_bytes);
+        crate::staging::encode_copy(device, encoder, &self.transforms_buf, 0, transforms_bytes);
         if !live_lights.is_empty() {
-            stage.slice(off_l..).get_mapped_range_mut().unwrap().copy_from_slice(live_lights);
-        }
-        stage.unmap();
-        encoder.copy_buffer_to_buffer(&stage, 0, &self.lighting_buf, 0, off_t);
-        encoder.copy_buffer_to_buffer(&stage, off_t, &self.transforms_buf, 0, transforms_bytes.len() as u64);
-        if !live_lights.is_empty() {
-            encoder.copy_buffer_to_buffer(&stage, off_l, &self.lights_buf, 0, live_lights.len() as u64);
+            crate::staging::encode_copy(device, encoder, &self.lights_buf, 0, live_lights);
         }
 
         let [initial, temporal, spatial] = self.pipelines.entry((hardware, native_depth)).or_insert_with(|| {

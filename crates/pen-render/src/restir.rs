@@ -733,25 +733,13 @@ impl RestirRenderer {
                 u32::from(params.enable_di) | (u32::from(params.enable_gi) << 1),
             ],
         };
-        // Encoder-ordered upload into persistent buffers preserves ordering when several frames
-        // are recorded before submission while avoiding multiple per-frame GPU buffer allocations.
+        // Encoder-ordered upload through the shared frame staging ring preserves ordering when several
+        // frames are recorded before submission with zero per-frame GPU buffer allocations.
         let uniform_bytes = bytemuck::bytes_of(&uniform);
         let live_lights: &[u8] = bytemuck::cast_slice(local_lights);
-        let stage = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("restir upload stage"),
-            size: (uniform_bytes.len() + live_lights.len()) as u64,
-            usage: wgpu::BufferUsages::COPY_SRC,
-            mapped_at_creation: true,
-        });
-        let off_l = uniform_bytes.len() as u64;
-        stage.slice(0..off_l).get_mapped_range_mut().unwrap().copy_from_slice(uniform_bytes);
+        crate::staging::encode_copy(device, encoder, &self.uniform_buf, 0, uniform_bytes);
         if !live_lights.is_empty() {
-            stage.slice(off_l..).get_mapped_range_mut().unwrap().copy_from_slice(live_lights);
-        }
-        stage.unmap();
-        encoder.copy_buffer_to_buffer(&stage, 0, &self.uniform_buf, 0, off_l);
-        if !live_lights.is_empty() {
-            encoder.copy_buffer_to_buffer(&stage, off_l, &self.lights_buf, 0, live_lights.len() as u64);
+            crate::staging::encode_copy(device, encoder, &self.lights_buf, 0, live_lights);
         }
 
         let has_sharc = params.enable_gi && inputs.sharc.is_some();

@@ -115,15 +115,7 @@ fn encode_copy(
     dst_offset: u64,
     bytes: &[u8],
 ) {
-    let stage = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("gpu_particles_stage"),
-        size: bytes.len() as u64,
-        usage: wgpu::BufferUsages::COPY_SRC,
-        mapped_at_creation: true,
-    });
-    stage.slice(..).get_mapped_range_mut().unwrap().copy_from_slice(bytes);
-    stage.unmap();
-    encoder.copy_buffer_to_buffer(&stage, 0, dst, dst_offset, bytes.len() as u64);
+    crate::staging::encode_copy(device, encoder, dst, dst_offset, bytes);
 }
 
 /// Generates a unit cube 3D mesh suitable for solid 3D mesh particle instancing.

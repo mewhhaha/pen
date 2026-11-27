@@ -278,6 +278,22 @@ export function compileKernelModule(bytes) {
   return receipt;
 }
 
+export async function compileKernelModuleAsync(bytes) {
+  const snapshot = copyPrivateBytes(bytes);
+  const memoryShape = readMemoryShape(snapshot);
+  if (memoryShape.hasMemory) {
+    if (memoryShape.shared || memoryShape.memory64 || memoryShape.pageSizeLog2 !== 16) {
+      throw new BrowserKernelError("invalid_abi", "Unsupported Wasm memory shape");
+    }
+  }
+  const module = await WebAssembly.compile(snapshot);
+  const { transportBudget, kernels } = parseKernelsSection(module);
+  const meta = Object.freeze({ module, snapshot, memoryShape, transportBudget, kernels });
+  const receipt = Object.freeze({ module, memoryShape, transportBudget, kernels });
+  receiptMetaMap.set(receipt, meta);
+  return receipt;
+}
+
 function resolveValidated(source) {
   if (typeof source === "object" && source !== null) {
     const m = receiptMetaMap.get(source);

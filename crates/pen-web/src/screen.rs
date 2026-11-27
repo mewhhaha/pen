@@ -1,6 +1,7 @@
 //! The canvas on WebGPU: the game's renderer, and the dev tools' sharing its
 //! device, drawing into the canvas's surface.
 use std::collections::{HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
@@ -42,6 +43,9 @@ pub struct Canvas {
     frame: Option<wgpu::SurfaceTexture>,
     /// A backing size kept whatever the canvas shows (a replay's).
     pinned: Option<(u32, u32)>,
+    /// Set by the window `resize` listener or `pin()`, avoiding per-frame CSS layout reflows.
+    fit_dirty: Arc<AtomicBool>,
+    _resize_listener: Option<Closure<dyn FnMut()>>,
     timings: DrawTimings,
 }
 
@@ -57,8 +61,12 @@ fn backing(element: &HtmlCanvasElement, limit: u32) -> Option<(u32, u32)> {
 impl Canvas {
     /// Backs the canvas with device pixels, as many as it shows now (the
     /// ratio changes as the page moves between screens or zooms), and the
-    /// surface with the canvas.
+    /// surface with the canvas. Skips synchronous DOM layout queries when
+    /// no resize or pin change occurred since the last fit.
     fn fit(&mut self) {
+        if !self.fit_dirty.swap(false, Ordering::AcqRel) {
+            return;
+        }
         let limit = self.device.limits().max_texture_dimension_2d;
         let backed = self.pinned.map(|(width, height)| (width.clamp(1, limit), height.clamp(1, limit)));
         if let Some((width, height)) = backed.or_else(|| backing(&self.element, limit)) {
@@ -190,6 +198,15 @@ impl Screen {
             pipeline_cache: None,
         };
         let renderer = Renderer::new(device.clone(), queue.clone(), options)?;
+        let fit_dirty = Arc::new(AtomicBool::new(true));
+        let resize_listener = web_sys::window().and_then(|win| {
+            let dirty = fit_dirty.clone();
+            let cb = Closure::<dyn FnMut()>::new(move || {
+                dirty.store(true, Ordering::Release);
+            });
+            win.add_event_listener_with_callback("resize", cb.as_ref().unchecked_ref()).ok()?;
+            Some(cb)
+        });
         let canvas = Canvas {
             element,
             queue,
@@ -198,6 +215,8 @@ impl Screen {
             device,
             frame: None,
             pinned: None,
+            fit_dirty,
+            _resize_listener: resize_listener,
             timings: DrawTimings::default(),
         };
         Ok(Self {
@@ -227,6 +246,7 @@ impl Screen {
         self.canvas.pinned = size;
         let fit = if size.is_some() { "contain" } else { "" };
         let _ = self.canvas.element.style().set_property("object-fit", fit);
+        self.canvas.fit_dirty.store(true, Ordering::Release);
         self.canvas.fit();
     }
 

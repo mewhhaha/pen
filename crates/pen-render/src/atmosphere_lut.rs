@@ -143,15 +143,7 @@ fn normalize3(v: [f32; 3]) -> [f32; 3] {
 /// Encodes a command-ordered uniform upload via a mapped-at-creation staging buffer so multiple
 /// dispatches recorded into the same `CommandEncoder` never overwrite each other's inputs.
 fn encode_uniform_upload(device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, dst: &wgpu::Buffer, bytes: &[u8]) {
-    let stage = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("atmo_stage"),
-        size: bytes.len() as u64,
-        usage: wgpu::BufferUsages::COPY_SRC,
-        mapped_at_creation: true,
-    });
-    stage.slice(..).get_mapped_range_mut().unwrap().copy_from_slice(bytes);
-    stage.unmap();
-    encoder.copy_buffer_to_buffer(&stage, 0, dst, 0, bytes.len() as u64);
+    crate::staging::encode_copy(device, encoder, dst, 0, bytes);
 }
 
 /// GPU compute generator for physical Transmittance, Multi-Scattering, and Sky-View LUTs,
@@ -569,20 +561,9 @@ impl PhysicalAtmosphere {
         if medium_dirty {
             let u_trans = make_u(TRANSMITTANCE_SIZE);
             let u_ms = make_u(MULTISCATTER_SIZE);
-            let u_sz = std::mem::size_of::<AtmoUniform>() as u64;
-            let stage = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("atmo_lut_stage"),
-                size: u_sz * 3,
-                usage: wgpu::BufferUsages::COPY_SRC,
-                mapped_at_creation: true,
-            });
-            stage.slice(0..u_sz).get_mapped_range_mut().unwrap().copy_from_slice(bytemuck::bytes_of(&u_trans));
-            stage.slice(u_sz..u_sz * 2).get_mapped_range_mut().unwrap().copy_from_slice(bytemuck::bytes_of(&u_ms));
-            stage.slice(u_sz * 2..u_sz * 3).get_mapped_range_mut().unwrap().copy_from_slice(bytemuck::bytes_of(&u_sky));
-            stage.unmap();
-            encoder.copy_buffer_to_buffer(&stage, 0, &self.uniform_trans, 0, u_sz);
-            encoder.copy_buffer_to_buffer(&stage, u_sz, &self.uniform_ms, 0, u_sz);
-            encoder.copy_buffer_to_buffer(&stage, u_sz * 2, &self.uniform_sky, 0, u_sz);
+            encode_uniform_upload(device, encoder, &self.uniform_trans, bytemuck::bytes_of(&u_trans));
+            encode_uniform_upload(device, encoder, &self.uniform_ms, bytemuck::bytes_of(&u_ms));
+            encode_uniform_upload(device, encoder, &self.uniform_sky, bytemuck::bytes_of(&u_sky));
             dispatch(encoder, "atmo_transmittance", &self.pipe_trans, &self.bg_trans, TRANSMITTANCE_SIZE);
             dispatch(encoder, "atmo_multiscatter", &self.pipe_ms, &self.bg_ms, MULTISCATTER_SIZE);
             dispatch(encoder, "atmo_sky_view", &self.pipe_sky, &self.bg_sky, SKY_VIEW_SIZE);

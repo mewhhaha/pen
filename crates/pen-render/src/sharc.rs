@@ -251,12 +251,7 @@ impl SharcCache {
 
     fn upload(&self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, params: &SharcParams) {
         let uniform = SharcUniform::new(self.config, params);
-        let upload = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("sharc frame uniforms"),
-            contents: bytemuck::bytes_of(&uniform),
-            usage: wgpu::BufferUsages::COPY_SRC,
-        });
-        encoder.copy_buffer_to_buffer(&upload, 0, &self.uniform, 0, size_of::<SharcUniform>() as u64);
+        crate::staging::encode_copy(device, encoder, &self.uniform, 0, bytemuck::bytes_of(&uniform));
     }
 
     pub fn clear(&self, encoder: &mut wgpu::CommandEncoder) {

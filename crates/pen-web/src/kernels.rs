@@ -919,7 +919,10 @@ impl WebKernelService {
                 if job.manifest.variable_output() { pool.run_variable(&items_arr) } else { pool.run_fixed(&items_arr) }
                     .map_err(|_| ERR_EXECUTION_FAILED)?;
             match JsFuture::from(promise).await {
-                Ok(val) => Ok(Uint32Array::new(&val).to_vec()),
+                Ok(val) => {
+                    let arr = val.dyn_into::<Uint32Array>().unwrap_or_else(|v| Uint32Array::new(&v));
+                    Ok(arr.to_vec())
+                }
                 Err(err) => {
                     let code = match js_error_code(&err).as_deref() {
                         Some("timeout") => {

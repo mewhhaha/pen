@@ -1498,8 +1498,9 @@ impl Session {
             && self.live()
             && self.build.is_none()
             && !self.transport.travelling()
-            // Its requests' answers go to the next frame, as without overlap.
-            && rendered.services.is_empty()
+            // Synchronous host services can be answered before sending frame N+1;
+            // only async kernel batches need to wait until render completes.
+            && !crate::kernels::has_kernel_requests(&rendered.services)
             && !(rendered.checkpoint_requested
                 || rendered.undo_requested
                 || rendered.redo_requested
@@ -1868,7 +1869,17 @@ impl Session {
             }
         }
         let overlapped = self.overlaps(&planned, &rendered);
+        let mut services_answered = false;
         if overlapped {
+            // Answer deterministic non-kernel host services before planning frame N+1 so
+            // replies reach the guest on the exact same next frame as sequential execution.
+            if planned.replayed.is_none() && !rendered.services.is_empty() {
+                self.services.answer(&rendered.services);
+                for event in self.services.take_answers() {
+                    self.input.enqueue(event);
+                }
+                services_answered = true;
+            }
             // This frame changes nothing after it draws: the next one goes
             // to the guest now and computes while this one draws.
             self.timeline.observe(&rendered, false);
@@ -1882,7 +1893,7 @@ impl Session {
                 self.overlap.flight = Some(next);
             }
         }
-        let stop = self.complete(window, planned, rendered, overlapped, started)?;
+        let stop = self.complete(window, planned, rendered, overlapped, services_answered, started)?;
         Ok(!stop)
     }
 
@@ -1894,6 +1905,7 @@ impl Session {
         planned: Planned,
         rendered: RenderFrame,
         overlapped: bool,
+        services_answered: bool,
         started: Option<Instant>,
     ) -> Result<bool> {
         self.capture.screenshots.extend(planned.shots);
@@ -1924,7 +1936,7 @@ impl Session {
             // A live frame's requests (a recorded one's answers are in the
             // recording), before an undo or load replaces the world asking.
             // Pre-dispatch partition: `service::KERNEL` NEVER enters generic `Services::answer`.
-            if planned.replayed.is_none() {
+            if planned.replayed.is_none() && !services_answered {
                 if has_kernels {
                     let canonical: Vec<_> = rendered
                         .services

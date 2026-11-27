@@ -159,15 +159,7 @@ fn frame_rotation_matrix(frame: u32) -> [[f32; 3]; 3] {
 }
 
 fn encode_copy(device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, dst: &wgpu::Buffer, bytes: &[u8]) {
-    let stage = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("ddgi_stage"),
-        size: bytes.len() as u64,
-        usage: wgpu::BufferUsages::COPY_SRC,
-        mapped_at_creation: true,
-    });
-    stage.slice(..).get_mapped_range_mut().unwrap().copy_from_slice(bytes);
-    stage.unmap();
-    encoder.copy_buffer_to_buffer(&stage, 0, dst, 0, bytes.len() as u64);
+    crate::staging::encode_copy(device, encoder, dst, 0, bytes);
 }
 
 /// GPU 3D DDGI probe volume with octahedral irradiance and Chebyshev visibility atlases,

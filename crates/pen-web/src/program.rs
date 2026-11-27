@@ -9,7 +9,7 @@ use anyhow::{Result, anyhow, ensure};
 use js_sys::{Float32Array, Promise, Reflect, Uint8Array};
 use pen_runtime::program::{self, Backend, Operation, Program};
 use pen_runtime::symbols::{Symbols, js_frames};
-use wasm_bindgen::prelude::*;
+use wasm_bindgen::{JsCast, prelude::*};
 use wasm_bindgen_futures::JsFuture;
 use web_time::Instant;
 
@@ -122,7 +122,7 @@ impl Program for BrowserProgram {
         self.answered = Some(Instant::now());
         match result {
             Ok(value) => {
-                let array = Float32Array::new(&value);
+                let array = value.dyn_into::<Float32Array>().unwrap_or_else(|v| Float32Array::new(&v));
                 let mut buffer = std::mem::take(&mut self.spare_response);
                 buffer.resize(array.length() as usize, 0.0);
                 array.copy_to(&mut buffer);

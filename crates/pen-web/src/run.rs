@@ -214,24 +214,26 @@ struct Autosave {
     at: f64,
     /// A frame ran, or the game was restored, since.
     changed: bool,
-    /// The hashes of the states written last.
-    game: Option<u64>,
+    /// The hashes of the states written last (updated off the synchronous rAF path).
+    game: Rc<std::cell::Cell<Option<u64>>>,
     #[cfg(feature = "devtools")]
-    tools: Option<u64>,
+    tools: Rc<std::cell::Cell<Option<u64>>>,
 }
 
-/// Writes `saved` as the save `name` off the frame's path, unless it is
-/// the state written last (`last`, its hash); returns its hash.
-fn keep(name: &'static str, saved: SavedState, last: Option<u64>) -> Option<u64> {
-    let hash = hash_lanes(&saved.state) ^ u64::from(saved.schema);
-    if last != Some(hash) {
-        spawn_local(async move {
+/// Hashes and writes `saved` as the save `name` off the frame's path, unless
+/// it matches the state last written (`last`).
+fn keep(name: &'static str, saved: Arc<SavedState>, last: &Rc<std::cell::Cell<Option<u64>>>) {
+    let last = last.clone();
+    spawn_local(async move {
+        let hash = hash_lanes(&saved.state) ^ u64::from(saved.schema);
+        if last.get() != Some(hash) {
+            last.set(Some(hash));
             if let Err(error) = saves::write(name, &saved).await {
+                last.set(None);
                 web_sys::console::warn_1(&format!("keeping {name}: {error:#}").into());
             }
-        });
-    }
-    Some(hash)
+        }
+    });
 }
 
 /// Optional browser WebSocket relay netplay configuration passed via `options.netRelay`.
@@ -1355,8 +1357,8 @@ impl Browser {
         }
         self.autosave.at = timestamp;
         if std::mem::take(&mut self.autosave.changed) {
-            match self.game.snapshot().await {
-                Ok(saved) => self.autosave.game = keep("pen.autosave", saved, self.autosave.game),
+            match self.game.shared_snapshot().await {
+                Ok(saved) => keep("pen.autosave", saved, &self.autosave.game),
                 Err(error) => say(&mut self.log, log_source::SESSION, true, format!("autosave: {error:#}")),
             }
         }
@@ -1364,7 +1366,7 @@ impl Browser {
         if let Some(tools) = &mut self.tools
             && let Some(saved) = tools.snapshot().await
         {
-            self.autosave.tools = keep("pen.devtools", saved, self.autosave.tools);
+            keep("pen.devtools", Arc::new(saved), &self.autosave.tools);
         }
     }
 

@@ -392,7 +392,8 @@ pub async fn start(canvas: HtmlCanvasElement, options: JsValue) -> Result<(), Js
     log.push(log_source::SESSION, false, "pen browser host ready");
     let viewport = screen.viewport();
     #[cfg(feature = "kernels")]
-    let game_wasm_for_kernels = game.clone();
+    let game_wasm_for_kernels =
+        pen_runtime::abi::read_abi(&game).ok().is_some_and(|abi| !abi.kernels.is_empty()).then(|| game.clone());
     #[cfg(feature = "netplay")]
     let build_hash = pen_runtime::net::wire::hash_bytes(&game);
     let started = {
@@ -424,7 +425,10 @@ pub async fn start(canvas: HtmlCanvasElement, options: JsValue) -> Result<(), Js
     #[cfg(not(feature = "devtools"))]
     let _ = devtools;
     #[cfg(feature = "kernels")]
-    let kernels = kernels::WebKernelService::maybe_new(&game_wasm_for_kernels).await;
+    let kernels = match game_wasm_for_kernels.as_deref() {
+        Some(bytes) => kernels::WebKernelService::maybe_new(bytes).await,
+        None => None,
+    };
     let input = input::Input::install(&canvas);
     let audio = audio::Audio::new(&canvas, assets);
     let browser = Browser::new(

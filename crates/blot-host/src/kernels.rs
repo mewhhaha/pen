@@ -1117,12 +1117,13 @@ impl KernelPool {
             cvar: Condvar::new(),
         });
 
-        let active_count = self.workers.len();
+        let chunks = count.div_ceil(self.max_chunk_items.max(1)).max(1);
+        let active_count = self.workers.len().min(chunks);
         {
             let mut guard = batch.state.lock().unwrap();
             guard.active_workers_on_batch = active_count;
         }
-        for slot in &self.workers {
+        for slot in &self.workers[..active_count] {
             let (lock, cvar) = &*slot.dispatch;
             let mut cmd = lock.lock().unwrap();
             cmd.batch = Some(BatchJob { shared: batch.clone(), fixed_storage: fixed_storage.cloned() });

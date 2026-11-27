@@ -183,6 +183,7 @@ impl State {
         }
         let pass_obj = wired.jfa_outline.pass.get_or_insert_with(|| JfaOutlinePass::new(device));
         pass_obj.resize(device, w, h);
+        pass_obj.begin_scene_masks();
         let style_slice = &outline_scene.styles[..outline_scene.styles.len().min(OUTLINE_STYLE_CAPACITY)];
 
         let vertex_stride = (MESH_VERTEX_FLOATS * size_of::<f32>()) as u64;
@@ -213,8 +214,9 @@ impl State {
                 depth_bias: bias,
             };
             let skin = entry.skin.zip(mesh.skin.as_ref()).zip(joints);
-            let prepared = pass_obj.prepare_scene_mask(
+            let prepared = pass_obj.prepare_scene_mask_queued(
                 device,
+                encoder,
                 &params,
                 resolved_r32.is_some(),
                 skin.map(|((at, _), (buffer, size))| (at, buffer, size)),

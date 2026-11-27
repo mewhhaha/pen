@@ -132,6 +132,8 @@ mod sprites;
 #[cfg(feature = "render-3d")]
 mod ssgi;
 #[cfg(feature = "render-3d")]
+mod staging;
+#[cfg(feature = "render-3d")]
 mod subsurface;
 #[cfg(feature = "render-3d")]
 mod surface;

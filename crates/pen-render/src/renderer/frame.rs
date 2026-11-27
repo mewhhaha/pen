@@ -401,8 +401,13 @@ impl State {
         // What a frame works out reuses the last one's memory.
         let mut scratch = std::mem::take(&mut self.scratch);
         scratch.clear();
+        if !self.wired.in_secondary_camera {
+            self.frame_staging.begin_frame(&self.device);
+        }
         let cache = self.context.cache.clone();
-        let drawn = cache.with_active(|| self.draw_inner(frame, catalog, target, &mut scratch, validate));
+        let staging = self.frame_staging.clone();
+        let drawn = cache
+            .with_active(|| staging.with_active(|| self.draw_inner(frame, catalog, target, &mut scratch, validate)));
         self.scratch = scratch;
         if drawn.is_err() {
             #[cfg(feature = "render-rt")]

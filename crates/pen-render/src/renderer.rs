@@ -921,6 +921,8 @@ pub(crate) struct State {
     // whether the host wants them.
     timer: timing::GpuTimer,
     timing: bool,
+    // Reusable frame-scoped staging ring buffer for encoder-ordered small uploads.
+    frame_staging: crate::staging::FrameStaging,
     // Instances of large batches culled on the GPU, plus prior-frame Hi-Z occlusion pyramid.
     culling: GpuCulling,
     hiz: hiz::HiZ,
@@ -1331,6 +1333,7 @@ impl State {
             last_stats: RenderStats::default(),
             timer: timing::GpuTimer::new(&device, &queue),
             timing: false,
+            frame_staging: crate::staging::FrameStaging::new(queue.clone()),
             culling: GpuCulling::new(&device, &queue),
             hiz: hiz::HiZ::new(&device, &queue),
             asset_budget: None,

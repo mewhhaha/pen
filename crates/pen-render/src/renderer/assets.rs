@@ -822,6 +822,8 @@ impl State {
                 }
             }
         }
+        const MAX_STREAM_UPLOAD_BYTES_PER_FRAME: usize = 4 * 1024 * 1024;
+        let mut uploaded_bytes = 0usize;
         let mut index = 0;
         while index < self.streaming.len() {
             let slot = self.streaming[index];
@@ -836,8 +838,12 @@ impl State {
                         ended = true;
                         break;
                     };
+                    if uploaded_bytes >= MAX_STREAM_UPLOAD_BYTES_PER_FRAME {
+                        break;
+                    }
                     match levels.try_recv() {
                         Ok(LevelMessage::Level(level)) => {
+                            uploaded_bytes += level.pixels.len();
                             upload_level(&self.queue, &texture.texture, &level);
                             texture.resident = level.level;
                             new_views = true;

@@ -121,15 +121,7 @@ pub fn apply_projection_jitter(projection: &[f32; 16], jitter_px: [f32; 2], in_s
 }
 
 fn encode_stage_copy(device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, dst: &wgpu::Buffer, bytes: &[u8]) {
-    let stage = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("post_fx_stage"),
-        size: bytes.len() as u64,
-        usage: wgpu::BufferUsages::COPY_SRC,
-        mapped_at_creation: true,
-    });
-    stage.slice(..).get_mapped_range_mut().unwrap().copy_from_slice(bytes);
-    stage.unmap();
-    encoder.copy_buffer_to_buffer(&stage, 0, dst, 0, bytes.len() as u64);
+    crate::staging::encode_copy(device, encoder, dst, 0, bytes);
 }
 
 #[repr(C)]

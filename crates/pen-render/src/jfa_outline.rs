@@ -103,6 +103,13 @@ struct MaskTargets {
     init: wgpu::BindGroup,
 }
 
+type CachedMaskBg = (MeshPipelineKey, Option<wgpu::TextureView>, Option<(u32, wgpu::Buffer, u64)>, wgpu::BindGroup);
+
+struct MeshDrawSlot {
+    uniform: wgpu::Buffer,
+    cached_bg: Option<CachedMaskBg>,
+}
+
 pub struct JfaOutlinePass {
     shader: wgpu::ShaderModule,
     styles: wgpu::Buffer,
@@ -115,6 +122,8 @@ pub struct JfaOutlinePass {
     targets: Option<MaskTargets>,
     resolved: Option<(usize, wgpu::TextureView, u32)>,
     composite_bg: Option<(usize, wgpu::TextureView, u32, wgpu::TextureFormat, wgpu::BindGroup)>,
+    mesh_draw_pool: Vec<MeshDrawSlot>,
+    mesh_draw_cursor: usize,
 }
 
 impl JfaOutlinePass {
@@ -180,6 +189,8 @@ impl JfaOutlinePass {
             targets: None,
             resolved: None,
             composite_bg: None,
+            mesh_draw_pool: Vec::new(),
+            mesh_draw_cursor: 0,
         }
     }
 
@@ -364,15 +375,126 @@ impl JfaOutlinePass {
     }
 
     #[cfg_attr(not(feature = "render-jfa-outline"), allow(dead_code))]
-    pub(crate) fn prepare_scene_mask(
+    pub(crate) fn begin_scene_masks(&mut self) {
+        self.mesh_draw_cursor = 0;
+    }
+
+    #[cfg_attr(not(feature = "render-jfa-outline"), allow(dead_code))]
+    pub(crate) fn prepare_scene_mask_queued(
         &mut self,
         device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
         params: &MeshMaskParams<'_>,
         resolved: bool,
         skin: Option<(u32, &wgpu::Buffer, u64)>,
     ) -> PreparedMeshMask {
         let kind = if resolved { SceneDepthKind::R32Float } else { SceneDepthKind::Depth2d };
-        self.prepare_mesh_mask_inner(device, params, kind, skin)
+        self.prepare_mesh_mask_pooled(device, Some(encoder), params, kind, skin)
+    }
+
+    fn prepare_mesh_mask_pooled(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: Option<&mut wgpu::CommandEncoder>,
+        params: &MeshMaskParams<'_>,
+        scene_depth_kind: SceneDepthKind,
+        skin: Option<(u32, &wgpu::Buffer, u64)>,
+    ) -> PreparedMeshMask {
+        let Some(encoder) = encoder else {
+            return self.prepare_mesh_mask_inner(device, params, scene_depth_kind, skin);
+        };
+        assert!(params.style_index < OUTLINE_STYLE_CAPACITY, "style index is outside the outline palette");
+        assert!(
+            params.vertex_stride >= 12
+                && params.vertex_stride.is_multiple_of(4)
+                && params.vertex_stride <= u64::from(device.limits().max_vertex_buffer_array_stride),
+            "invalid mesh vertex stride"
+        );
+        let key = MeshPipelineKey {
+            stride: params.vertex_stride,
+            depth_mode: params.depth_mode,
+            scene_depth: scene_depth_kind,
+            skinned: skin.is_some(),
+        };
+        let pipeline = if let Some((_, pipeline)) = self.mesh_pipelines.iter().find(|(candidate, _)| *candidate == key)
+        {
+            pipeline.clone()
+        } else {
+            let pipeline = self.create_mesh_pipeline(device, key);
+            self.mesh_pipelines.push((key, pipeline.clone()));
+            pipeline
+        };
+        let draw = MeshDraw {
+            model: params.model,
+            view_proj: params.view_proj,
+            packed_style: u32::try_from(params.style_index + 1).unwrap(),
+            reversed_z: u32::from(params.depth_mode == DepthMode::ReversedZ),
+            depth_bias: params.depth_bias.max(0.0),
+            padding: 0,
+        };
+        let slot_idx = self.mesh_draw_cursor;
+        self.mesh_draw_cursor += 1;
+        if slot_idx == self.mesh_draw_pool.len() {
+            let uniform = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("JFA mesh draw pooled"),
+                size: size_of::<MeshDraw>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.mesh_draw_pool.push(MeshDrawSlot { uniform, cached_bg: None });
+        }
+        let slot = &mut self.mesh_draw_pool[slot_idx];
+        crate::staging::encode_copy(device, encoder, &slot.uniform, 0, bytemuck::bytes_of(&draw));
+        let depth_key = params.scene_depth.cloned();
+        let skin_key = skin.map(|(off, buf, sz)| (off, buf.clone(), sz));
+        let hit = matches!(
+            &slot.cached_bg,
+            Some((k, d, s, _)) if *k == key && *d == depth_key && *s == skin_key
+        );
+        if !hit {
+            let draw_entry = wgpu::BindGroupEntry { binding: 0, resource: slot.uniform.as_entire_binding() };
+            let depth_entry = params.scene_depth.map(|depth| {
+                let binding = match scene_depth_kind {
+                    SceneDepthKind::R32Float => 7,
+                    _ => 1,
+                };
+                wgpu::BindGroupEntry { binding, resource: wgpu::BindingResource::TextureView(depth) }
+            });
+            let skin_entry = skin.map(|(offset, buffer, size)| wgpu::BindGroupEntry {
+                binding: 8,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer,
+                    offset: u64::from(offset),
+                    size: wgpu::BufferSize::new(size),
+                }),
+            });
+            let layout = pipeline.get_bind_group_layout(0);
+            let bindings = match (depth_entry, skin_entry) {
+                (Some(depth), Some(skin)) => device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("JFA mesh draw bindings"),
+                    layout: &layout,
+                    entries: &[draw_entry, depth, skin],
+                }),
+                (Some(depth), None) => device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("JFA mesh draw bindings"),
+                    layout: &layout,
+                    entries: &[draw_entry, depth],
+                }),
+                (None, Some(skin)) => device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("JFA mesh draw bindings"),
+                    layout: &layout,
+                    entries: &[draw_entry, skin],
+                }),
+                (None, None) => device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("JFA mesh draw bindings"),
+                    layout: &layout,
+                    entries: &[draw_entry],
+                }),
+            };
+            slot.cached_bg = Some((key, depth_key, skin_key, bindings));
+        }
+        let bindings = slot.cached_bg.as_ref().unwrap().3.clone();
+        PreparedMeshMask { pipeline, bindings }
     }
 
     fn prepare_mesh_mask_inner(
@@ -1000,8 +1122,10 @@ mod tests {
         let mut joint = IDENTITY;
         joint[12] = 0.5;
         let joints = buffer(bytemuck::cast_slice(&joint), wgpu::BufferUsages::STORAGE);
-        let prepared = frame.outline.prepare_scene_mask(
+        frame.outline.begin_scene_masks();
+        let prepared = frame.outline.prepare_scene_mask_queued(
             &frame.device,
+            &mut frame.encoder,
             &MeshMaskParams {
                 vertex_stride: 12,
                 model: IDENTITY,

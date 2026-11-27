@@ -1,3 +1,4 @@
+#![cfg_attr(not(feature = "render-area-lights"), allow(dead_code))]
 // Clustered forward lighting for the frame's point and spot lights (the
 // render packet's lights section). The view is cut into clusters: 16 x 9
 // tiles of the picture, and 24 slices of the depth ahead, closer together
@@ -564,8 +565,9 @@ impl Clusters {
             label: Some("area lights + LTC LUTs"),
             size: AREA_BUFFER_BYTES,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: true,
+            mapped_at_creation: cfg!(feature = "render-area-lights"),
         });
+        #[cfg(feature = "render-area-lights")]
         {
             type LtcLuts = (Vec<[f32; 4]>, Vec<[f32; 4]>);
             static LTC_LUTS: std::sync::OnceLock<LtcLuts> = std::sync::OnceLock::new();
@@ -582,8 +584,8 @@ impl Clusters {
                 .get_mapped_range_mut()
                 .unwrap()
                 .copy_from_slice(amp_bytes);
+            area.unmap();
         }
-        area.unmap();
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("local shadows"),
             compare: Some(wgpu::CompareFunction::Less),
@@ -676,6 +678,7 @@ impl Clusters {
     }
 
     /// Packs `frame.area_lights` (up to `MAX_AREA_LIGHTS`) into the area-light storage region.
+    #[cfg(feature = "render-area-lights")]
     fn upload_area_lights(&mut self, queue: &wgpu::Queue, frame: &RenderFrame, cookie_slots: &[Option<u32>]) -> u32 {
         use crate::area_lights::AreaLight;
         self.area_data.clear();
@@ -719,7 +722,23 @@ impl Clusters {
         u32::try_from(self.area_data.len()).unwrap_or(0)
     }
 
+    #[cfg(not(feature = "render-area-lights"))]
+    fn upload_area_lights(&mut self, _queue: &wgpu::Queue, _frame: &RenderFrame, _cookie_slots: &[Option<u32>]) -> u32 {
+        0
+    }
+
     /// Downsamples changed cookie projector textures (32x32 RGBA) into `self.area` storage slots.
+    #[cfg(not(feature = "render-area-lights"))]
+    pub fn encode_cookies(
+        &mut self,
+        _device: &wgpu::Device,
+        _encoder: &mut wgpu::CommandEncoder,
+        _cookies: &[(u32, wgpu::TextureView, u64)],
+    ) {
+    }
+
+    /// Downsamples changed cookie projector textures (32x32 RGBA) into `self.area` storage slots.
+    #[cfg(feature = "render-area-lights")]
     pub fn encode_cookies(
         &mut self,
         device: &wgpu::Device,

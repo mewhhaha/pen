@@ -240,7 +240,7 @@ impl TaauUpscaler {
         });
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("upscale_rcas"),
-            source: wgpu::ShaderSource::Wgsl(UPSCALE_RCAS_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(crate::deferred_wgsl!("upscale_rcas.wgsl").into()),
         });
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("taau_pl"),
@@ -519,7 +519,7 @@ impl FsrEasuUpscaler {
         });
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("easu_shader"),
-            source: wgpu::ShaderSource::Wgsl(UPSCALE_RCAS_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(crate::deferred_wgsl!("upscale_rcas.wgsl").into()),
         });
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("easu_pl"),
@@ -665,7 +665,7 @@ impl RcasSharpener {
         });
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("rcas_shader"),
-            source: wgpu::ShaderSource::Wgsl(UPSCALE_RCAS_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(crate::deferred_wgsl!("upscale_rcas.wgsl").into()),
         });
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("rcas_pl"),
@@ -894,7 +894,7 @@ impl PostFxPass {
         });
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("post_fx_shader"),
-            source: wgpu::ShaderSource::Wgsl(POST_FX_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(crate::deferred_wgsl!("post_fx.wgsl").into()),
         });
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("post_fx_pl"),

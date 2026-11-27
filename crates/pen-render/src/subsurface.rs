@@ -1,3 +1,4 @@
+#![cfg_attr(not(feature = "render-subsurface"), allow(dead_code))]
 // Screen-space subsurface scattering, for skin and other materials that light
 // travels a little way into before it leaves (a material's `"subsurface":
 // true`). The scene stamps such surfaces into the stencil (`MARK`), and once the
@@ -117,8 +118,6 @@ fn kernel_wgsl() -> String {
     format!("const KERNEL = array<vec4f, {}>(\n  {taps});", TAPS + 1)
 }
 
-const SHADER: &str = crate::wgsl!("subsurface.wgsl");
-
 const FULLSCREEN: &str = crate::wgsl!("fullscreen.wgsl");
 
 /// One of the two passes' shader, reading the depth and the stencil marks of a
@@ -126,7 +125,7 @@ const FULLSCREEN: &str = crate::wgsl!("fullscreen.wgsl");
 pub(crate) fn shader(samples: u32) -> String {
     let depth = if samples > 1 { "texture_depth_multisampled_2d" } else { "texture_depth_2d" };
     let marks = if samples > 1 { "texture_multisampled_2d<u32>" } else { "texture_2d<u32>" };
-    SHADER
+    crate::deferred_wgsl!("subsurface.wgsl")
         .replace("${depth_texture}", depth)
         .replace("${marks_texture}", marks)
         .replace("${fullscreen}", FULLSCREEN)

@@ -404,7 +404,16 @@ mod tests {
             // 2: Tube above origin
             AreaLight::tube([0.0, 2.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0], 1.5, 0.15, [4.0; 3], 20.0),
             // 3: Cookie projector at (0, 3, 0) shining down (-Y)
-            AreaLight::cookie_projector([0.0, 3.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0], 1.0, 1.0, [10.0; 3], 20.0, 0.01),
+            AreaLight::cookie_projector(
+                [0.0, 3.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0],
+                1.0,
+                1.0,
+                [10.0; 3],
+                20.0,
+                0.01,
+            ),
         ];
         #[repr(C)]
         #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -416,23 +425,68 @@ mod tests {
         }
         let probes = [
             // 0: One-sided Rect front (y=0), smooth mirror-like specular
-            Probe { world_rough: [0.0, 0.0, 0.0, 0.15], view_kind: [0.0, 1.0, 0.0, 0.0], normal_f0: [0.0, 1.0, 0.0, 0.9], albedo_pad: [0.05, 0.05, 0.05, 0.0] },
+            Probe {
+                world_rough: [0.0, 0.0, 0.0, 0.15],
+                view_kind: [0.0, 1.0, 0.0, 0.0],
+                normal_f0: [0.0, 1.0, 0.0, 0.9],
+                albedo_pad: [0.05, 0.05, 0.05, 0.0],
+            },
             // 1: One-sided Rect front (y=0), rough
-            Probe { world_rough: [0.0, 0.0, 0.0, 0.70], view_kind: [0.0, 1.0, 0.0, 0.0], normal_f0: [0.0, 1.0, 0.0, 0.9], albedo_pad: [0.05, 0.05, 0.05, 0.0] },
+            Probe {
+                world_rough: [0.0, 0.0, 0.0, 0.70],
+                view_kind: [0.0, 1.0, 0.0, 0.0],
+                normal_f0: [0.0, 1.0, 0.0, 0.9],
+                albedo_pad: [0.05, 0.05, 0.05, 0.0],
+            },
             // 2: Exact diffuse form-factor check for 2x2 unit-radiance square at h=2: pure diffuse (albedo=1, f0=0)
-            Probe { world_rough: [0.0, 0.0, 0.0, 1.0], view_kind: [0.0, 1.0, 0.0, 0.0], normal_f0: [0.0, 1.0, 0.0, 0.0], albedo_pad: [1.0, 1.0, 1.0, 0.0] },
+            Probe {
+                world_rough: [0.0, 0.0, 0.0, 1.0],
+                view_kind: [0.0, 1.0, 0.0, 0.0],
+                normal_f0: [0.0, 1.0, 0.0, 0.0],
+                albedo_pad: [1.0, 1.0, 1.0, 0.0],
+            },
             // 3: One-sided Rect BACK side (y=4, normal facing down toward light) -> MUST be 0!
-            Probe { world_rough: [0.0, 4.0, 0.0, 0.5], view_kind: [0.0, -1.0, 0.0, 0.0], normal_f0: [0.0, -1.0, 0.0, 0.5], albedo_pad: [1.0, 1.0, 1.0, 0.0] },
+            Probe {
+                world_rough: [0.0, 4.0, 0.0, 0.5],
+                view_kind: [0.0, -1.0, 0.0, 0.0],
+                normal_f0: [0.0, -1.0, 0.0, 0.5],
+                albedo_pad: [1.0, 1.0, 1.0, 0.0],
+            },
             // 4: One-sided Disk front (y=0)
-            Probe { world_rough: [0.0, 0.0, 0.0, 0.20], view_kind: [0.0, 1.0, 0.0, 1.0], normal_f0: [0.0, 1.0, 0.0, 0.9], albedo_pad: [0.05, 0.05, 0.05, 0.0] },
+            Probe {
+                world_rough: [0.0, 0.0, 0.0, 0.20],
+                view_kind: [0.0, 1.0, 0.0, 1.0],
+                normal_f0: [0.0, 1.0, 0.0, 0.9],
+                albedo_pad: [0.05, 0.05, 0.05, 0.0],
+            },
             // 5: One-sided Disk BACK side (y=4) -> MUST be 0!
-            Probe { world_rough: [0.0, 4.0, 0.0, 0.20], view_kind: [0.0, -1.0, 0.0, 1.0], normal_f0: [0.0, -1.0, 0.0, 0.9], albedo_pad: [1.0, 1.0, 1.0, 0.0] },
+            Probe {
+                world_rough: [0.0, 4.0, 0.0, 0.20],
+                view_kind: [0.0, -1.0, 0.0, 1.0],
+                normal_f0: [0.0, -1.0, 0.0, 0.9],
+                albedo_pad: [1.0, 1.0, 1.0, 0.0],
+            },
             // 6: Tube
-            Probe { world_rough: [0.0, 0.0, 0.0, 0.20], view_kind: [0.0, 1.0, 0.0, 2.0], normal_f0: [0.0, 1.0, 0.0, 0.9], albedo_pad: [0.05, 0.05, 0.05, 0.0] },
+            Probe {
+                world_rough: [0.0, 0.0, 0.0, 0.20],
+                view_kind: [0.0, 1.0, 0.0, 2.0],
+                normal_f0: [0.0, 1.0, 0.0, 0.9],
+                albedo_pad: [0.05, 0.05, 0.05, 0.0],
+            },
             // 7: Cookie lit left half
-            Probe { world_rough: [-1.0, 0.0, 0.0, 0.50], view_kind: [0.0, 1.0, 0.0, 3.0], normal_f0: [0.0, 1.0, 0.0, 0.04], albedo_pad: [0.8, 0.8, 0.8, 0.0] },
+            Probe {
+                world_rough: [-1.0, 0.0, 0.0, 0.50],
+                view_kind: [0.0, 1.0, 0.0, 3.0],
+                normal_f0: [0.0, 1.0, 0.0, 0.04],
+                albedo_pad: [0.8, 0.8, 0.8, 0.0],
+            },
             // 8: Cookie dark right half
-            Probe { world_rough: [1.0, 0.0, 0.0, 0.50], view_kind: [0.0, 1.0, 0.0, 3.0], normal_f0: [0.0, 1.0, 0.0, 0.04], albedo_pad: [0.8, 0.8, 0.8, 0.0] },
+            Probe {
+                world_rough: [1.0, 0.0, 0.0, 0.50],
+                view_kind: [0.0, 1.0, 0.0, 3.0],
+                normal_f0: [0.0, 1.0, 0.0, 0.04],
+                albedo_pad: [0.8, 0.8, 0.8, 0.0],
+            },
         ];
         let make_buf = |label, bytes: &[u8], usage| {
             let b = device.create_buffer(&wgpu::BufferDescriptor {
@@ -504,7 +558,12 @@ mod tests {
         let vals: &[[f32; 4]] = bytemuck::cast_slice(&bytes);
         assert!(vals.iter().flatten().all(|v| v.is_finite() && *v >= 0.0), "{vals:?}");
         // Smooth mirror-aligned rect highlight must exceed rough.
-        assert!(vals[0][0] > vals[1][0] * 1.3, "smooth rect must peak brighter than rough: {} vs {}", vals[0][0], vals[1][0]);
+        assert!(
+            vals[0][0] > vals[1][0] * 1.3,
+            "smooth rect must peak brighter than rough: {} vs {}",
+            vals[0][0],
+            vals[1][0]
+        );
         // Analytical Lambertian form factor of [-1, 1]^2 square at h=2 above center:
         // F = (4 / pi) * (a / sqrt(a^2 + h^2)) * atan(a / sqrt(a^2 + h^2)) with a=1, h=2 -> 0.23946.
         let expected_f = (4.0 / PI) * (1.0 / 5.0f64.sqrt()) * (1.0 / 5.0f64.sqrt()).atan();
@@ -518,7 +577,12 @@ mod tests {
         assert!(vals[4][0] > 1.0, "one-sided disk front side must illuminate: {:?}", vals[4]);
         assert_eq!(vals[5][0], 0.0, "one-sided disk back side must be dark: {:?}", vals[5]);
         assert!(vals[6][0] > 0.3, "tube LTC must illuminate: {:?}", vals[6]);
-        assert!(vals[7][0] > 0.3 && vals[7][0] > vals[8][0] * 10.0, "cookie contrast failed: lit={} dark={}", vals[7][0], vals[8][0]);
+        assert!(
+            vals[7][0] > 0.3 && vals[7][0] > vals[8][0] * 10.0,
+            "cookie contrast failed: lit={} dark={}",
+            vals[7][0],
+            vals[8][0]
+        );
         drop(bytes);
         readback.unmap();
     }

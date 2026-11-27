@@ -322,6 +322,7 @@ fn route(site: &Site, request: &Request, revision: u64) -> Reply {
         Some("js") => "text/javascript",
         Some("wasm") => "application/wasm",
         Some("json") => "application/json",
+        Some("wgsl") => "text/plain; charset=utf-8",
         Some("png") => "image/png",
         Some("jpg" | "jpeg") => "image/jpeg",
         Some("ogg") => "audio/ogg",

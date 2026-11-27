@@ -5,7 +5,10 @@ pub mod policy;
 
 #[cfg(target_arch = "wasm32")]
 mod accessibility;
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", feature = "audio-advanced"))]
+mod audio;
+#[cfg(all(target_arch = "wasm32", not(feature = "audio-advanced")))]
+#[path = "audio_lite.rs"]
 mod audio;
 #[cfg(all(target_arch = "wasm32", feature = "devtools"))]
 mod development;

@@ -1,3 +1,4 @@
+#![cfg_attr(not(feature = "render-particles-cpu"), allow(dead_code, unused_imports))]
 // Particles: the frame's emitters (pen-protocol's Emitter) simulated on the
 // GPU and drawn over the scene's opaque and translucent surfaces. Each frame
 // works out, on the CPU, which of each emitter's particles are alive (from
@@ -17,9 +18,6 @@ use crate::built_in::BuiltIn;
 use crate::matrix::{multiply, narrow};
 use crate::post::SCENE_FORMAT;
 use crate::shader::PipelineContext;
-
-const SIMULATE: &str = crate::wgsl!("particles.wgsl");
-const QUADS: &str = crate::wgsl!("particle_quads.wgsl");
 
 // The most particles a frame draws, all emitters together: 64 MB of them,
 // within a storage binding and a dispatch.
@@ -82,7 +80,7 @@ pub(crate) fn living(emitter: &Emitter) -> Option<Living> {
 pub(crate) fn pipeline(context: &PipelineContext, samples: u32, additive: bool) -> wgpu::RenderPipeline {
     use wgpu::{BlendComponent, BlendFactor, BlendOperation};
     let device = &context.device;
-    let code = QUADS
+    let code = crate::deferred_wgsl!("particle_quads.wgsl")
         .replace("${translucency}", crate::volume::TRANSLUCENCY_WGSL)
         .replace("${additive}", if additive { "true" } else { "false" });
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -317,165 +315,177 @@ impl State {
     /// material, texture or pipeline is on its way waits.
     pub(super) fn prepare_particles(
         &mut self,
-        frame: &RenderFrame,
-        catalog: &Catalog,
-        samples: u32,
-        scratch: &mut Scratch,
+        #[cfg_attr(not(feature = "render-particles-cpu"), allow(unused_variables))] frame: &RenderFrame,
+        #[cfg_attr(not(feature = "render-particles-cpu"), allow(unused_variables))] catalog: &Catalog,
+        #[cfg_attr(not(feature = "render-particles-cpu"), allow(unused_variables))] samples: u32,
+        #[cfg_attr(not(feature = "render-particles-cpu"), allow(unused_variables))] scratch: &mut Scratch,
     ) -> Result<()> {
-        if let Some(particles) = &mut self.particles {
-            particles.total = 0;
-        }
-        if frame.emitters.is_empty() {
-            return Ok(());
-        }
-        if self.particles.is_none() {
-            self.particles = Some(Particles::new(self)?);
-        }
-        // Each emitter's slots, and the texture its particles take.
-        let mut placed = Vec::new();
-        let mut params = std::mem::take(&mut self.particles.as_mut().unwrap().params);
-        params.clear();
-        let mut total = 0u32;
-        for emitter in &frame.emitters {
-            let Some(living) = living(emitter) else { continue };
-            if total + living.slots > MOST {
-                break;
+        #[cfg(not(feature = "render-particles-cpu"))]
+        return Ok(());
+        #[cfg(feature = "render-particles-cpu")]
+        {
+            if let Some(particles) = &mut self.particles {
+                particles.total = 0;
             }
-            let Some(material) = self.material(catalog, emitter.material)? else { continue };
-            let material = &material.material;
-            let texture = match &material.texture {
-                None => None,
-                Some(key) => {
-                    let slot = self.resolve(AssetKind::Texture, key)?;
-                    match self.assets.current(slot) {
-                        Some(GpuAsset::Texture(texture)) => Some(texture.view.clone()),
-                        // A texture that failed shows its particles as dots.
-                        _ if self.assets.loading(slot) => continue,
-                        _ => None,
-                    }
+            if frame.emitters.is_empty()
+                || !crate::deferred_shaders::ready_all(&["particles.wgsl", "particle_quads.wgsl"])
+            {
+                return Ok(());
+            }
+            if self.particles.is_none() {
+                self.particles = Some(Particles::new(self)?);
+            }
+            // Each emitter's slots, and the texture its particles take.
+            let mut placed = Vec::new();
+            let mut params = std::mem::take(&mut self.particles.as_mut().unwrap().params);
+            params.clear();
+            let mut total = 0u32;
+            for emitter in &frame.emitters {
+                let Some(living) = living(emitter) else { continue };
+                if total + living.slots > MOST {
+                    break;
                 }
-            };
-            let which = BuiltIn::Particles { samples, additive: emitter.additive };
-            if !self.built_ins.ready([which]) {
-                self.built_ins.prepare([which]);
-                self.waiting = true;
-                continue;
+                let Some(material) = self.material(catalog, emitter.material)? else { continue };
+                let material = &material.material;
+                let texture = match &material.texture {
+                    None => None,
+                    Some(key) => {
+                        let slot = self.resolve(AssetKind::Texture, key)?;
+                        match self.assets.current(slot) {
+                            Some(GpuAsset::Texture(texture)) => Some(texture.view.clone()),
+                            // A texture that failed shows its particles as dots.
+                            _ if self.assets.loading(slot) => continue,
+                            _ => None,
+                        }
+                    }
+                };
+                let which = BuiltIn::Particles { samples, additive: emitter.additive };
+                if !self.built_ins.ready([which]) {
+                    self.built_ins.prepare([which]);
+                    self.waiting = true;
+                    continue;
+                }
+                let tint = material.color.map(narrow);
+                let color = |color: &pen_protocol::Color| {
+                    [color.r * tint[0], color.g * tint[1], color.b * tint[2], color.a * tint[3]]
+                };
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "a birth number, wrapping")]
+                let first_born = living.first.rem_euclid(4_294_967_296.0) as u32;
+                params.push(Params {
+                    transform: emitter.transform,
+                    velocity: [emitter.velocity.x, emitter.velocity.y, emitter.velocity.z, emitter.spread],
+                    gravity: [emitter.gravity.x, emitter.gravity.y, emitter.gravity.z, emitter.drag],
+                    color_start: color(&emitter.color_start),
+                    color_end: color(&emitter.color_end),
+                    shape: [emitter.radius, emitter.size_start, emitter.size_end, emitter.lifetime],
+                    timing: [
+                        narrow(living.age),
+                        narrow(1.0 / f64::from(emitter.rate)),
+                        emitter.flipbook_fps.max(0.0),
+                        0.0,
+                    ],
+                    style: [
+                        emitter.soft_depth.max(0.0),
+                        emitter.lit.clamp(0.0, 1.0),
+                        emitter.flipbook_cols.max(1) as f32,
+                        emitter.flipbook_rows.max(1) as f32,
+                    ],
+                    counts: [total, living.slots, living.alive, first_born],
+                    seed: [emitter.seed, 0, 0, 0],
+                });
+                placed.push((which, texture, total, living.slots));
+                total += living.slots;
             }
-            let tint = material.color.map(narrow);
-            let color = |color: &pen_protocol::Color| {
-                [color.r * tint[0], color.g * tint[1], color.b * tint[2], color.a * tint[3]]
-            };
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "a birth number, wrapping")]
-            let first_born = living.first.rem_euclid(4_294_967_296.0) as u32;
-            params.push(Params {
-                transform: emitter.transform,
-                velocity: [emitter.velocity.x, emitter.velocity.y, emitter.velocity.z, emitter.spread],
-                gravity: [emitter.gravity.x, emitter.gravity.y, emitter.gravity.z, emitter.drag],
-                color_start: color(&emitter.color_start),
-                color_end: color(&emitter.color_end),
-                shape: [emitter.radius, emitter.size_start, emitter.size_end, emitter.lifetime],
-                timing: [narrow(living.age), narrow(1.0 / f64::from(emitter.rate)), emitter.flipbook_fps.max(0.0), 0.0],
-                style: [
-                    emitter.soft_depth.max(0.0),
-                    emitter.lit.clamp(0.0, 1.0),
-                    emitter.flipbook_cols.max(1) as f32,
-                    emitter.flipbook_rows.max(1) as f32,
-                ],
-                counts: [total, living.slots, living.alive, first_born],
-                seed: [emitter.seed, 0, 0, 0],
-            });
-            placed.push((which, texture, total, living.slots));
-            total += living.slots;
-        }
-        let particles = self.particles.as_mut().unwrap();
-        particles.params = params;
-        if total == 0 {
-            return Ok(());
-        }
-        let device = &self.device;
-        let emitter_bytes = particles.params.len() as u64 * EMITTER_BYTES;
-        let particle_bytes = u64::from(total) * PARTICLE_BYTES;
-        let storage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
-        sized(device, &mut particles.emitters, emitter_bytes, storage, "emitters");
-        sized(device, &mut particles.particles, particle_bytes, wgpu::BufferUsages::STORAGE, "particles");
-        let (emitters, buffer) = (particles.emitters.as_ref().unwrap(), particles.particles.as_ref().unwrap());
-        self.queue.write_buffer(emitters, 0, bytemuck::cast_slice(&particles.params));
-        let view_projection = multiply(&frame.projection, &frame.view);
-        let inv_projection = crate::matrix::invert(&frame.projection);
-        let v = &frame.view;
-        let mut view = [0.0f32; 56];
-        view[..16].copy_from_slice(&view_projection);
-        view[16..32].copy_from_slice(&inv_projection);
-        view[32..].copy_from_slice(&[
-            v[0],
-            v[4],
-            v[8],
-            0.0,
-            v[1],
-            v[5],
-            v[9],
-            0.0,
-            frame.light_direction.x,
-            frame.light_direction.y,
-            frame.light_direction.z,
-            0.0,
-            frame.light_color.x,
-            frame.light_color.y,
-            frame.light_color.z,
-            0.0,
-            frame.ambient.x,
-            frame.ambient.y,
-            frame.ambient.z,
-            0.0,
-            1.0,
-            1.0,
-            0.0,
-            0.0,
-        ]);
-        self.queue.write_buffer(&particles.view, 0, bytemuck::cast_slice(&view));
-        let simulate = particles.simulate.get_or_insert_with(|| {
-            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("particles"),
-                source: wgpu::ShaderSource::Wgsl(SIMULATE.into()),
-            });
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("particles"),
-                layout: None,
-                module: &module,
-                entry_point: Some("simulate"),
-                compilation_options: Default::default(),
-                cache: self.context.cache.get(),
-            })
-        });
-        let cache_hit = matches!(
-            &particles.group_cache,
-            Some((eb, pb, eb_buf, pb_buf, _))
-                if *eb == emitter_bytes && *pb == particle_bytes && eb_buf == emitters && pb_buf == buffer
-        );
-        if !cache_hit {
-            fn binding(buffer: &wgpu::Buffer, size: u64) -> wgpu::BindingResource<'_> {
-                wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                    buffer,
-                    offset: 0,
-                    size: wgpu::BufferSize::new(size),
+            let particles = self.particles.as_mut().unwrap();
+            particles.params = params;
+            if total == 0 {
+                return Ok(());
+            }
+            let device = &self.device;
+            let emitter_bytes = particles.params.len() as u64 * EMITTER_BYTES;
+            let particle_bytes = u64::from(total) * PARTICLE_BYTES;
+            let storage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
+            sized(device, &mut particles.emitters, emitter_bytes, storage, "emitters");
+            sized(device, &mut particles.particles, particle_bytes, wgpu::BufferUsages::STORAGE, "particles");
+            let (emitters, buffer) = (particles.emitters.as_ref().unwrap(), particles.particles.as_ref().unwrap());
+            self.queue.write_buffer(emitters, 0, bytemuck::cast_slice(&particles.params));
+            let view_projection = multiply(&frame.projection, &frame.view);
+            let inv_projection = crate::matrix::invert(&frame.projection);
+            let v = &frame.view;
+            let mut view = [0.0f32; 56];
+            view[..16].copy_from_slice(&view_projection);
+            view[16..32].copy_from_slice(&inv_projection);
+            view[32..].copy_from_slice(&[
+                v[0],
+                v[4],
+                v[8],
+                0.0,
+                v[1],
+                v[5],
+                v[9],
+                0.0,
+                frame.light_direction.x,
+                frame.light_direction.y,
+                frame.light_direction.z,
+                0.0,
+                frame.light_color.x,
+                frame.light_color.y,
+                frame.light_color.z,
+                0.0,
+                frame.ambient.x,
+                frame.ambient.y,
+                frame.ambient.z,
+                0.0,
+                1.0,
+                1.0,
+                0.0,
+                0.0,
+            ]);
+            self.queue.write_buffer(&particles.view, 0, bytemuck::cast_slice(&view));
+            let simulate = particles.simulate.get_or_insert_with(|| {
+                let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("particles"),
+                    source: wgpu::ShaderSource::Wgsl(crate::deferred_wgsl!("particles.wgsl").into()),
+                });
+                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("particles"),
+                    layout: None,
+                    module: &module,
+                    entry_point: Some("simulate"),
+                    compilation_options: Default::default(),
+                    cache: self.context.cache.get(),
                 })
-            }
-            let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("particles"),
-                layout: &simulate.get_bind_group_layout(0),
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: binding(emitters, emitter_bytes) },
-                    wgpu::BindGroupEntry { binding: 1, resource: binding(buffer, particle_bytes) },
-                ],
             });
-            particles.group_cache = Some((emitter_bytes, particle_bytes, emitters.clone(), buffer.clone(), group));
+            let cache_hit = matches!(
+                &particles.group_cache,
+                Some((eb, pb, eb_buf, pb_buf, _))
+                    if *eb == emitter_bytes && *pb == particle_bytes && eb_buf == emitters && pb_buf == buffer
+            );
+            if !cache_hit {
+                fn binding(buffer: &wgpu::Buffer, size: u64) -> wgpu::BindingResource<'_> {
+                    wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer,
+                        offset: 0,
+                        size: wgpu::BufferSize::new(size),
+                    })
+                }
+                let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("particles"),
+                    layout: &simulate.get_bind_group_layout(0),
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: binding(emitters, emitter_bytes) },
+                        wgpu::BindGroupEntry { binding: 1, resource: binding(buffer, particle_bytes) },
+                    ],
+                });
+                particles.group_cache = Some((emitter_bytes, particle_bytes, emitters.clone(), buffer.clone(), group));
+            }
+            particles.total = total;
+            for (which, shape, first, count) in placed {
+                let pipeline = self.built_ins.get(which).clone();
+                scratch.emitters.push(Ready { pipeline, shape, group: None, first, count });
+            }
+            Ok(())
         }
-        particles.total = total;
-        for (which, shape, first, count) in placed {
-            let pipeline = self.built_ins.get(which).clone();
-            scratch.emitters.push(Ready { pipeline, shape, group: None, first, count });
-        }
-        Ok(())
     }
 
     /// Binds the frame's emitters to what their shaders read: the view, their

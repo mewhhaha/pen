@@ -236,6 +236,7 @@ impl State {
         }
         if let Some(near_plane) = perspective_near
             && !self.wired.dag_plan.is_empty()
+            && crate::deferred_shaders::ready_all(&["meshlet_dag_cut.wgsl"])
         {
             let dag_culler = self.wired.meshlet_dag_culler.get_or_insert_with(|| MeshletDagCuller::new(device));
             let dag_two_phase = use_hiz && device.limits().max_storage_buffers_per_shader_stage >= 5;
@@ -272,7 +273,7 @@ impl State {
             self.wired.dag_phase1_used_hiz = dag_two_phase;
         }
         self.wired.last_meshlet_dag_draws = u32::try_from(dag_cursor).unwrap_or(u32::MAX);
-        if !self.wired.meshlet_plan.is_empty() {
+        if !self.wired.meshlet_plan.is_empty() && crate::deferred_shaders::ready_all(&["meshlet_cull.wgsl"]) {
             let culler = self.wired.meshlet_culler.get_or_insert_with(|| MeshletCuller::new(device));
             if use_hiz {
                 let mut batch = Vec::with_capacity(self.wired.meshlet_plan.len());

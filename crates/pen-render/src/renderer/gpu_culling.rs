@@ -1,3 +1,4 @@
+#![cfg_attr(not(feature = "render-gpu-culling"), allow(dead_code, unused_imports))]
 // Instanced batches culled on the GPU (shaders/cull.wgsl): a batch of many
 // instances is written to the instance buffer once, whole, and a compute pass
 // before the frame's passes tests each instance against every view, picks
@@ -15,8 +16,6 @@ use super::{MeshAsset, State};
 use crate::asset_store::{Lod, MAX_LODS};
 use crate::culling::{Detail, MAX_VIEWS, Sphere, ViewMask, Views};
 use crate::shader::PipelineContext;
-
-pub(crate) const CULL_WGSL: &str = crate::wgsl!("cull.wgsl");
 
 /// Batches of at least this many instances cull on the GPU, where it can.
 pub(crate) const GPU_CULLING_FROM: u32 = 32;
@@ -39,7 +38,7 @@ pub(crate) fn pipeline(context: &PipelineContext) -> wgpu::ComputePipeline {
     let device = &context.device;
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("cull"),
-        source: wgpu::ShaderSource::Wgsl(CULL_WGSL.into()),
+        source: wgpu::ShaderSource::Wgsl(crate::deferred_wgsl!("cull.wgsl").into()),
     });
     device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: Some("cull"),
@@ -183,9 +182,14 @@ impl GpuCulling {
 
     /// Whether the device can, and whether its pipeline should be compiled.
     pub fn wanted(&mut self) -> bool {
-        let wanted = self.supported && !self.requested;
-        self.requested = true;
-        wanted
+        #[cfg(not(feature = "render-gpu-culling"))]
+        return false;
+        #[cfg(feature = "render-gpu-culling")]
+        {
+            let wanted = self.supported && !self.requested;
+            self.requested = true;
+            wanted
+        }
     }
 
     /// The pipeline the loader compiled.
@@ -212,7 +216,15 @@ impl GpuCulling {
 
     /// Whether a batch of `count` instances culls on the GPU this frame.
     pub fn takes(&self, count: u32) -> bool {
-        self.pipeline.is_some() && self.from.is_some_and(|from| count >= from)
+        #[cfg(not(feature = "render-gpu-culling"))]
+        {
+            let _ = count;
+            false
+        }
+        #[cfg(feature = "render-gpu-culling")]
+        {
+            self.pipeline.is_some() && self.from.is_some_and(|from| count >= from)
+        }
     }
 
     /// What was kept, as last read back.

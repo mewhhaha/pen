@@ -8,8 +8,8 @@ use wgpu::util::DeviceExt;
 
 #[cfg(not(target_arch = "wasm32"))]
 use crate::ray_tracing::TLAS_TRAVERSAL_HW_WGSL;
-use crate::ray_tracing::{RtLocalLight, TLAS_TRAVERSAL_WGSL, TlasSceneGpu, device_supports_hardware_ray_query};
-use crate::restir::{RESTIR_MAX_LIGHTS, RESTIR_WGSL};
+use crate::ray_tracing::{RtLocalLight, TlasSceneGpu, device_supports_hardware_ray_query};
+use crate::restir::RESTIR_MAX_LIGHTS;
 use crate::sharc::{SHARC_HASH_WGSL, SHARC_QUERY_RO_FN_WGSL, SharcCache};
 
 pub const RESTIR_SPECULAR_WGSL: &str = crate::wgsl!("restir_specular.wgsl");
@@ -268,8 +268,10 @@ impl Pass {
 }
 
 fn pipelines(device: &wgpu::Device, hardware: bool, native_depth: bool, specular_wgsl: &str) -> [Pass; 3] {
-    let (traversal, tlas_binding) =
-        (TLAS_TRAVERSAL_WGSL, "@group(0) @binding(1) var<storage, read> tlas_nodes: array<BvhNode>;");
+    let (traversal, tlas_binding) = (
+        crate::deferred_wgsl!("tlas_traversal.wgsl"),
+        "@group(0) @binding(1) var<storage, read> tlas_nodes: array<BvhNode>;",
+    );
     #[cfg(not(target_arch = "wasm32"))]
     let (traversal, tlas_binding) = if hardware {
         (TLAS_TRAVERSAL_HW_WGSL, "@group(0) @binding(1) var hw_tlas: acceleration_structure;")
@@ -278,7 +280,7 @@ fn pipelines(device: &wgpu::Device, hardware: bool, native_depth: bool, specular
     };
     // WGSL binds only the globals reached by each entry point. Share the thin
     // G-buffer mapping, TLAS, light attenuation and packed DDGI decode with ReSTIR.
-    let restir = RESTIR_WGSL.replace("// __TLAS_BINDING_1__", tlas_binding);
+    let restir = crate::deferred_wgsl!("restir.wgsl").replace("// __TLAS_BINDING_1__", tlas_binding);
     let mut body = format!("{traversal}\n{restir}\n{SHARC_HASH_WGSL}\n{SHARC_QUERY_RO_FN_WGSL}\n{specular_wgsl}");
     if native_depth {
         body = body
@@ -491,10 +493,9 @@ impl RestirSpecularRenderer {
             encoder.copy_buffer_to_buffer(&stage, off_l, &self.lights_buf, 0, live_lights.len() as u64);
         }
 
-        let [initial, temporal, spatial] = self
-            .pipelines
-            .entry((hardware, native_depth))
-            .or_insert_with(|| pipelines(device, hardware, native_depth, RESTIR_SPECULAR_WGSL));
+        let [initial, temporal, spatial] = self.pipelines.entry((hardware, native_depth)).or_insert_with(|| {
+            pipelines(device, hardware, native_depth, crate::deferred_wgsl!("restir_specular.wgsl"))
+        });
         let previous = frame.previous;
         let next = 1 - previous;
         let tlas = scene.tlas_nodes_buf.as_entire_binding();

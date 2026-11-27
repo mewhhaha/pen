@@ -1,3 +1,4 @@
+#![cfg_attr(not(feature = "render-3d"), allow(dead_code))]
 //! Small-footprint sorting helpers that keep `wasm32` code size down by
 //! routing hot sorts through a single `[(u64, u32)]` `ipnsort` instantiation
 //! and using tiny in-place sorts for short or cold slices.

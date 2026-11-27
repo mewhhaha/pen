@@ -1,13 +1,12 @@
+#![cfg_attr(not(feature = "render-dof"), allow(dead_code))]
 // Bokeh depth of field pass (shaders/dof.wgsl), run in linear HDR light after
 // TAA and before motion blur, exposure metering and bloom.
 use pen_protocol::{Dof, Matrix};
 
 use crate::matrix::invert;
 
-const SHADER: &str = crate::wgsl!("dof.wgsl");
-
 pub(crate) fn shader(samples: u32) -> String {
-    SHADER
+    crate::deferred_wgsl!("dof.wgsl")
         .replace("${depth_texture}", if samples > 1 { "texture_depth_multisampled_2d" } else { "texture_depth_2d" })
         .replace("${fullscreen}", crate::wgsl!("fullscreen.wgsl"))
 }

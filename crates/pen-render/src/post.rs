@@ -1,3 +1,7 @@
+#![cfg_attr(
+    not(all(feature = "render-ssgi", feature = "render-taa", feature = "render-dof", feature = "render-subsurface")),
+    allow(dead_code)
+)]
 // The passes around the scene. The scene draws offscreen in floating point
 // (`SCENE_FORMAT`), so light can go past white: multisampled and resolved for
 // MSAA, at the render scale's size. Ambient occlusion is then worked out from
@@ -91,10 +95,8 @@ pub(crate) fn atmosphere_shader(samples: u32, depth_mode: crate::camera_precisio
 }
 
 // Ground-truth ambient occlusion (GTAO): horizon-based visibility from depth.
-const OCCLUSION_SHADER: &str = crate::wgsl!("occlusion.wgsl");
-
 pub(crate) fn occlusion_shader(samples: u32) -> String {
-    OCCLUSION_SHADER
+    crate::deferred_wgsl!("occlusion.wgsl")
         .replace("${depth_texture}", depth_texture(samples))
         .replace("${fullscreen}", FULLSCREEN)
 }
@@ -293,8 +295,7 @@ pub(crate) struct PhysicalSkyBinding {
 /// Computes the scaled internal scene resolution `Post::begin` will allocate.
 pub(crate) fn scene_size(device: &wgpu::Device, size: (u32, u32), scale: f32) -> (u32, u32) {
     let limit = device.limits().max_texture_dimension_2d;
-    let budget =
-        f64::from(scale).min((MAX_RENDER_PIXELS / (f64::from(size.0) * f64::from(size.1)).max(1.0)).sqrt());
+    let budget = f64::from(scale).min((MAX_RENDER_PIXELS / (f64::from(size.0) * f64::from(size.1)).max(1.0)).sqrt());
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, reason = "at least 1, and saturating")]
     let scaled = |value: u32| ((f64::from(value) * budget).round().max(1.0) as u32).min(limit);
     (scaled(size.0), scaled(size.1))
@@ -466,15 +467,35 @@ pub(crate) fn pipeline(context: &PipelineContext, which: BuiltIn) -> wgpu::Rende
     };
     let depth_mode = context.depth_mode();
     let (code, target, blend) = match which {
+        #[cfg(feature = "render-ssgi")]
         BuiltIn::Occlusion(samples) => (occlusion_shader(samples), wgpu::TextureFormat::R8Unorm, None),
+        #[cfg(not(feature = "render-ssgi"))]
+        BuiltIn::Occlusion(_) => unreachable!("render-ssgi disabled"),
         BuiltIn::Atmosphere(samples) => (atmosphere_shader(samples, depth_mode), SCENE_FORMAT, None),
+        #[cfg(feature = "render-ssgi")]
         BuiltIn::Ssgi(samples) => (crate::ssgi::shader(samples), SCENE_FORMAT, None),
-        BuiltIn::OpaqueDepth(samples) => (opaque_depth_shader(samples, depth_mode), wgpu::TextureFormat::R32Float, None),
+        #[cfg(not(feature = "render-ssgi"))]
+        BuiltIn::Ssgi(_) => unreachable!("render-ssgi disabled"),
+        BuiltIn::OpaqueDepth(samples) => {
+            (opaque_depth_shader(samples, depth_mode), wgpu::TextureFormat::R32Float, None)
+        }
         BuiltIn::OpaqueMip => (OPAQUE_MIP_SHADER.to_owned(), SCENE_FORMAT, None),
+        #[cfg(feature = "render-subsurface")]
         BuiltIn::Subsurface(samples) => (crate::subsurface::shader(samples), SCENE_FORMAT, None),
+        #[cfg(not(feature = "render-subsurface"))]
+        BuiltIn::Subsurface(_) => unreachable!("render-subsurface disabled"),
+        #[cfg(feature = "render-taa")]
         BuiltIn::Taa(samples) => (crate::taa::shader(samples), SCENE_FORMAT, None),
+        #[cfg(not(feature = "render-taa"))]
+        BuiltIn::Taa(_) => unreachable!("render-taa disabled"),
+        #[cfg(feature = "render-dof")]
         BuiltIn::Dof(samples) => (crate::dof::shader(samples), SCENE_FORMAT, None),
+        #[cfg(not(feature = "render-dof"))]
+        BuiltIn::Dof(_) => unreachable!("render-dof disabled"),
+        #[cfg(feature = "render-taa")]
         BuiltIn::MotionBlur(samples) => (crate::motion_blur::shader(samples), SCENE_FORMAT, None),
+        #[cfg(not(feature = "render-taa"))]
+        BuiltIn::MotionBlur(_) => unreachable!("render-taa disabled"),
         BuiltIn::Present(samples) => (present_shader(samples, &context.display), context.format, None),
         BuiltIn::BloomDown { first } => (bloom_down_shader(first), SCENE_FORMAT, None),
         // Each level up is added onto the one above.
@@ -492,7 +513,8 @@ pub(crate) fn pipeline(context: &PipelineContext, which: BuiltIn) -> wgpu::Rende
         label: Some(&label),
         source: wgpu::ShaderSource::Wgsl(code.into()),
     });
-    let mut color_targets = vec![Some(wgpu::ColorTargetState { format: target, blend, write_mask: wgpu::ColorWrites::ALL })];
+    let mut color_targets =
+        vec![Some(wgpu::ColorTargetState { format: target, blend, write_mask: wgpu::ColorWrites::ALL })];
     if matches!(which, BuiltIn::Taa(_)) {
         color_targets.push(Some(wgpu::ColorTargetState {
             format: wgpu::TextureFormat::Rgba16Float,
@@ -822,11 +844,20 @@ impl Post {
         extras: Extras,
     ) -> SceneTargets {
         let Extras { translucent, opaque_depth, opaque_mips, subsurface } = extras;
+        #[cfg(feature = "render-subsurface")]
+        let subsurface = subsurface && crate::deferred_shaders::ready_all(&["subsurface.wgsl"]);
+        #[cfg(not(feature = "render-subsurface"))]
+        let subsurface = {
+            let _ = subsurface;
+            false
+        };
         self.quality = Some(quality);
         self.size = size;
         self.translucent = translucent;
         self.subsurface = subsurface;
-        let occluding = quality.occlusion;
+        let occluding = cfg!(feature = "render-ssgi")
+            && quality.occlusion
+            && crate::deferred_shaders::ready_all(&["occlusion.wgsl"]);
         let atmosphere = quality.sky
             || quality.physical_sky
             || frame.fog.density > 0.0
@@ -837,8 +868,10 @@ impl Post {
         // the multisampled targets of more would take gigabytes.
         let (width, height) = scene_size(&self.device, size, quality.scale);
         let samples = quality.msaa;
-        let ssgi = quality.ssgi;
-        let taa = quality.taa;
+        let ssgi = cfg!(feature = "render-ssgi") && quality.ssgi && crate::deferred_shaders::ready_all(&["ssgi.wgsl"]);
+        let taa = cfg!(feature = "render-taa")
+            && quality.taa
+            && crate::deferred_shaders::ready_all(&["taa.wgsl", "velocity.wgsl"]);
         let (taa_width, taa_height) = if taa && quality.upscale && (width < size.0 || height < size.1) {
             scene_size(&self.device, size, 1.0)
         } else {
@@ -852,10 +885,17 @@ impl Post {
         } else {
             0
         };
-        let dof =
-            quality.effects && frame.dof.focus_distance > 0.0 && frame.dof.aperture > 0.0 && frame.dof.max_blur > 0.0;
-        let motion_blur =
-            quality.effects && frame.motion_blur.strength > 0.0 && frame.motion_blur.max_radius > 0.0;
+        let dof = cfg!(feature = "render-dof")
+            && quality.effects
+            && frame.dof.focus_distance > 0.0
+            && frame.dof.aperture > 0.0
+            && frame.dof.max_blur > 0.0
+            && crate::deferred_shaders::ready_all(&["dof.wgsl"]);
+        let motion_blur = cfg!(feature = "render-taa")
+            && quality.effects
+            && frame.motion_blur.strength > 0.0
+            && frame.motion_blur.max_radius > 0.0
+            && crate::deferred_shaders::ready_all(&["motion_blur.wgsl", "velocity.wgsl"]);
         let key = TargetsKey {
             width,
             height,
@@ -924,16 +964,21 @@ impl Post {
                 // rest; a new history starts afresh.
                 self.memory = Default::default();
                 self.previous_vp = None;
+                #[cfg(feature = "render-taa")]
                 let histories = taa.then(|| {
                     let textures = [0, 1].map(|_| crate::taa::history(device, taa_width, taa_height, SCENE_FORMAT));
                     [view(&textures[0]), view(&textures[1])]
                 });
+                #[cfg(not(feature = "render-taa"))]
+                let histories = None;
+                #[cfg(feature = "render-taa")]
                 let locks = taa.then(|| {
-                    let textures = [0, 1].map(|_| {
-                        crate::taa::history(device, taa_width, taa_height, wgpu::TextureFormat::Rgba16Float)
-                    });
+                    let textures = [0, 1]
+                        .map(|_| crate::taa::history(device, taa_width, taa_height, wgpu::TextureFormat::Rgba16Float));
                     [view(&textures[0]), view(&textures[1])]
                 });
+                #[cfg(not(feature = "render-taa"))]
+                let locks = None;
                 (histories, locks)
             };
             let mut graphs: Vec<Graph> = Vec::new();
@@ -991,12 +1036,19 @@ impl Post {
             self.targets.as_mut().unwrap().subsurface = Some(diffusion);
         }
         // The scene's samples move within their pixels from frame to frame across an FSR-scaled Halton cycle.
-        self.jittered = taa.then(|| {
-            self.jitters += 1;
-            let phases = crate::taa::fsr_jitter_phase_count(width, taa_width);
-            let offset = crate::taa::jitter_for(self.jitters, phases);
-            (crate::taa::jittered(&frame.projection, offset, (width, height)), offset)
-        });
+        #[cfg(feature = "render-taa")]
+        {
+            self.jittered = taa.then(|| {
+                self.jitters += 1;
+                let phases = crate::taa::fsr_jitter_phase_count(width, taa_width);
+                let offset = crate::taa::jitter_for(self.jitters, phases);
+                (crate::taa::jittered(&frame.projection, offset, (width, height)), offset)
+            });
+        }
+        #[cfg(not(feature = "render-taa"))]
+        {
+            self.jittered = None;
+        }
         let current = self.targets.as_ref().unwrap();
         SceneTargets {
             size: (current.key.width, current.key.height),
@@ -1129,28 +1181,31 @@ impl Post {
     /// before anything else reads it.
     pub fn diffuse(
         &mut self,
-        built_ins: &mut BuiltIns,
-        encoder: &mut wgpu::CommandEncoder,
-        frame: &RenderFrame,
-        timer: &GpuTimer,
+        #[cfg_attr(not(feature = "render-subsurface"), allow(unused_variables))] built_ins: &mut BuiltIns,
+        #[cfg_attr(not(feature = "render-subsurface"), allow(unused_variables))] encoder: &mut wgpu::CommandEncoder,
+        #[cfg_attr(not(feature = "render-subsurface"), allow(unused_variables))] frame: &RenderFrame,
+        #[cfg_attr(not(feature = "render-subsurface"), allow(unused_variables))] timer: &GpuTimer,
     ) {
-        let TargetsKey { width, height, .. } = self.targets.as_ref().unwrap().key;
-        // What the scene drew with.
-        let (projection, _) = self.jittered.unwrap_or((frame.projection, (0.0, 0.0)));
-        let inverse = invert(&projection);
-        for (name, vertical) in [("subsurface x", false), ("subsurface y", true)] {
-            let uniform = self.uniform(name, 96);
-            let data = crate::subsurface::uniform(&inverse, vertical, (width, height));
-            self.queue.write_buffer(&uniform, 0, bytemuck::cast_slice(&data));
+        #[cfg(feature = "render-subsurface")]
+        {
+            let TargetsKey { width, height, .. } = self.targets.as_ref().unwrap().key;
+            // What the scene drew with.
+            let (projection, _) = self.jittered.unwrap_or((frame.projection, (0.0, 0.0)));
+            let inverse = invert(&projection);
+            for (name, vertical) in [("subsurface x", false), ("subsurface y", true)] {
+                let uniform = self.uniform(name, 96);
+                let data = crate::subsurface::uniform(&inverse, vertical, (width, height));
+                self.queue.write_buffer(&uniform, 0, bytemuck::cast_slice(&data));
+            }
+            let diffusion = self
+                .targets
+                .as_ref()
+                .unwrap()
+                .subsurface
+                .as_ref()
+                .expect("a frame with subsurface surfaces has its diffusion");
+            diffusion.execute(encoder, built_ins, None, timer, Span::Subsurface, None, &mut |_, _| {});
         }
-        let diffusion = self
-            .targets
-            .as_ref()
-            .unwrap()
-            .subsurface
-            .as_ref()
-            .expect("a frame with subsurface surfaces has its diffusion");
-        diffusion.execute(encoder, built_ins, None, timer, Span::Subsurface, None, &mut |_, _| {});
     }
 
     /// Reuse a resolved HDR image for the next mesh filter's binding 14.
@@ -1336,8 +1391,13 @@ impl Post {
         if motion_blur {
             let smeared = graph.texture("motion blur", full_post(SCENE_FORMAT));
             let uniform = Binding::Uniform(self.uniform("motion blur", 160));
-            let bindings =
-                vec![uniform, Binding::Texture(lit), Binding::Texture(velocity), Binding::Texture(depth), sampler.clone()];
+            let bindings = vec![
+                uniform,
+                Binding::Texture(lit),
+                Binding::Texture(velocity),
+                Binding::Texture(depth),
+                sampler.clone(),
+            ];
             graph.pass("motion blur", BuiltIn::MotionBlur(samples), bindings, Target::Texture(smeared), false);
             lit = smeared;
         }
@@ -1449,11 +1509,14 @@ impl Post {
             let data = atmosphere_of(frame, &projection, &quality, width, height);
             self.queue.write_buffer(&uniform, 0, bytemuck::cast_slice(&data));
         }
+        #[cfg(feature = "render-ssgi")]
         if ssgi {
             let uniform = self.uniform("ssgi", 160);
             let data = crate::ssgi::uniform(&projection, (width, height));
             self.queue.write_buffer(&uniform, 0, bytemuck::cast_slice(&data));
         }
+        #[cfg(not(feature = "render-ssgi"))]
+        let _ = ssgi;
     }
 
     /// For a frame with translucent surfaces, once the opaque surfaces are
@@ -1503,10 +1566,11 @@ impl Post {
         let (projection, offset) = self.jittered.unwrap_or((frame.projection, (0.0, 0.0)));
         // The graph reading the history this frame reads.
         let graph = if taa { self.memory.read() } else { 0 };
+        #[cfg(feature = "render-taa")]
         if taa {
             let uniform = self.uniform("taa", 176);
-            let reversed_z =
-                crate::camera_precision::detect_depth_mode(&frame.projection) == Some(crate::camera_precision::DepthMode::ReversedZ);
+            let reversed_z = crate::camera_precision::detect_depth_mode(&frame.projection)
+                == Some(crate::camera_precision::DepthMode::ReversedZ);
             let data = self.memory.uniform(
                 &frame.view,
                 &frame.projection,
@@ -1518,11 +1582,17 @@ impl Post {
             );
             self.queue.write_buffer(&uniform, 0, bytemuck::cast_slice(&data));
         }
+        #[cfg(not(feature = "render-taa"))]
+        let _ = (&projection, offset);
+        #[cfg(feature = "render-dof")]
         if dof {
             let uniform = self.uniform("dof", 96);
             let data = crate::dof::uniform(&projection, &frame.dof, (taa_width, taa_height));
             self.queue.write_buffer(&uniform, 0, bytemuck::cast_slice(&data));
         }
+        #[cfg(not(feature = "render-dof"))]
+        let _ = dof;
+        #[cfg(feature = "render-taa")]
         if motion_blur {
             let uniform = self.uniform("motion blur", 160);
             let data = crate::motion_blur::uniform(
@@ -1534,6 +1604,8 @@ impl Post {
             );
             self.queue.write_buffer(&uniform, 0, bytemuck::cast_slice(&data));
         }
+        #[cfg(not(feature = "render-taa"))]
+        let _ = motion_blur;
         let uniform = self.uniform("present", 64);
         let (output_width, output_height) = (size.0 as f32, size.1 as f32);
         // EASU spatial upscaling now coexists cleanly with FXAA (FXAA uses cheap bilinear edge probes

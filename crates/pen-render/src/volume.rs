@@ -1,3 +1,4 @@
+#![cfg_attr(not(feature = "render-volume"), allow(dead_code, unused_imports))]
 // Participating media: the frame's mist drawn through a froxel volume. A grid
 // aligned with the camera (froxels across and down the picture, slices deep
 // along the view, spaced exponentially from the eye out to `fog.distance`) is
@@ -22,8 +23,6 @@ use crate::post::atmosphere_of;
 use crate::shader::PipelineContext;
 
 const COMMON: &str = crate::wgsl!("volume_common.wgsl");
-const INJECT: &str = crate::wgsl!("volume_inject.wgsl");
-const INTEGRATE: &str = crate::wgsl!("volume_integrate.wgsl");
 const ATMOSPHERE_COMMON: &str = crate::wgsl!("atmosphere_common.wgsl");
 
 /// WGSL: the volume's uniform and slicing, which the passes that fill the
@@ -402,21 +401,28 @@ impl Volumetrics {
     /// draws, because the analytic mist takes its colours from it.
     pub fn prepare(
         &mut self,
-        context: &PipelineContext,
+        #[cfg_attr(not(feature = "render-volume"), allow(unused_variables))] context: &PipelineContext,
         frame: &RenderFrame,
         quality: &Quality,
         size: (u32, u32),
         translucent: bool,
     ) -> Applied {
-        let tier = wanted(frame, quality.volumetrics);
+        #[cfg(feature = "render-volume")]
+        let tier = wanted(frame, quality.volumetrics)
+            .filter(|_| crate::deferred_shaders::ready_all(&["volume_inject.wgsl", "volume_integrate.wgsl"]));
+        #[cfg(not(feature = "render-volume"))]
+        let tier: Option<Tier> = None;
         self.drawing = tier.is_some();
+        #[cfg(feature = "render-volume")]
         let view_projection = multiply(&frame.projection, &frame.view);
+        #[cfg(feature = "render-volume")]
         let distance = frame.fog.distance;
         let mut data = [0.0f32; UNIFORM_FLOATS];
         data[..16].copy_from_slice(&frame.view);
         let mut serial = 0;
         let mut texture = self.stand_in.clone();
         let mut filter = 0.0;
+        #[cfg(feature = "render-volume")]
         if let Some(tier) = tier {
             let grid = self.grid(context, tier);
             serial = grid.serial;
@@ -465,6 +471,13 @@ impl Volumetrics {
             self.frames += 1;
             self.froxels = tier.width * tier.height * tier.slices;
         } else {
+            self.remembered = None;
+            self.historic = false;
+            self.froxels = 0;
+        }
+        #[cfg(not(feature = "render-volume"))]
+        {
+            let _ = (&mut serial, &mut texture, &mut filter);
             self.remembered = None;
             self.historic = false;
             self.froxels = 0;
@@ -547,34 +560,39 @@ impl Volumetrics {
     /// maps and the lights it reads are drawn, before the scene.
     pub fn encode(
         &mut self,
-        encoder: &mut wgpu::CommandEncoder,
-        timer: &crate::renderer::GpuTimer,
-        scene: &wgpu::BindGroup,
-        lights: &wgpu::BindGroup,
+        #[cfg_attr(not(feature = "render-volume"), allow(unused_variables))] encoder: &mut wgpu::CommandEncoder,
+        #[cfg_attr(not(feature = "render-volume"), allow(unused_variables))] timer: &crate::renderer::GpuTimer,
+        #[cfg_attr(not(feature = "render-volume"), allow(unused_variables))] scene: &wgpu::BindGroup,
+        #[cfg_attr(not(feature = "render-volume"), allow(unused_variables))] lights: &wgpu::BindGroup,
     ) {
-        if !self.drawing {
-            return;
+        #[cfg(not(feature = "render-volume"))]
+        return;
+        #[cfg(feature = "render-volume")]
+        {
+            if !self.drawing {
+                return;
+            }
+            let (Some(grid), Some(pipelines)) = (&self.grid, &self.pipelines) else { return };
+            let tier = grid.tier;
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("volume"),
+                timestamp_writes: timer.compute(crate::renderer::Span::Volume),
+            });
+            pass.set_pipeline(&pipelines.inject);
+            pass.set_bind_group(0, scene, &[]);
+            pass.set_bind_group(1, &grid.inject[self.turn], &[]);
+            pass.set_bind_group(2, lights, &[]);
+            pass.dispatch_workgroups(tier.width.div_ceil(4), tier.height.div_ceil(4), tier.slices.div_ceil(4));
+            // Dispatches of one pass see each other's writes only across passes.
+            drop(pass);
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("volume integration"),
+                timestamp_writes: timer.compute(crate::renderer::Span::Volume),
+            });
+            pass.set_pipeline(&pipelines.integrate);
+            pass.set_bind_group(0, &grid.integrate[self.turn], &[]);
+            pass.dispatch_workgroups(tier.width.div_ceil(8), tier.height.div_ceil(8), 1);
         }
-        let (Some(grid), Some(pipelines)) = (&self.grid, &self.pipelines) else { return };
-        let tier = grid.tier;
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("volume"),
-            timestamp_writes: timer.compute(crate::renderer::Span::Volume),
-        });
-        pass.set_pipeline(&pipelines.inject);
-        pass.set_bind_group(0, scene, &[]);
-        pass.set_bind_group(1, &grid.inject[self.turn], &[]);
-        pass.set_bind_group(2, lights, &[]);
-        pass.dispatch_workgroups(tier.width.div_ceil(4), tier.height.div_ceil(4), tier.slices.div_ceil(4));
-        // Dispatches of one pass see each other's writes only across passes.
-        drop(pass);
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("volume integration"),
-            timestamp_writes: timer.compute(crate::renderer::Span::Volume),
-        });
-        pass.set_pipeline(&pipelines.integrate);
-        pass.set_bind_group(0, &grid.integrate[self.turn], &[]);
-        pass.dispatch_workgroups(tier.width.div_ceil(8), tier.height.div_ceil(8), 1);
     }
 }
 
@@ -671,8 +689,9 @@ pub(crate) fn inject_shader() -> String {
     let shadows = crate::renderer::SHADOWS_WGSL
         .replace("let mode = u32(scene.cascades.z);", "let mode = volume_filter(u32(scene.cascades.z));");
     assert!(shadows.contains("volume_filter"), "the sun's filter reads the frame's mode where the volume takes it");
+    let inject = crate::deferred_wgsl!("volume_inject.wgsl");
     format!(
-        "{SCENE}{shadows}\n{}\n{}\n{ATMOSPHERE_COMMON}\n{COMMON}\n{INJECT}",
+        "{SCENE}{shadows}\n{}\n{}\n{ATMOSPHERE_COMMON}\n{COMMON}\n{inject}",
         crate::environment::ENVIRONMENT_WGSL,
         crate::lights::LIGHTS_WGSL,
     )
@@ -680,7 +699,8 @@ pub(crate) fn inject_shader() -> String {
 
 /// The integration's WGSL.
 pub(crate) fn integrate_shader() -> String {
-    format!("{COMMON}\n{INTEGRATE}")
+    let integrate = crate::deferred_wgsl!("volume_integrate.wgsl");
+    format!("{COMMON}\n{integrate}")
 }
 
 #[cfg(test)]

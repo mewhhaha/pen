@@ -10,6 +10,7 @@ workspace = true
 
 [features]
 default = [
+  "render-3d",
   "mesh-json",
   "texture-recipes",
   "shader-graph",
@@ -24,10 +25,23 @@ default = [
   "render-atmosphere",
   "render-pbr-decals",
   "render-post-fx",
+  "render-volume",
+  "render-ssgi",
+  "render-subsurface",
+  "render-taa",
+  "render-dof",
+  "render-area-lights",
+  "render-decals",
+  "render-particles-cpu",
+  "render-gpu-culling",
 ]
 # Simpler levels of detail for meshes where assets are packaged
 # (`pack_mesh_with_lods`): pen's packaging has it, the browser host does not.
-simplify = ["dep:meshopt-rs"]
+simplify = ["render-3d", "dep:meshopt-rs"]
+# Fetch heavy optional pass WGSL shaders lazily at runtime on wasm32 instead of
+# embedding them into pen_web_bg.wasm's Data section.
+deferred-shaders = []
+render-3d = []
 mesh-json = []
 texture-recipes = []
 shader-graph = []
@@ -42,6 +56,15 @@ render-oit = []
 render-atmosphere = []
 render-pbr-decals = []
 render-post-fx = []
+render-volume = []
+render-ssgi = []
+render-subsurface = []
+render-taa = []
+render-dof = []
+render-area-lights = []
+render-decals = []
+render-particles-cpu = []
+render-gpu-culling = []
 
 [dependencies]
 anyhow.workspace = true

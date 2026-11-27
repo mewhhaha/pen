@@ -34,7 +34,11 @@ impl PipelineTarget {
         Self { color_format, depth_format, depth_compare: wgpu::CompareFunction::LessEqual, sample_count: 1 }
     }
 
-    pub fn reversed_z(color_format: wgpu::TextureFormat, depth_format: Option<wgpu::TextureFormat>, sample_count: u32) -> Self {
+    pub fn reversed_z(
+        color_format: wgpu::TextureFormat,
+        depth_format: Option<wgpu::TextureFormat>,
+        sample_count: u32,
+    ) -> Self {
         Self { color_format, depth_format, depth_compare: wgpu::CompareFunction::GreaterEqual, sample_count }
     }
 }
@@ -125,7 +129,7 @@ impl TerrainPipeline {
         });
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("terrain_shader"),
-            source: wgpu::ShaderSource::Wgsl(TERRAIN_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(crate::deferred_wgsl!("terrain.wgsl").into()),
         });
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("terrain_pl"),
@@ -215,8 +219,13 @@ impl TerrainPipeline {
             width >= 2 && height >= 2 && width <= max_dim && height <= max_dim,
             "heightmap dimensions {width}x{height} out of valid range 2..={max_dim}"
         );
-        let expected = (width as usize).checked_mul(height as usize).ok_or_else(|| anyhow!("heightmap size overflow"))?;
-        ensure!(heights.len() == expected, "heightmap sample count mismatch: got {}, expected {expected}", heights.len());
+        let expected =
+            (width as usize).checked_mul(height as usize).ok_or_else(|| anyhow!("heightmap size overflow"))?;
+        ensure!(
+            heights.len() == expected,
+            "heightmap sample count mismatch: got {}, expected {expected}",
+            heights.len()
+        );
         ensure!(heights.iter().all(|h| h.is_finite()), "heightmap contains non-finite values");
         let tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("terrain_heightmap"),
@@ -240,7 +249,13 @@ impl TerrainPipeline {
             wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
         );
         let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
-        Ok(TerrainHeightmap { id: NEXT_HEIGHTMAP_ID.fetch_add(1, Ordering::Relaxed), texture: tex, view, width, height })
+        Ok(TerrainHeightmap {
+            id: NEXT_HEIGHTMAP_ID.fetch_add(1, Ordering::Relaxed),
+            texture: tex,
+            view,
+            width,
+            height,
+        })
     }
 
     /// Batches terrain patches by their validated even grid cell count and draws them in command order.
@@ -257,7 +272,10 @@ impl TerrainPipeline {
             return Ok(());
         }
         ensure!(uniform.view_projection.iter().all(|v| v.is_finite()), "non-finite terrain view_projection");
-        ensure!(uniform.world_bounds[0] > 0.0 && uniform.world_bounds[1] > 0.0, "terrain world bounds must be positive");
+        ensure!(
+            uniform.world_bounds[0] > 0.0 && uniform.world_bounds[1] > 0.0,
+            "terrain world bounds must be positive"
+        );
 
         // Group patches by validated even grid size so mixed grid sizes never generate stray rows.
         let mut sorted: Vec<(u32, TerrainPatch)> = Vec::with_capacity(patches.len());
@@ -278,12 +296,12 @@ impl TerrainPipeline {
 
         let rec_bytes = std::mem::size_of::<TerrainPatch>();
         let max_storage = device.limits().max_storage_buffer_binding_size;
-        let needed = self.patch_cursor.checked_add(ordered_patches.len()).ok_or_else(|| anyhow!("patch count overflow"))?;
+        let needed =
+            self.patch_cursor.checked_add(ordered_patches.len()).ok_or_else(|| anyhow!("patch count overflow"))?;
         if needed > self.patch_cap {
             let new_cap = needed.next_power_of_two().max(64);
-            let new_bytes = (new_cap as u64)
-                .checked_mul(rec_bytes as u64)
-                .ok_or_else(|| anyhow!("terrain storage overflow"))?;
+            let new_bytes =
+                (new_cap as u64).checked_mul(rec_bytes as u64).ok_or_else(|| anyhow!("terrain storage overflow"))?;
             ensure!(new_bytes <= max_storage, "terrain patches buffer {new_bytes} exceeds limit {max_storage}");
             self.patch_cap = new_cap;
             self.patches = device.create_buffer(&wgpu::BufferDescriptor {
@@ -305,7 +323,8 @@ impl TerrainPipeline {
         let dyn_offset = (slot as u32) * self.uniform_stride;
         queue.write_buffer(&self.uniform, u64::from(dyn_offset), bytemuck::bytes_of(uniform));
 
-        let cache_hit = matches!(&self.cached_bg, Some((hm_id, sgen, _)) if *hm_id == heightmap.id && *sgen == self.storage_gen);
+        let cache_hit =
+            matches!(&self.cached_bg, Some((hm_id, sgen, _)) if *hm_id == heightmap.id && *sgen == self.storage_gen);
         if !cache_hit {
             let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("terrain_bg"),
@@ -392,7 +411,7 @@ impl WaterPipeline {
         });
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("water_shader"),
-            source: wgpu::ShaderSource::Wgsl(WATER_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(crate::deferred_wgsl!("water.wgsl").into()),
         });
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("water_pl"),
@@ -546,7 +565,7 @@ impl FoliagePipeline {
         });
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("foliage_shader"),
-            source: wgpu::ShaderSource::Wgsl(FOLIAGE_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(crate::deferred_wgsl!("foliage.wgsl").into()),
         });
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("foliage_pl"),
@@ -660,12 +679,12 @@ impl FoliagePipeline {
         ensure!(uniform.view_projection.iter().all(|v| v.is_finite()), "non-finite foliage view_projection");
         let rec_bytes = std::mem::size_of::<FoliageInstance>();
         let max_storage = device.limits().max_storage_buffer_binding_size;
-        let needed = self.instance_cursor.checked_add(instances.len()).ok_or_else(|| anyhow!("foliage count overflow"))?;
+        let needed =
+            self.instance_cursor.checked_add(instances.len()).ok_or_else(|| anyhow!("foliage count overflow"))?;
         if needed > self.instance_cap {
             let new_cap = needed.next_power_of_two().max(256);
-            let new_bytes = (new_cap as u64)
-                .checked_mul(rec_bytes as u64)
-                .ok_or_else(|| anyhow!("foliage storage overflow"))?;
+            let new_bytes =
+                (new_cap as u64).checked_mul(rec_bytes as u64).ok_or_else(|| anyhow!("foliage storage overflow"))?;
             ensure!(new_bytes <= max_storage, "foliage instances buffer {new_bytes} exceeds limit {max_storage}");
             self.instance_cap = new_cap;
             self.instances = device.create_buffer(&wgpu::BufferDescriptor {
@@ -713,20 +732,44 @@ mod tests {
         let s = norm(cross(f, up));
         let u = cross(s, f);
         [
-            s[0], u[0], -f[0], 0.0,
-            s[1], u[1], -f[1], 0.0,
-            s[2], u[2], -f[2], 0.0,
-            -dot(s, eye), -dot(u, eye), dot(f, eye), 1.0,
+            s[0],
+            u[0],
+            -f[0],
+            0.0,
+            s[1],
+            u[1],
+            -f[1],
+            0.0,
+            s[2],
+            u[2],
+            -f[2],
+            0.0,
+            -dot(s, eye),
+            -dot(u, eye),
+            dot(f, eye),
+            1.0,
         ]
     }
 
     fn perspective_rh_zo(fov_y: f32, aspect: f32, near: f32, far: f32) -> [f32; 16] {
         let f = 1.0 / (fov_y * 0.5).tan();
         [
-            f / aspect, 0.0, 0.0, 0.0,
-            0.0, f, 0.0, 0.0,
-            0.0, 0.0, far / (near - far), -1.0,
-            0.0, 0.0, (far * near) / (near - far), 0.0,
+            f / aspect,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            f,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            far / (near - far),
+            -1.0,
+            0.0,
+            0.0,
+            (far * near) / (near - far),
+            0.0,
         ]
     }
 
@@ -777,7 +820,10 @@ mod tests {
                     view: &color_view,
                     depth_slice: None,
                     resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &depth_view,
@@ -860,7 +906,10 @@ mod tests {
         }
         let hm = TerrainPipeline::upload_heightmap(&device, &queue, hm_w, hm_h, &heights).unwrap();
         let eye = [0.0, 26.0, 14.0];
-        let vp = mul4(perspective_rh_zo(std::f32::consts::FRAC_PI_3, 1.0, 0.5, 200.0), look_at_rh(eye, [0.0, 4.0, 0.0], [0.0, 1.0, 0.0]));
+        let vp = mul4(
+            perspective_rh_zo(std::f32::consts::FRAC_PI_3, 1.0, 0.5, 200.0),
+            look_at_rh(eye, [0.0, 4.0, 0.0], [0.0, 1.0, 0.0]),
+        );
         let uniform = TerrainUniform {
             view_projection: vp,
             camera_pos_and_fog: [eye[0], eye[1], eye[2], 0.0],
@@ -884,7 +933,10 @@ mod tests {
         let seam_center = img[32 * 64 + 32];
         let summit = img[32 * 64 + 52];
         assert!(meadow[1] > meadow[0] + 15 && meadow[1] > meadow[2] + 15, "meadow must be green: {meadow:?}");
-        assert!(seam_center[0] > 10 || seam_center[1] > 10, "adjacent CDLOD seam must have no black crack: {seam_center:?}");
+        assert!(
+            seam_center[0] > 10 || seam_center[1] > 10,
+            "adjacent CDLOD seam must have no black crack: {seam_center:?}"
+        );
         assert!(
             summit[0] > 160 && summit[1] > 160 && summit[2] > 160,
             "high snow plateau must be bright white: {summit:?}"
@@ -897,7 +949,10 @@ mod tests {
         let target = PipelineTarget::standard(wgpu::TextureFormat::Rgba8Unorm, Some(wgpu::TextureFormat::Depth32Float));
         let mut water = WaterPipeline::new(&device, target);
         let eye = [0.0, 12.0, 8.0];
-        let vp = mul4(perspective_rh_zo(std::f32::consts::FRAC_PI_3, 1.0, 0.5, 200.0), look_at_rh(eye, [0.0, 0.0, 0.0], [0.0, 1.0, 0.0]));
+        let vp = mul4(
+            perspective_rh_zo(std::f32::consts::FRAC_PI_3, 1.0, 0.5, 200.0),
+            look_at_rh(eye, [0.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
+        );
         let uniform = WaterUniform {
             view_projection: vp,
             camera_pos_and_time: [eye[0], eye[1], eye[2], 1.5],
@@ -908,12 +963,7 @@ mod tests {
             sky_horizon: [0.65, 0.78, 0.92, 10.0],
             sky_zenith: [0.18, 0.38, 0.78, 0.7],
             bed_color_and_slope: [0.85, 0.70, 0.45, -0.45],
-            waves: [
-                [1.0, 0.2, 0.14, 5.0],
-                [0.4, 0.9, 0.10, 3.1],
-                [-0.6, 0.8, 0.06, 1.8],
-                [0.8, -0.5, 0.04, 1.1],
-            ],
+            waves: [[1.0, 0.2, 0.14, 5.0], [0.4, 0.9, 0.10, 3.1], [-0.6, 0.8, 0.06, 1.8], [0.8, -0.5, 0.04, 1.1]],
         };
         let img = render_and_read_rgba8(&device, &queue, 64, 64, |pass| {
             water.draw(&queue, pass, &uniform).unwrap();
@@ -924,7 +974,12 @@ mod tests {
         assert!(deep[2] > deep[0] + 15, "deep water must absorb red faster than blue: deep={deep:?}");
 
         // Dry-cell discard: seabed above water level (+2.0 > 0.0) with calm waves must discard (stay black).
-        let dry_u = WaterUniform { sun_color_and_bed: [2.0, 1.95, 1.85, 2.0], bed_color_and_slope: [0.8, 0.7, 0.5, 0.0], waves: [[0.0; 4]; 4], ..uniform };
+        let dry_u = WaterUniform {
+            sun_color_and_bed: [2.0, 1.95, 1.85, 2.0],
+            bed_color_and_slope: [0.8, 0.7, 0.5, 0.0],
+            waves: [[0.0; 4]; 4],
+            ..uniform
+        };
         let dry_img = render_and_read_rgba8(&device, &queue, 32, 32, |pass| {
             water.draw(&queue, pass, &dry_u).unwrap();
         });
@@ -952,7 +1007,10 @@ mod tests {
         });
         let left_px = split[16 * 64 + 16];
         let right_px = split[16 * 64 + 48];
-        assert!(left_px[0] > right_px[0] + 30 && right_px[2] > right_px[0] + 30, "two draws in one submission must preserve distinct uniforms: left={left_px:?} right={right_px:?}");
+        assert!(
+            left_px[0] > right_px[0] + 30 && right_px[2] > right_px[0] + 30,
+            "two draws in one submission must preserve distinct uniforms: left={left_px:?} right={right_px:?}"
+        );
     }
 
     #[test]
@@ -961,7 +1019,10 @@ mod tests {
         let target = PipelineTarget::standard(wgpu::TextureFormat::Rgba8Unorm, Some(wgpu::TextureFormat::Depth32Float));
         let mut foliage = FoliagePipeline::new(&device, target);
         let eye = [0.0, 1.0, 4.0];
-        let vp = mul4(perspective_rh_zo(std::f32::consts::FRAC_PI_3, 1.0, 0.2, 100.0), look_at_rh(eye, [0.0, 1.0, 0.0], [0.0, 1.0, 0.0]));
+        let vp = mul4(
+            perspective_rh_zo(std::f32::consts::FRAC_PI_3, 1.0, 0.2, 100.0),
+            look_at_rh(eye, [0.0, 1.0, 0.0], [0.0, 1.0, 0.0]),
+        );
         let instances = [FoliageInstance { pos_and_scale: [0.0, 0.0, 0.0, 1.0], rot_phase_tint: [0.0, 0.0, 0.0, 0.5] }];
 
         // 1. Calm wind vs strong +X wind: blade tips bend right (+X); also verify zero wind vector is safe (no NaN).

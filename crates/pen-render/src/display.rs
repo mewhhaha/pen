@@ -1,3 +1,4 @@
+#![cfg_attr(not(feature = "render-3d"), allow(dead_code))]
 // HDR output. Frames are drawn as for an SDR screen, in sRGB-encoded light,
 // but on an HDR display the present pass rolls highlights off toward the
 // display's peak instead of into white, so they reach past 1. Where the
@@ -184,9 +185,7 @@ impl Screen {
         }
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("decode"),
-            source: wgpu::ShaderSource::Wgsl(
-                DECODE.replace("${fullscreen}", crate::wgsl!("fullscreen.wgsl")).into(),
-            ),
+            source: wgpu::ShaderSource::Wgsl(DECODE.replace("${fullscreen}", crate::wgsl!("fullscreen.wgsl")).into()),
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("decode"),

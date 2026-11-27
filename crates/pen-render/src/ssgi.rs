@@ -1,10 +1,10 @@
+#![cfg_attr(not(feature = "render-ssgi"), allow(dead_code))]
 // Screen-Space Global Illumination (SSGI) diffuse bounce pass.
 use pen_protocol::Matrix;
 
 use crate::matrix::invert;
 
 const FULLSCREEN: &str = crate::wgsl!("fullscreen.wgsl");
-const SSGI_SHADER: &str = crate::wgsl!("ssgi.wgsl");
 
 /// World-space bounce march radius, indirect intensity, and depth-hit thickness.
 const SSGI_RADIUS: f32 = 3.5;
@@ -14,9 +14,7 @@ const SSGI_MAX_PIXELS: f32 = 96.0;
 
 pub(crate) fn shader(samples: u32) -> String {
     let depth_texture = if samples > 1 { "texture_depth_multisampled_2d" } else { "texture_depth_2d" };
-    SSGI_SHADER
-        .replace("${depth_texture}", depth_texture)
-        .replace("${fullscreen}", FULLSCREEN)
+    crate::deferred_wgsl!("ssgi.wgsl").replace("${depth_texture}", depth_texture).replace("${fullscreen}", FULLSCREEN)
 }
 
 /// Packs the 160-byte `Ssgi` uniform buffer.

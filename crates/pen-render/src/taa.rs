@@ -1,3 +1,4 @@
+#![cfg_attr(not(feature = "render-taa"), allow(dead_code))]
 // Temporal antialiasing, which the frame's quality turns on. Each frame's
 // samples move within their pixels along a Halton sequence (the projection
 // is jittered), and a pass after the sky and fog (post.rs) blends the frame
@@ -40,10 +41,8 @@ pub fn fsr_mip_bias(in_width: u32, out_width: u32) -> f32 {
     (-ratio.log2()).clamp(-2.5, 0.0)
 }
 
-const SHADER: &str = crate::wgsl!("taa.wgsl");
-
 pub(crate) fn shader(samples: u32) -> String {
-    SHADER
+    crate::deferred_wgsl!("taa.wgsl")
         .replace("${depth_texture}", if samples > 1 { "texture_depth_multisampled_2d" } else { "texture_depth_2d" })
         .replace("${fullscreen}", crate::wgsl!("fullscreen.wgsl"))
 }

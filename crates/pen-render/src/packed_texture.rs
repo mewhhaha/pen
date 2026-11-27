@@ -1,3 +1,4 @@
+#![cfg_attr(not(feature = "render-3d"), allow(dead_code))]
 // Packed textures, as models/gtex.py writes them: compact channels (palette
 // indices and data stay one or two bytes a texel instead of being expanded to
 // RGBA) and every mip level worked out offline, smallest first, so a texture

@@ -374,7 +374,8 @@ impl Browser {
         let hooks = options.qualify.then(|| Hooks::new(screen.canvas.element.clone()));
         let captions = options.captions.shared();
         services.register(Box::new(pen_runtime::captions::CaptionsService(captions.clone())));
-        let accessibility = Accessibility::new(input.clone())?;
+        #[cfg_attr(not(feature = "locales"), allow(unused_mut))]
+        let mut accessibility = Accessibility::new(input.clone())?;
         #[cfg(all(feature = "devtools", feature = "locales"))]
         let has_locales = options.locales.is_some();
         #[cfg(feature = "locales")]

@@ -1,3 +1,4 @@
+#![cfg_attr(not(feature = "render-taa"), allow(dead_code, unused_imports))]
 // Per-object and skeletal screen-space velocity pass (shaders/velocity.wgsl).
 // Renders opaque scene geometry into a single-sampled Rg16Float velocity
 // texture (UV delta curr_uv - prev_uv) whenever a frame contains moving draws
@@ -12,8 +13,6 @@ use super::{Drawing, GpuAsset, ReadyEntry, Scratch, Shape, Source};
 use crate::asset_store::MESH_VERTEX_FLOATS;
 use crate::matrix::{IDENTITY, multiply};
 use crate::shader::SKIN_VERTEX_BYTES;
-
-const SHADER: &str = crate::wgsl!("velocity.wgsl");
 
 /// Clear value marking pixels without explicit object velocity (sky or idle frame).
 pub(crate) const SENTINEL: f64 = 1024.0;
@@ -98,7 +97,7 @@ impl Velocity {
         }
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("velocity"),
-            source: wgpu::ShaderSource::Wgsl(SHADER.into()),
+            source: wgpu::ShaderSource::Wgsl(crate::deferred_wgsl!("velocity.wgsl").into()),
         });
         let camera_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("velocity camera"),
@@ -276,148 +275,116 @@ impl Velocity {
     #[allow(clippy::too_many_arguments)]
     pub fn encode(
         &mut self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        encoder: &mut wgpu::CommandEncoder,
-        target: &wgpu::TextureView,
-        depth: &wgpu::TextureView,
-        frame: &RenderFrame,
-        jittered_projection: &Matrix,
-        previous_vp: Option<Matrix>,
-        scratch: &Scratch,
-        drawing: &Drawing<'_>,
-        skinning: &Skinning,
-        ready: &[ReadyEntry],
-        timer: &GpuTimer,
+        #[cfg_attr(not(feature = "render-taa"), allow(unused_variables))] device: &wgpu::Device,
+        #[cfg_attr(not(feature = "render-taa"), allow(unused_variables))] queue: &wgpu::Queue,
+        #[cfg_attr(not(feature = "render-taa"), allow(unused_variables))] encoder: &mut wgpu::CommandEncoder,
+        #[cfg_attr(not(feature = "render-taa"), allow(unused_variables))] target: &wgpu::TextureView,
+        #[cfg_attr(not(feature = "render-taa"), allow(unused_variables))] depth: &wgpu::TextureView,
+        #[cfg_attr(not(feature = "render-taa"), allow(unused_variables))] frame: &RenderFrame,
+        #[cfg_attr(not(feature = "render-taa"), allow(unused_variables))] jittered_projection: &Matrix,
+        #[cfg_attr(not(feature = "render-taa"), allow(unused_variables))] previous_vp: Option<Matrix>,
+        #[cfg_attr(not(feature = "render-taa"), allow(unused_variables))] scratch: &Scratch,
+        #[cfg_attr(not(feature = "render-taa"), allow(unused_variables))] drawing: &Drawing<'_>,
+        #[cfg_attr(not(feature = "render-taa"), allow(unused_variables))] skinning: &Skinning,
+        #[cfg_attr(not(feature = "render-taa"), allow(unused_variables))] ready: &[ReadyEntry],
+        #[cfg_attr(not(feature = "render-taa"), allow(unused_variables))] timer: &GpuTimer,
     ) {
-        let has_object_motion = !frame.motions.is_empty()
-            || scratch.opaque.iter().any(|&idx| {
+        #[cfg(not(feature = "render-taa"))]
+        return;
+        #[cfg(feature = "render-taa")]
+        {
+            let has_object_motion = !frame.motions.is_empty()
+                || scratch.opaque.iter().any(|&idx| {
+                    let entry = &ready[idx];
+                    entry.skin.is_some()
+                        && entry.mesh.is_some_and(|mesh| {
+                            scratch
+                                .target_of_source(drawing.items[entry.item].source)
+                                .is_some_and(|t| skinning.previous_offset(t, mesh).is_some())
+                        })
+                });
+
+            let clear = wgpu::Color { r: SENTINEL, g: SENTINEL, b: 0.0, a: 0.0 };
+            if !has_object_motion {
+                if self.dirty {
+                    let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("velocity clear"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: target,
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: wgpu::Operations { load: wgpu::LoadOp::Clear(clear), store: wgpu::StoreOp::Store },
+                        })],
+                        ..Default::default()
+                    });
+                    self.dirty = false;
+                }
+                return;
+            }
+
+            self.ensure_pipelines(device);
+            let curr_vp = multiply(&frame.projection, &frame.view);
+            let curr_jittered_vp = multiply(jittered_projection, &frame.view);
+            let prev_vp = previous_vp.unwrap_or(curr_vp);
+            let mut cam_floats = [0.0f32; 48];
+            cam_floats[..16].copy_from_slice(&curr_jittered_vp);
+            cam_floats[16..32].copy_from_slice(&curr_vp);
+            cam_floats[32..48].copy_from_slice(&prev_vp);
+            queue.write_buffer(&self.pipelines.as_ref().unwrap().camera_uniform, 0, bytemuck::cast_slice(&cam_floats));
+
+            // Slot 0 is always identity (used for world-space solids), followed by each opaque non-batch mesh.
+            self.motion_slots.clear();
+            let mut slot_count: usize = 1;
+            for &idx in &scratch.opaque {
                 let entry = &ready[idx];
-                entry.skin.is_some()
-                    && entry.mesh.is_some_and(|mesh| {
-                        scratch
-                            .target_of_source(drawing.items[entry.item].source)
-                            .is_some_and(|t| skinning.previous_offset(t, mesh).is_some())
-                    })
-            });
-
-        let clear = wgpu::Color { r: SENTINEL, g: SENTINEL, b: 0.0, a: 0.0 };
-        if !has_object_motion {
-            if self.dirty {
-                let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("velocity clear"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: target,
-                        depth_slice: None,
-                        resolve_target: None,
-                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(clear), store: wgpu::StoreOp::Store },
-                    })],
-                    ..Default::default()
-                });
-                self.dirty = false;
+                if entry.persistent {
+                    continue;
+                }
+                if matches!(drawing.items[entry.item].shape, Shape::Mesh(_)) {
+                    self.motion_slots.push((idx, u32::try_from(slot_count).unwrap_or(u32::MAX)));
+                    slot_count += 1;
+                }
             }
-            return;
-        }
-
-        self.ensure_pipelines(device);
-        let curr_vp = multiply(&frame.projection, &frame.view);
-        let curr_jittered_vp = multiply(jittered_projection, &frame.view);
-        let prev_vp = previous_vp.unwrap_or(curr_vp);
-        let mut cam_floats = [0.0f32; 48];
-        cam_floats[..16].copy_from_slice(&curr_jittered_vp);
-        cam_floats[16..32].copy_from_slice(&curr_vp);
-        cam_floats[32..48].copy_from_slice(&prev_vp);
-        queue.write_buffer(&self.pipelines.as_ref().unwrap().camera_uniform, 0, bytemuck::cast_slice(&cam_floats));
-
-        // Slot 0 is always identity (used for world-space solids), followed by each opaque non-batch mesh.
-        self.motion_slots.clear();
-        let mut slot_count: usize = 1;
-        for &idx in &scratch.opaque {
-            let entry = &ready[idx];
-            if entry.persistent {
-                continue;
+            self.ensure_draw_buffer(device, slot_count);
+            let stride_floats = (self.stride / 4) as usize;
+            // Slot 0: identity current and previous.
+            self.draw_data[0..16].copy_from_slice(&IDENTITY);
+            self.draw_data[16..32].copy_from_slice(&IDENTITY);
+            for &(idx, slot) in &self.motion_slots {
+                let entry = &ready[idx];
+                let item = &drawing.items[entry.item];
+                let curr = item.transform(frame);
+                let prev = match item.source {
+                    Source::Draw(draw_idx) => scratch.motion_previous(frame, draw_idx).unwrap_or(curr),
+                    _ => curr,
+                };
+                let base = slot as usize * stride_floats;
+                self.draw_data[base..base + 16].copy_from_slice(curr);
+                self.draw_data[base + 16..base + 32].copy_from_slice(prev);
             }
-            if matches!(drawing.items[entry.item].shape, Shape::Mesh(_)) {
-                self.motion_slots.push((idx, u32::try_from(slot_count).unwrap_or(u32::MAX)));
-                slot_count += 1;
-            }
-        }
-        self.ensure_draw_buffer(device, slot_count);
-        let stride_floats = (self.stride / 4) as usize;
-        // Slot 0: identity current and previous.
-        self.draw_data[0..16].copy_from_slice(&IDENTITY);
-        self.draw_data[16..32].copy_from_slice(&IDENTITY);
-        for &(idx, slot) in &self.motion_slots {
-            let entry = &ready[idx];
-            let item = &drawing.items[entry.item];
-            let curr = item.transform(frame);
-            let prev = match item.source {
-                Source::Draw(draw_idx) => scratch.motion_previous(frame, draw_idx).unwrap_or(curr),
-                _ => curr,
-            };
-            let base = slot as usize * stride_floats;
-            self.draw_data[base..base + 16].copy_from_slice(curr);
-            self.draw_data[base + 16..base + 32].copy_from_slice(prev);
-        }
-        queue.write_buffer(
-            self.draw_buffer.as_ref().unwrap(),
-            0,
-            bytemuck::cast_slice(&self.draw_data[..slot_count * stride_floats]),
-        );
+            queue.write_buffer(
+                self.draw_buffer.as_ref().unwrap(),
+                0,
+                bytemuck::cast_slice(&self.draw_data[..slot_count * stride_floats]),
+            );
 
-        // Prepare skinned velocity bind groups if any skinned buffers are live (2-slot cache for double-buffered skins).
-        let [curr_skin_buf, prev_skin_buf] = skinning.buffers();
-        let mut active_skin_same: Option<usize> = None;
-        let mut active_skin_both: Option<usize> = None;
-        if let Some((curr_buf, curr_size)) = curr_skin_buf {
-            let layout = &self.pipelines.as_ref().unwrap().skin_layout;
-            let same_slot = if let Some(hit) = self
-                .skin_same
-                .iter()
-                .position(|entry| entry.as_ref().is_some_and(|(b, s, _)| b == curr_buf && *s == curr_size))
-            {
-                hit
-            } else {
-                let slot = self.skin_same_next;
-                self.skin_same_next ^= 1;
-                let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("velocity skin same"),
-                    layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                                buffer: curr_buf,
-                                offset: 0,
-                                size: wgpu::BufferSize::new(curr_size),
-                            }),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                                buffer: curr_buf,
-                                offset: 0,
-                                size: wgpu::BufferSize::new(curr_size),
-                            }),
-                        },
-                    ],
-                });
-                self.skin_same[slot] = Some((curr_buf.clone(), curr_size, group));
-                slot
-            };
-            active_skin_same = Some(same_slot);
-            if let Some((prev_buf, prev_size)) = prev_skin_buf {
-                let both_slot = if let Some(hit) = self.skin_both.iter().position(|entry| {
-                    entry
-                        .as_ref()
-                        .is_some_and(|(b, s, _)| &b[0] == curr_buf && &b[1] == prev_buf && *s == [curr_size, prev_size])
-                }) {
+            // Prepare skinned velocity bind groups if any skinned buffers are live (2-slot cache for double-buffered skins).
+            let [curr_skin_buf, prev_skin_buf] = skinning.buffers();
+            let mut active_skin_same: Option<usize> = None;
+            let mut active_skin_both: Option<usize> = None;
+            if let Some((curr_buf, curr_size)) = curr_skin_buf {
+                let layout = &self.pipelines.as_ref().unwrap().skin_layout;
+                let same_slot = if let Some(hit) = self
+                    .skin_same
+                    .iter()
+                    .position(|entry| entry.as_ref().is_some_and(|(b, s, _)| b == curr_buf && *s == curr_size))
+                {
                     hit
                 } else {
-                    let slot = self.skin_both_next;
-                    self.skin_both_next ^= 1;
+                    let slot = self.skin_same_next;
+                    self.skin_same_next ^= 1;
                     let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some("velocity skin both"),
+                        label: Some("velocity skin same"),
                         layout,
                         entries: &[
                             wgpu::BindGroupEntry {
@@ -431,123 +398,162 @@ impl Velocity {
                             wgpu::BindGroupEntry {
                                 binding: 1,
                                 resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                                    buffer: prev_buf,
+                                    buffer: curr_buf,
                                     offset: 0,
-                                    size: wgpu::BufferSize::new(prev_size),
+                                    size: wgpu::BufferSize::new(curr_size),
                                 }),
                             },
                         ],
                     });
-                    self.skin_both[slot] = Some(([curr_buf.clone(), prev_buf.clone()], [curr_size, prev_size], group));
+                    self.skin_same[slot] = Some((curr_buf.clone(), curr_size, group));
                     slot
                 };
-                active_skin_both = Some(both_slot);
-            }
-        }
-        let skin_same_group = active_skin_same.and_then(|slot| self.skin_same[slot].as_ref().map(|(_, _, g)| g));
-        let skin_both_group = active_skin_both.and_then(|slot| self.skin_both[slot].as_ref().map(|(_, _, g)| g));
-
-        let pipelines = self.pipelines.as_ref().unwrap();
-        let draw_group = self.draw_group.as_ref().unwrap();
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("velocity"),
-            timestamp_writes: timer.pass(Span::Scene),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: target,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(clear), store: wgpu::StoreOp::Store },
-            })],
-            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                view: depth,
-                depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Discard }),
-                stencil_ops: None,
-            }),
-            ..Default::default()
-        });
-        pass.set_bind_group(0, &pipelines.camera_group, &[]);
-
-        let mut next_slot_cursor = 0usize;
-        for &idx in &scratch.opaque {
-            let entry = &ready[idx];
-            if entry.persistent {
-                continue;
-            }
-            let item = &drawing.items[entry.item];
-            match item.shape {
-                Shape::Mesh(_) => {
-                    let slot = self.motion_slots[next_slot_cursor].1;
-                    next_slot_cursor += 1;
-                    let Some(mesh_slot) = entry.mesh else { continue };
-                    let Some(GpuAsset::Mesh(mesh)) = drawing.assets.current(mesh_slot) else { continue };
-                    if mesh.instances.is_some() {
-                        continue;
-                    }
-                    let offset = u32::try_from(u64::from(slot) * self.stride).unwrap_or(0);
-                    let lod = mesh.lods.get(usize::from(item.lod)).unwrap_or(&mesh.lods[0]);
-                    if let (Some(curr_off), Some(skin)) = (entry.skin, &mesh.skin) {
-                        let prev_off =
-                            scratch.target_of_source(item.source).and_then(|t| skinning.previous_offset(t, mesh_slot));
-                        let bound = match (prev_off, skin_both_group, skin_same_group) {
-                            (Some(p_off), Some(group), _) => Some((group, p_off)),
-                            (_, _, Some(group)) => Some((group, curr_off)),
-                            _ => None,
-                        };
-                        if let Some((skin_group, p_off)) = bound {
-                            pass.set_pipeline(&pipelines.skinned);
-                            pass.set_bind_group(1, draw_group, &[offset]);
-                            pass.set_bind_group(2, skin_group, &[curr_off, p_off]);
-                            if let (Some((start, end)), Some(morphed)) = (entry.morph, drawing.morphed) {
-                                pass.set_vertex_buffer(0, morphed.slice(start..end));
-                            } else {
-                                pass.set_vertex_buffer(0, mesh.vertices.slice(..));
-                            }
-                            pass.set_vertex_buffer(1, skin.vertices.slice(..));
-                            pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
-                            pass.draw_indexed(lod.first..lod.first + lod.count, 0, 0..1);
-                            continue;
-                        }
-                    }
-                    pass.set_pipeline(&pipelines.plain);
-                    pass.set_bind_group(1, draw_group, &[offset]);
-                    if let (Some((start, end)), Some(morphed)) = (entry.morph, drawing.morphed) {
-                        pass.set_vertex_buffer(0, morphed.slice(start..end));
+                active_skin_same = Some(same_slot);
+                if let Some((prev_buf, prev_size)) = prev_skin_buf {
+                    let both_slot = if let Some(hit) = self.skin_both.iter().position(|entry| {
+                        entry.as_ref().is_some_and(|(b, s, _)| {
+                            &b[0] == curr_buf && &b[1] == prev_buf && *s == [curr_size, prev_size]
+                        })
+                    }) {
+                        hit
                     } else {
-                        pass.set_vertex_buffer(0, mesh.vertices.slice(..));
-                    }
-                    pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
-                    pass.draw_indexed(lod.first..lod.first + lod.count, 0, 0..1);
+                        let slot = self.skin_both_next;
+                        self.skin_both_next ^= 1;
+                        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("velocity skin both"),
+                            layout,
+                            entries: &[
+                                wgpu::BindGroupEntry {
+                                    binding: 0,
+                                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                        buffer: curr_buf,
+                                        offset: 0,
+                                        size: wgpu::BufferSize::new(curr_size),
+                                    }),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 1,
+                                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                        buffer: prev_buf,
+                                        offset: 0,
+                                        size: wgpu::BufferSize::new(prev_size),
+                                    }),
+                                },
+                            ],
+                        });
+                        self.skin_both[slot] =
+                            Some(([curr_buf.clone(), prev_buf.clone()], [curr_size, prev_size], group));
+                        slot
+                    };
+                    active_skin_both = Some(both_slot);
                 }
-                Shape::Batch(batch_idx) => {
-                    let batch = &drawing.batches[batch_idx];
-                    let Some(GpuAsset::Mesh(mesh)) = drawing.assets.current(batch.mesh) else { continue };
-                    pass.set_pipeline(&pipelines.instanced);
-                    if let Some(culled) = &batch.gpu {
-                        drawing.culling.draw_positions(&mut pass, culled, 0, mesh);
-                    } else {
-                        let ranges = &batch.ranges[0];
-                        if ranges.iter().all(|&(_, count)| count == 0) {
+            }
+            let skin_same_group = active_skin_same.and_then(|slot| self.skin_same[slot].as_ref().map(|(_, _, g)| g));
+            let skin_both_group = active_skin_both.and_then(|slot| self.skin_both[slot].as_ref().map(|(_, _, g)| g));
+
+            let pipelines = self.pipelines.as_ref().unwrap();
+            let draw_group = self.draw_group.as_ref().unwrap();
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("velocity"),
+                timestamp_writes: timer.pass(Span::Scene),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(clear), store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: depth,
+                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Discard }),
+                    stencil_ops: None,
+                }),
+                ..Default::default()
+            });
+            pass.set_bind_group(0, &pipelines.camera_group, &[]);
+
+            let mut next_slot_cursor = 0usize;
+            for &idx in &scratch.opaque {
+                let entry = &ready[idx];
+                if entry.persistent {
+                    continue;
+                }
+                let item = &drawing.items[entry.item];
+                match item.shape {
+                    Shape::Mesh(_) => {
+                        let slot = self.motion_slots[next_slot_cursor].1;
+                        next_slot_cursor += 1;
+                        let Some(mesh_slot) = entry.mesh else { continue };
+                        let Some(GpuAsset::Mesh(mesh)) = drawing.assets.current(mesh_slot) else { continue };
+                        if mesh.instances.is_some() {
                             continue;
                         }
-                        pass.set_vertex_buffer(0, mesh.vertices.slice(..));
-                        pass.set_vertex_buffer(1, drawing.instances.slice(..));
+                        let offset = u32::try_from(u64::from(slot) * self.stride).unwrap_or(0);
+                        let lod = mesh.lods.get(usize::from(item.lod)).unwrap_or(&mesh.lods[0]);
+                        if let (Some(curr_off), Some(skin)) = (entry.skin, &mesh.skin) {
+                            let prev_off = scratch
+                                .target_of_source(item.source)
+                                .and_then(|t| skinning.previous_offset(t, mesh_slot));
+                            let bound = match (prev_off, skin_both_group, skin_same_group) {
+                                (Some(p_off), Some(group), _) => Some((group, p_off)),
+                                (_, _, Some(group)) => Some((group, curr_off)),
+                                _ => None,
+                            };
+                            if let Some((skin_group, p_off)) = bound {
+                                pass.set_pipeline(&pipelines.skinned);
+                                pass.set_bind_group(1, draw_group, &[offset]);
+                                pass.set_bind_group(2, skin_group, &[curr_off, p_off]);
+                                if let (Some((start, end)), Some(morphed)) = (entry.morph, drawing.morphed) {
+                                    pass.set_vertex_buffer(0, morphed.slice(start..end));
+                                } else {
+                                    pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+                                }
+                                pass.set_vertex_buffer(1, skin.vertices.slice(..));
+                                pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+                                pass.draw_indexed(lod.first..lod.first + lod.count, 0, 0..1);
+                                continue;
+                            }
+                        }
+                        pass.set_pipeline(&pipelines.plain);
+                        pass.set_bind_group(1, draw_group, &[offset]);
+                        if let (Some((start, end)), Some(morphed)) = (entry.morph, drawing.morphed) {
+                            pass.set_vertex_buffer(0, morphed.slice(start..end));
+                        } else {
+                            pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+                        }
                         pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
-                        for (lod, &(first, count)) in mesh.lods.iter().zip(ranges) {
-                            if count > 0 {
-                                pass.draw_indexed(lod.first..lod.first + lod.count, 0, first..first + count);
+                        pass.draw_indexed(lod.first..lod.first + lod.count, 0, 0..1);
+                    }
+                    Shape::Batch(batch_idx) => {
+                        let batch = &drawing.batches[batch_idx];
+                        let Some(GpuAsset::Mesh(mesh)) = drawing.assets.current(batch.mesh) else { continue };
+                        pass.set_pipeline(&pipelines.instanced);
+                        if let Some(culled) = &batch.gpu {
+                            drawing.culling.draw_positions(&mut pass, culled, 0, mesh);
+                        } else {
+                            let ranges = &batch.ranges[0];
+                            if ranges.iter().all(|&(_, count)| count == 0) {
+                                continue;
+                            }
+                            pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+                            pass.set_vertex_buffer(1, drawing.instances.slice(..));
+                            pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+                            for (lod, &(first, count)) in mesh.lods.iter().zip(ranges) {
+                                if count > 0 {
+                                    pass.draw_indexed(lod.first..lod.first + lod.count, 0, first..first + count);
+                                }
                             }
                         }
                     }
-                }
-                Shape::Solid(solid_idx) => {
-                    let solid = &drawing.solids[solid_idx];
-                    pass.set_pipeline(&pipelines.plain);
-                    pass.set_bind_group(1, draw_group, &[0]);
-                    pass.set_vertex_buffer(0, solid.buffer.slice(..));
-                    pass.draw(0..solid.count, 0..1);
+                    Shape::Solid(solid_idx) => {
+                        let solid = &drawing.solids[solid_idx];
+                        pass.set_pipeline(&pipelines.plain);
+                        pass.set_bind_group(1, draw_group, &[0]);
+                        pass.set_vertex_buffer(0, solid.buffer.slice(..));
+                        pass.draw(0..solid.count, 0..1);
+                    }
                 }
             }
+            self.dirty = true;
         }
-        self.dirty = true;
     }
 }

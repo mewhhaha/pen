@@ -644,7 +644,18 @@ impl State {
         samples: u32,
         depth_mode: DepthMode,
     ) -> Result<()> {
-        if frame.quality.ray_tracing == 0 || !TlasRayTracer::supported(device) || wired.tlas_gpu.is_none() {
+        if frame.quality.ray_tracing == 0
+            || !TlasRayTracer::supported(device)
+            || wired.tlas_gpu.is_none()
+            || !crate::deferred_shaders::ready_all(&[
+                "tlas_traversal.wgsl",
+                "tlas_raytrace.wgsl",
+                "svgf.wgsl",
+                "restir.wgsl",
+                "restir_specular.wgsl",
+                "sharc.wgsl",
+            ])
+        {
             return Ok(());
         }
         let ddgi_active = ddgi_packed_buf.is_some();

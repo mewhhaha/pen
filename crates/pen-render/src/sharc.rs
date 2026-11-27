@@ -204,7 +204,7 @@ impl SharcCache {
         });
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("sharc"),
-            source: wgpu::ShaderSource::Wgsl(SHARC_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(crate::deferred_wgsl!("sharc.wgsl").into()),
         });
         let pipeline = |entry| {
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {

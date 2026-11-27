@@ -8,7 +8,7 @@ use wgpu::util::DeviceExt;
 
 #[cfg(not(target_arch = "wasm32"))]
 use crate::ray_tracing::TLAS_TRAVERSAL_HW_WGSL;
-use crate::ray_tracing::{RtLocalLight, TLAS_TRAVERSAL_WGSL, TlasSceneGpu, device_supports_hardware_ray_query};
+use crate::ray_tracing::{RtLocalLight, TlasSceneGpu, device_supports_hardware_ray_query};
 use crate::sharc::{SHARC_COMMON_WGSL, SharcCache};
 
 pub const RESTIR_WGSL: &str = crate::wgsl!("restir.wgsl");
@@ -480,15 +480,17 @@ struct Pipelines {
 
 impl Pipelines {
     fn new(device: &wgpu::Device, hardware: bool, native_depth: bool, fuse_bounce: bool, fuse_deposit: bool) -> Self {
-        let (traversal, declaration) =
-            (TLAS_TRAVERSAL_WGSL, "@group(0) @binding(1) var<storage, read> tlas_nodes: array<BvhNode>;");
+        let (traversal, declaration) = (
+            crate::deferred_wgsl!("tlas_traversal.wgsl"),
+            "@group(0) @binding(1) var<storage, read> tlas_nodes: array<BvhNode>;",
+        );
         #[cfg(not(target_arch = "wasm32"))]
         let (traversal, declaration) = if hardware {
             (TLAS_TRAVERSAL_HW_WGSL, "@group(0) @binding(1) var hw_tlas: acceleration_structure;")
         } else {
             (traversal, declaration)
         };
-        let mut body = RESTIR_WGSL.replace("// __TLAS_BINDING_1__", declaration);
+        let mut body = crate::deferred_wgsl!("restir.wgsl").replace("// __TLAS_BINDING_1__", declaration);
         let has_fused_sharc = fuse_bounce || fuse_deposit;
         if has_fused_sharc {
             body = body.replace("// __RESTIR_SHARC_DECLS__", RESTIR_SHARC_DECLS_WGSL);

@@ -8,7 +8,7 @@
 
 use anyhow::{Result, ensure};
 
-use crate::ray_tracing::{MAX_RT_LOCAL_LIGHTS, RtLocalLight, TLAS_TRAVERSAL_WGSL, TlasSceneGpu};
+use crate::ray_tracing::{MAX_RT_LOCAL_LIGHTS, RtLocalLight, TlasSceneGpu};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::ray_tracing::{TLAS_TRAVERSAL_HW_WGSL, device_supports_hardware_ray_query};
 
@@ -338,9 +338,9 @@ impl DdgiVolume {
             entries: &[u_entry, pack_u_entry, tex_ro(2, false), tex_ro(3, false), storage_rw(4), storage_ro(10)],
         });
 
-        let sw_body = DDGI_WGSL
+        let sw_body = crate::deferred_wgsl!("ddgi.wgsl")
             .replace("// __TLAS_BINDING_1__", "@group(0) @binding(1) var<storage, read> tlas_nodes: array<BvhNode>;");
-        let source = format!("{TLAS_TRAVERSAL_WGSL}\n{sw_body}");
+        let source = format!("{}\n{sw_body}", crate::deferred_wgsl!("tlas_traversal.wgsl"));
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("ddgi_wgsl"),
             source: wgpu::ShaderSource::Wgsl(source.into()),
@@ -393,7 +393,7 @@ impl DdgiVolume {
                     storage_ro(10),
                 ],
             });
-            let hw_body = DDGI_WGSL
+            let hw_body = crate::deferred_wgsl!("ddgi.wgsl")
                 .replace("// __TLAS_BINDING_1__", "@group(0) @binding(1) var hw_tlas: acceleration_structure;");
             let hw_src = format!("{TLAS_TRAVERSAL_HW_WGSL}\n{hw_body}");
             let hw_mod = device.create_shader_module(wgpu::ShaderModuleDescriptor {

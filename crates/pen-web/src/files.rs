@@ -1,16 +1,25 @@
+#![cfg_attr(not(feature = "file-saves"), allow(dead_code, unused_imports))]
 //! Files between the player and the page: a save or an input recording
 //! handed over as a download, and those the player hands the page, picked
 //! in the browser's file chooser or dropped onto it. What arrives, and the
 //! word on what became of it, waits for the frame loop.
+#[cfg(feature = "file-saves")]
 use std::cell::RefCell;
+#[cfg(feature = "file-saves")]
 use std::rc::Rc;
 
+#[cfg(feature = "file-saves")]
 use anyhow::Result;
+#[cfg(feature = "file-saves")]
 use js_sys::{Array, Uint8Array};
+#[cfg(feature = "file-saves")]
 use wasm_bindgen::{JsCast, closure::Closure};
+#[cfg(feature = "file-saves")]
 use wasm_bindgen_futures::{JsFuture, spawn_local};
+#[cfg(feature = "file-saves")]
 use web_sys::{Blob, BlobPropertyBag, DragEvent, Event, EventTarget, File, HtmlAnchorElement, HtmlInputElement, Url};
 
+#[cfg(feature = "file-saves")]
 use crate::program::error;
 
 /// What the frame loop is told.
@@ -23,9 +32,11 @@ pub enum Arrival {
 
 #[derive(Clone, Default)]
 pub struct Files {
+    #[cfg(feature = "file-saves")]
     arrived: Rc<RefCell<Vec<Arrival>>>,
 }
 
+#[cfg(feature = "file-saves")]
 fn listen(target: &EventTarget, name: &str, call: impl FnMut(Event) + 'static) {
     let callback = Closure::<dyn FnMut(Event)>::new(call);
     target.add_event_listener_with_callback(name, callback.as_ref().unchecked_ref()).unwrap();
@@ -35,36 +46,53 @@ fn listen(target: &EventTarget, name: &str, call: impl FnMut(Event) + 'static) {
 impl Files {
     /// Takes files dropped onto the page.
     pub fn install() -> Files {
-        let files = Files::default();
-        let window = web_sys::window().unwrap();
-        listen(&window, "dragover", |event| event.prevent_default());
-        let dropped = files.clone();
-        listen(&window, "drop", move |event| {
-            event.prevent_default();
-            let Some(list) = event.unchecked_ref::<DragEvent>().data_transfer().and_then(|transfer| transfer.files())
-            else {
-                return;
-            };
-            for index in 0..list.length() {
-                if let Some(file) = list.item(index) {
-                    dropped.read(file);
+        #[cfg(not(feature = "file-saves"))]
+        {
+            Files::default()
+        }
+        #[cfg(feature = "file-saves")]
+        {
+            let files = Files::default();
+            let window = web_sys::window().unwrap();
+            listen(&window, "dragover", |event| event.prevent_default());
+            let dropped = files.clone();
+            listen(&window, "drop", move |event| {
+                event.prevent_default();
+                let Some(list) =
+                    event.unchecked_ref::<DragEvent>().data_transfer().and_then(|transfer| transfer.files())
+                else {
+                    return;
+                };
+                for index in 0..list.length() {
+                    if let Some(file) = list.item(index) {
+                        dropped.read(file);
+                    }
                 }
-            }
-        });
-        files
+            });
+            files
+        }
     }
 
     /// Says `text` in the log with the next frame.
+    #[cfg(feature = "file-saves")]
     pub fn note(&self, error: bool, text: impl Into<String>) {
         self.arrived.borrow_mut().push(Arrival::Note { error, text: text.into() });
     }
 
     /// What arrived since the frame loop last looked.
     pub fn take(&self) -> Vec<Arrival> {
-        std::mem::take(&mut *self.arrived.borrow_mut())
+        #[cfg(feature = "file-saves")]
+        {
+            std::mem::take(&mut *self.arrived.borrow_mut())
+        }
+        #[cfg(not(feature = "file-saves"))]
+        {
+            Vec::new()
+        }
     }
 
     /// Reads `file` for the frame loop.
+    #[cfg(feature = "file-saves")]
     fn read(&self, file: File) {
         let files = self.clone();
         spawn_local(async move {
@@ -82,6 +110,7 @@ impl Files {
     /// Asks the player for a file (`accept` lists the extensions offered),
     /// which arrives once chosen. Browsers open their chooser only soon
     /// after the player pressed a key or clicked.
+    #[cfg(feature = "file-saves")]
     #[cfg_attr(not(feature = "devtools"), allow(dead_code))]
     pub fn choose(&self, accept: &str) -> Result<()> {
         let document = web_sys::window().unwrap().document().unwrap();
@@ -101,6 +130,7 @@ impl Files {
 }
 
 /// Hands `bytes` to the player as a download named `name`.
+#[cfg(feature = "file-saves")]
 #[cfg_attr(not(any(feature = "devtools", feature = "replay")), allow(dead_code))]
 pub fn download(name: &str, bytes: &[u8], kind: &str) -> Result<()> {
     let parts = Array::of1(&Uint8Array::from(bytes));
@@ -125,6 +155,7 @@ pub fn download(name: &str, bytes: &[u8], kind: &str) -> Result<()> {
 
 /// A name for a file made now: `PREFIX-20261016-142301.EXTENSION` (UTC),
 /// as native pen names its shots and recordings.
+#[cfg(feature = "file-saves")]
 #[cfg_attr(not(any(feature = "devtools", feature = "replay")), allow(dead_code))]
 pub fn named(prefix: &str, extension: &str) -> String {
     let now = js_sys::Date::new_0();
@@ -140,6 +171,7 @@ pub fn named(prefix: &str, extension: &str) -> String {
 }
 
 /// The last part of `path`, as a download's name.
+#[cfg(feature = "file-saves")]
 #[cfg_attr(not(feature = "devtools"), allow(dead_code))]
 pub fn base_name(path: &str) -> &str {
     path.rsplit(['/', '\\']).next().unwrap_or(path)

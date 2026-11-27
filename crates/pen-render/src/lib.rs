@@ -11,140 +11,246 @@ macro_rules! wgsl {
 }
 pub(crate) use wgsl;
 
+#[cfg(feature = "render-3d")]
+macro_rules! deferred_wgsl {
+    ($name:literal) => {{
+        #[cfg(all(target_arch = "wasm32", feature = "deferred-shaders"))]
+        {
+            crate::deferred_shaders::expect($name)
+        }
+        #[cfg(not(all(target_arch = "wasm32", feature = "deferred-shaders")))]
+        {
+            crate::wgsl!($name)
+        }
+    }};
+}
+#[cfg(feature = "render-3d")]
+pub(crate) use deferred_wgsl;
+
+#[cfg(feature = "render-3d")]
+mod deferred_shaders;
+
+#[cfg(feature = "render-3d")]
 pub mod animation;
+#[cfg(feature = "render-3d")]
 pub mod area_lights;
+#[cfg(feature = "render-3d")]
 mod asset_store;
+#[cfg(feature = "render-3d")]
 pub mod atmosphere_lut;
+#[cfg(feature = "render-3d")]
 mod built_in;
+#[cfg(feature = "render-3d")]
 pub mod camera_precision;
+#[cfg(feature = "render-3d")]
 mod compressed;
+#[cfg(feature = "render-3d")]
 mod culling;
+#[cfg(feature = "render-3d")]
 pub mod ddgi;
+#[cfg(feature = "render-3d")]
 pub mod decals;
 mod display;
+#[cfg(feature = "render-3d")]
 mod dof;
+#[cfg(feature = "render-3d")]
 mod environment;
+#[cfg(feature = "render-3d")]
 pub mod environment_passes;
+#[cfg(feature = "render-3d")]
 mod exposure;
 mod filter;
+#[cfg(feature = "render-3d")]
 pub mod gpu_particles;
+#[cfg(feature = "render-3d")]
 mod grade;
+#[cfg(feature = "render-3d")]
 mod graph;
+#[cfg(feature = "render-3d")]
 pub mod hdri;
+#[cfg(feature = "render-3d")]
 mod inspect;
+#[cfg(feature = "render-3d")]
 pub mod jfa_outline;
+#[cfg(feature = "render-3d")]
 pub mod lightmap;
+#[cfg(feature = "render-3d")]
 mod lights;
+#[cfg(feature = "render-3d")]
 pub mod lines;
+#[cfg(feature = "render-3d")]
 mod loader;
+#[cfg(feature = "render-3d")]
 mod local_shadows;
 mod matrix;
+#[cfg(feature = "render-3d")]
 mod mesh_cache;
+#[cfg(feature = "render-3d")]
 pub mod meshlet_dag;
+#[cfg(feature = "render-3d")]
 pub mod meshlets;
+#[cfg(feature = "render-3d")]
 mod mipmaps;
+#[cfg(feature = "render-3d")]
 mod motion_blur;
+#[cfg(feature = "render-3d")]
 pub mod oit;
 mod packed_texture;
+#[cfg(feature = "render-3d")]
 mod pipeline_cache;
 mod platform;
+#[cfg(feature = "render-3d")]
 mod post;
+#[cfg(feature = "render-3d")]
 pub mod post_fx;
+#[cfg(feature = "render-3d")]
 mod prefetch;
+#[cfg(feature = "render-3d")]
 pub mod ray_tracing;
 pub mod render2d;
+#[cfg(feature = "render-3d")]
 pub mod render_targets;
+#[cfg(feature = "render-3d")]
 mod renderer;
+#[cfg(not(feature = "render-3d"))]
+mod renderer2d_host;
+#[cfg(feature = "render-3d")]
 pub mod restir;
+#[cfg(feature = "render-3d")]
 pub mod restir_specular;
+#[cfg(feature = "render-3d")]
 mod shader;
-#[cfg(feature = "shader-graph")]
+#[cfg(all(feature = "render-3d", feature = "shader-graph"))]
 pub mod shader_graph;
+#[cfg(feature = "render-3d")]
 pub mod sharc;
-#[cfg(feature = "simplify")]
+#[cfg(all(feature = "render-3d", feature = "simplify"))]
 mod simplify;
+#[cfg(feature = "render-3d")]
 mod solids;
 mod sort;
 mod sprites;
+#[cfg(feature = "render-3d")]
 mod ssgi;
+#[cfg(feature = "render-3d")]
 mod subsurface;
+#[cfg(feature = "render-3d")]
 mod surface;
+#[cfg(feature = "render-3d")]
 pub mod surface_atlas;
+#[cfg(feature = "render-3d")]
 pub mod svgf;
+#[cfg(feature = "render-3d")]
 mod taa;
-#[cfg(test)]
+#[cfg(all(test, feature = "render-3d"))]
 mod testing;
 mod texture;
 #[cfg(feature = "texture-recipes")]
 mod texture_recipe;
+#[cfg(feature = "render-3d")]
 pub mod tonemap;
+#[cfg(feature = "render-3d")]
 pub mod video;
+#[cfg(feature = "render-3d")]
 mod volume;
 
 use pen_protocol::{Catalog, GameEvent, RenderFrame};
 
+#[cfg(feature = "render-3d")]
 pub use area_lights::{
     AREA_LIGHTS_WGSL, AreaLight, AreaLightKind, AreaLightResources, LTC_LUT_SIZE, generate_ltc_luts,
 };
+#[cfg(feature = "render-3d")]
 pub use asset_store::{mesh_bounds, pack_mesh, validate_asset_key};
+#[cfg(not(feature = "render-3d"))]
+pub fn validate_asset_key(key: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !(key.is_empty()
+            || key.starts_with('/')
+            || key.contains('\\')
+            || key.split('/').any(|part| part.is_empty() || part == "..")),
+        "asset key must stay inside assets: {key}"
+    );
+    Ok(())
+}
+#[cfg(feature = "render-3d")]
 pub use atmosphere_lut::{ATMOSPHERE_LUT_WGSL, AtmosphereParams, CLOUDS_WGSL, PhysicalAtmosphere};
+#[cfg(feature = "render-3d")]
 pub use camera_precision::{
     CameraRelativeFrame, DepthMode, detect_depth_mode, perspective_forward_z, perspective_reversed_z,
 };
+#[cfg(feature = "render-3d")]
 pub use ddgi::{
     DDGI_IRRADIANCE_INNER, DDGI_IRRADIANCE_TILE, DDGI_PACKED_HEADER_VEC4S, DDGI_VISIBILITY_INNER, DDGI_VISIBILITY_TILE,
     DDGI_WGSL, DdgiFrameParams, DdgiGridConfig, DdgiQueryPoint, DdgiVolume,
 };
+#[cfg(feature = "render-3d")]
 pub use decals::{PBR_DECAL_WGSL, PbrDecal, PbrDecalPass, PbrDecalView};
 pub use display::{DEFAULT_HEADROOM, Display, REFERENCE_WHITE_NITS, choose_surface};
+#[cfg(feature = "render-3d")]
 pub use environment::ENVIRONMENT_WGSL;
+#[cfg(feature = "render-3d")]
 pub use environment_passes::{
     FOLIAGE_WGSL, FoliageInstance, FoliagePipeline, FoliageUniform, PipelineTarget, TERRAIN_WGSL, TerrainHeightmap,
     TerrainPatch, TerrainPipeline, TerrainUniform, WATER_WGSL, WaterPipeline, WaterUniform,
 };
 pub use filter::ColorFilter;
+#[cfg(feature = "render-3d")]
 pub use gpu_particles::{
     GPU_PARTICLES_DRAW_WGSL, GPU_PARTICLES_SIM_WGSL, GpuParticle, GpuParticleMeshVertex, GpuParticleSimParams,
     GpuParticleSystem, ParticleSimCounters, unit_cube_particle_mesh,
 };
+#[cfg(feature = "render-3d")]
 pub use hdri::{DEFAULT_HDRI_FACE_SIZE, DEFAULT_HDRI_SAMPLES, HdriCubemap, HdriImage, HdriPrefilterer, blend_sh_l2};
+#[cfg(feature = "render-3d")]
 pub use inspect::{
     TextureInfo, inspect_material, inspect_material_base_texture, inspect_mesh, inspect_texture, shader_draws_sprites,
 };
+#[cfg(feature = "render-3d")]
 pub use jfa_outline::{
     JFA_OUTLINE_WGSL, JfaOutlinePass, MeshMaskParams, OUTLINE_OCCLUDED_BIT, OUTLINE_STYLE_CAPACITY, OutlineStyle,
     PreparedMeshMask,
 };
+#[cfg(feature = "render-3d")]
 pub use lightmap::{
     BakedLightmap, GpuLightmapBaker, LIGHTMAP_BAKE_WGSL, LightmapBakeParams, LightmapTriangle, PackedLightmapMesh,
     pack_lightmap_uv2,
 };
+#[cfg(feature = "render-3d")]
 pub use lights::LIGHTS_WGSL;
+#[cfg(feature = "render-3d")]
 pub use lines::{
     LINES_WGSL, LineBatch, LineFrame, LineLayer, LineRenderer, LineSegmentGpu, LineStyle, LineVertex, PreparedLines,
     XRayStyle,
 };
+#[cfg(feature = "render-3d")]
 pub use meshlet_dag::{
     DagClusterGpu, MESHLET_DAG_CUT_WGSL, MeshletDagConfig, MeshletDagCullOutput, MeshletDagCullParams,
     MeshletDagCuller, MeshletDagGpu, MeshletDagMesh, MeshletDagTwoPhaseOutput, build_meshlet_dag,
 };
+#[cfg(feature = "render-3d")]
 pub use meshlets::{
     DEFAULT_MAX_MESHLET_TRIANGLES, DEFAULT_MAX_MESHLET_VERTICES, MESHLET_CULL_WGSL, MeshletBatchEntry,
     MeshletCullParams, MeshletCullStats, MeshletCuller, MeshletGpu, MeshletIndirectDraw, MeshletMesh,
     MeshletTwoPhaseBatchEntry, build_meshlets,
 };
+#[cfg(feature = "render-3d")]
 pub use oit::{OIT_SHADER_HELPERS_WGSL, OitPass, oit_color_targets};
+#[cfg(feature = "render-3d")]
 pub use post_fx::{
     FsrEasuUpscaler, FsrQualityPreset, POST_FX_WGSL, PostFxParams, PostFxPass, RcasSharpener, TaauUpscaler,
     UPSCALE_RCAS_WGSL, apply_projection_jitter, fsr_halton_jitter, halton_jitter,
 };
+#[cfg(feature = "render-3d")]
 pub use prefetch::Prefetch;
+#[cfg(feature = "render-3d")]
 pub use ray_tracing::{
     BVH_RAYTRACE_WGSL, Blas, BlasTriGpu, BlasTriangle, BvhNodeGpu, BvhScene, BvhTriGpu, BvhTriangle, GpuBlasPool,
     GpuRayTracer, MAX_RT_LOCAL_LIGHTS, RayTraceParams, RtLocalLight, TLAS_RAYTRACE_WGSL, TLAS_TRAVERSAL_WGSL,
     TlasInstance, TlasInstanceGpu, TlasRayTraceParams, TlasRayTracer, TlasScene, TlasSceneGpu,
     device_supports_hardware_ray_query, supports_hardware_ray_query,
 };
+#[cfg(feature = "render-3d")]
 pub use render_targets::{
     ColorTransfer, OffscreenRenderTarget, SPLIT_SCREEN_WGSL, SplitScreenCompositor, SplitScreenLayout, ViewportRect,
     oblique_clip_projection, planar_reflection_camera, planar_reflection_view,
@@ -153,40 +259,53 @@ pub use render2d::{
     Camera2d, Draw2d, RadianceCascades2d, RadianceCascades2dConfig, Scene2dEmitter, SdfShape, SdfShapePass, Sprite2d,
     Sprites2dPass, TileCell, TilemapPass, TilemapUniform, rasterize_scene_2d, sort_sprites,
 };
+#[cfg(feature = "render-3d")]
 pub use restir::{RESTIR_MAX_LIGHTS, RESTIR_WGSL, RestirInputs, RestirParams, RestirRenderer};
+#[cfg(feature = "render-3d")]
 pub use restir_specular::{
     RESTIR_SPECULAR_WGSL, RestirSpecularInputs, RestirSpecularOutputs, RestirSpecularParams, RestirSpecularRenderer,
 };
-#[cfg(feature = "shader-graph")]
+#[cfg(all(feature = "render-3d", feature = "shader-graph"))]
 pub use shader_graph::{
     CompiledShaderGraph, NodeRef, PortType, RampStop, ShaderGraph, ShaderNode, ShaderNodeKind, is_shader_graph_key,
 };
+#[cfg(feature = "render-3d")]
 pub use sharc::{
     SHARC_COMMON_WGSL, SHARC_DEFAULT_CAPACITY, SHARC_HASH_WGSL, SHARC_QUERY_RO_FN_WGSL, SHARC_WGSL, SharcCache,
     SharcConfig, SharcParams,
 };
+#[cfg(feature = "render-3d")]
 pub use surface_atlas::{SURFACE_ATLAS_WGSL, SurfaceAtlasPacker, SurfaceTile, TileCopy};
+#[cfg(feature = "render-3d")]
 pub use svgf::{SVGF_WGSL, SvgfDenoiser, SvgfInputs, SvgfParams};
+#[cfg(feature = "render-3d")]
 pub use taa::{fsr_jitter_phase_count, fsr_mip_bias};
+#[cfg(feature = "render-3d")]
 pub use tonemap::{TONEMAP_SUITE_WGSL, TonemapOperator, tonemap_linear_f64};
+#[cfg(feature = "render-3d")]
 pub use video::{
     ChromaSiting, ColorMatrix, ColorRange, ColorSpace, IndexedY4mStream, IvfFrame, IvfStream, VideoPlayer,
     VideoTexture, Y4mStream, Yuv420Frame,
 };
+#[cfg(feature = "render-3d")]
 pub use volume::{TRANSLUCENCY_WGSL, VolumeImage, VolumeLayer};
 
 /// WGSL a sprite shader adds to draw text from a multi-channel signed
 /// distance field atlas (pen-texture's `msdf`), crisp at any scale:
 /// `msdf_coverage(msdf_median(field.rgb), uv, range, size)`.
 pub const MSDF_WGSL: &str = crate::wgsl!("msdf.wgsl");
+#[cfg(feature = "render-3d")]
 pub use renderer::{
     ENV_FOLIAGE_EXT_TAG, ENV_TERRAIN_EXT_TAG, ENV_WATER_EXT_TAG, EnvironmentFoliage, EnvironmentScene,
     EnvironmentTerrain, GPU_PARTICLES_EXT_TAG, GpuParticleScene, JFA_OUTLINE_EXT_TAG, JfaOutlineScene,
     JfaOutlineTarget, LINES_EXT_TAG, LineScene, NANITE_EXT_TAG, RENDER2D_EXT_TAG, RENDER2D_WORLD_EXT_TAG,
     RadianceCascades2dLayer, SHADOWS_WGSL, Scene2d, SpriteLayer2d, TilemapLayer2d, validate_frame,
 };
-#[cfg(feature = "simplify")]
+#[cfg(not(feature = "render-3d"))]
+pub use renderer2d_host::validate_frame;
+#[cfg(all(feature = "render-3d", feature = "simplify"))]
 pub use simplify::pack_mesh_with_lods;
+#[cfg(feature = "render-3d")]
 pub use surface::{SURFACE_LOBES_WGSL, SURFACE_TRANSMISSION_WGSL, SURFACE_WGSL};
 
 pub struct RendererOptions {
@@ -346,10 +465,83 @@ pub struct GpuTimes {
     pub total: f32,
 }
 
+#[cfg(feature = "render-3d")]
 pub struct Renderer {
     state: renderer::State,
 }
 
+#[cfg(not(feature = "render-3d"))]
+pub struct Renderer {
+    state: renderer2d_host::State2d,
+}
+
+#[cfg(not(feature = "render-3d"))]
+impl Renderer {
+    pub fn new(device: wgpu::Device, queue: wgpu::Queue, options: RendererOptions) -> anyhow::Result<Self> {
+        Ok(Self { state: renderer2d_host::State2d::new(device, queue, options)? })
+    }
+
+    pub fn share(&self, assets: std::path::PathBuf) -> anyhow::Result<Renderer> {
+        Ok(Self { state: self.state.sharing(assets)? })
+    }
+
+    pub fn preload(&mut self, catalog: &Catalog) {
+        self.state.preload(catalog);
+    }
+
+    pub fn submit(
+        &mut self,
+        frame: &RenderFrame,
+        catalog: &Catalog,
+        target: &mut dyn RenderTarget,
+    ) -> anyhow::Result<()> {
+        self.state.submit(frame, catalog, target)
+    }
+
+    pub fn prepare_sprites(&mut self, sprites: &[pen_protocol::Sprite], catalog: &Catalog) -> anyhow::Result<bool> {
+        self.state.prepare_sprites(sprites, catalog)
+    }
+
+    pub fn overlay(
+        &mut self,
+        sprites: &[pen_protocol::Sprite],
+        catalog: &Catalog,
+        output: &wgpu::TextureView,
+        size: (u32, u32),
+    ) -> anyhow::Result<()> {
+        self.state.overlay(sprites, catalog, output, size)
+    }
+
+    pub fn take_events(&mut self) -> Vec<GameEvent> {
+        self.state.take_events()
+    }
+
+    pub fn reload_all(&mut self) {
+        self.state.reload_all();
+    }
+
+    pub fn quiet(&self) -> bool {
+        self.state.quiet()
+    }
+
+    pub fn pending(&self) -> usize {
+        self.state.pending()
+    }
+
+    pub fn stats(&self) -> RenderStats {
+        self.state.stats()
+    }
+
+    pub fn set_color_filter(&mut self, filter: ColorFilter) {
+        self.state.filter.filter = filter;
+    }
+
+    pub fn time_passes(&mut self, timing: bool) {
+        self.state.time_passes(timing);
+    }
+}
+
+#[cfg(feature = "render-3d")]
 impl Renderer {
     pub fn new(device: wgpu::Device, queue: wgpu::Queue, options: RendererOptions) -> anyhow::Result<Self> {
         Ok(Self { state: renderer::State::new(device, queue, options)? })

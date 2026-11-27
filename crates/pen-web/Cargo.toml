@@ -13,6 +13,11 @@ crate-type = ["cdylib"]
 
 [features]
 default = [
+  "render-3d",
+  "deferred-shaders",
+  "audio-advanced",
+  "file-saves",
+  "gamepad",
   "devtools",
   "netplay",
   "video",
@@ -35,10 +40,23 @@ default = [
   "render-atmosphere",
   "render-pbr-decals",
   "render-post-fx",
+  "render-volume",
+  "render-ssgi",
+  "render-subsurface",
+  "render-taa",
+  "render-dof",
+  "render-area-lights",
+  "render-decals",
+  "render-particles-cpu",
+  "render-gpu-culling",
 ]
 # General-purpose static single-player host (omits dev tools, netplay, video,
 # replay recording, runtime mesh/texture/shader recipes, and software RT).
 compact = [
+  "render-3d",
+  "deferred-shaders",
+  "audio-advanced",
+  "gamepad",
   "kernels",
   "locales",
   "saved-adapter",
@@ -53,11 +71,85 @@ compact = [
   "render-atmosphere",
   "render-pbr-decals",
   "render-post-fx",
+  "render-volume",
+  "render-ssgi",
+  "render-subsurface",
+  "render-taa",
+  "render-dof",
+  "render-area-lights",
+  "render-decals",
+  "render-particles-cpu",
+  "render-gpu-culling",
 ]
-devtools = ["pen-protocol/diagnostics", "pen-runtime/semantic"]
-netplay = ["pen-runtime/netplay"]
-video = []
-replay = ["pen-runtime/replay"]
+# Slim 3D static host (core PBR + standard RenderFrame passes; no 2D/env/recipes/locales/kernels).
+web-3d = [
+  "render-3d",
+  "deferred-shaders",
+  "audio-advanced",
+  "gamepad",
+  "render-oit",
+  "render-atmosphere",
+  "render-pbr-decals",
+  "render-post-fx",
+]
+# Pure 2D / UI static host (no 3D PBR renderer, lean WebAudio).
+web-2d = [
+  "render-2d",
+  "gamepad",
+]
+render-3d = ["pen-render/render-3d"]
+deferred-shaders = ["pen-render/deferred-shaders"]
+audio-advanced = [
+  "web-sys/AnalyserNode",
+  "web-sys/BiquadFilterNode",
+  "web-sys/BiquadFilterType",
+  "web-sys/Blob",
+  "web-sys/BlobPropertyBag",
+  "web-sys/ChannelSplitterNode",
+  "web-sys/ConvolverNode",
+  "web-sys/DistanceModelType",
+  "web-sys/DynamicsCompressorNode",
+  "web-sys/HtmlAudioElement",
+  "web-sys/HtmlMediaElement",
+  "web-sys/MediaElementAudioSourceNode",
+  "web-sys/OscillatorNode",
+  "web-sys/OscillatorType",
+  "web-sys/PannerNode",
+  "web-sys/PanningModelType",
+  "web-sys/Url",
+]
+file-saves = [
+  "web-sys/Blob",
+  "web-sys/BlobPropertyBag",
+  "web-sys/DataTransfer",
+  "web-sys/DragEvent",
+  "web-sys/File",
+  "web-sys/FileList",
+  "web-sys/HtmlAnchorElement",
+  "web-sys/HtmlInputElement",
+  "web-sys/Url",
+]
+gamepad = [
+  "web-sys/Gamepad",
+  "web-sys/GamepadButton",
+  "web-sys/GamepadMappingType",
+]
+devtools = [
+  "file-saves",
+  "pen-protocol/diagnostics",
+  "pen-runtime/semantic",
+  "web-sys/EventSource",
+]
+netplay = [
+  "pen-runtime/netplay",
+  "web-sys/BinaryType",
+  "web-sys/RtcDataChannel",
+  "web-sys/RtcDataChannelState",
+  "web-sys/RtcDataChannelType",
+  "web-sys/WebSocket",
+]
+video = ["render-3d"]
+replay = ["file-saves", "pen-runtime/replay"]
 kernels = []
 locales = ["pen-runtime/locales"]
 saved-adapter = ["dep:pen-ink"]
@@ -76,6 +168,15 @@ render-oit = ["pen-render/render-oit"]
 render-atmosphere = ["pen-render/render-atmosphere"]
 render-pbr-decals = ["pen-render/render-pbr-decals"]
 render-post-fx = ["pen-render/render-post-fx"]
+render-volume = ["pen-render/render-volume"]
+render-ssgi = ["pen-render/render-ssgi"]
+render-subsurface = ["pen-render/render-subsurface"]
+render-taa = ["pen-render/render-taa"]
+render-dof = ["pen-render/render-dof"]
+render-area-lights = ["pen-render/render-area-lights"]
+render-decals = ["pen-render/render-decals"]
+render-particles-cpu = ["pen-render/render-particles-cpu"]
+render-gpu-culling = ["pen-render/render-gpu-culling"]
 
 # The browser host builds for wasm32-unknown-unknown (build.sh, with the
 # workspace's `web` profile); for any other target the crate is empty, so
@@ -95,5 +196,5 @@ serde_json = "1"
 wasm-bindgen = "0.2.129"
 wasm-bindgen-futures = "0.4.79"
 web-time = "1"
-web-sys = { version = "0.3.106", features = ["HtmlCanvasElement", "DomRect", "console", "Window", "Document", "Element", "EventTarget", "Event", "KeyboardEvent", "MouseEvent", "WheelEvent", "Response", "Request", "RequestInit", "Headers", "Storage", "Location", "IdbFactory", "IdbDatabase", "IdbOpenDbRequest", "IdbRequest", "IdbObjectStore", "IdbTransaction", "IdbTransactionMode", "DomException", "Performance", "Navigator", "Clipboard", "CssStyleDeclaration", "HtmlElement", "AudioContext", "AudioContextState", "AudioDestinationNode", "AudioBuffer", "AudioBufferSourceNode", "AudioNode", "AudioParam", "GainNode", "StereoPannerNode", "BiquadFilterNode", "BiquadFilterType", "ConvolverNode", "DynamicsCompressorNode", "AudioScheduledSourceNode", "MediaQueryList", "UrlSearchParams", "Url", "EventSource", "MessageEvent", "PointerEvent", "InputEvent", "CompositionEvent", "HtmlTextAreaElement", "Gamepad", "GamepadButton", "GamepadMappingType", "PannerNode", "PanningModelType", "DistanceModelType", "AnalyserNode", "ChannelSplitterNode", "AudioContextOptions", "HtmlAudioElement", "HtmlMediaElement", "MediaElementAudioSourceNode", "Blob", "BlobPropertyBag", "DragEvent", "DataTransfer", "File", "FileList", "HtmlAnchorElement", "HtmlInputElement", "WebSocket", "BinaryType", "RtcDataChannel", "RtcDataChannelType", "RtcDataChannelState", "OscillatorNode", "OscillatorType"] }
+web-sys = { version = "0.3.106", features = ["HtmlCanvasElement", "DomRect", "console", "Window", "Document", "Element", "EventTarget", "Event", "KeyboardEvent", "MouseEvent", "WheelEvent", "Response", "Request", "RequestInit", "Headers", "Storage", "Location", "IdbFactory", "IdbDatabase", "IdbOpenDbRequest", "IdbRequest", "IdbObjectStore", "IdbTransaction", "IdbTransactionMode", "DomException", "Performance", "Navigator", "Clipboard", "CssStyleDeclaration", "HtmlElement", "AudioContext", "AudioContextOptions", "AudioContextState", "AudioDestinationNode", "AudioBuffer", "AudioBufferSourceNode", "AudioNode", "AudioParam", "GainNode", "StereoPannerNode", "AudioScheduledSourceNode", "MediaQueryList", "UrlSearchParams", "MessageEvent", "PointerEvent", "InputEvent", "CompositionEvent", "HtmlTextAreaElement"] }
 wgpu.workspace = true

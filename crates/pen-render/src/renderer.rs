@@ -70,10 +70,13 @@ use pen_protocol::boundary::MAX_CASCADES;
 
 #[cfg(test)]
 pub(crate) use fields::half_of;
+#[cfg(feature = "render-gpu-culling")]
 pub(crate) use gpu_culling::pipeline as culling_pipeline;
 use gpu_culling::{GpuBatch, GpuCulling};
 pub(crate) use insets::composite_pipeline;
+#[cfg(feature = "render-particles-cpu")]
 pub(crate) use particles::pipeline as particle_pipeline;
+#[cfg(feature = "render-particles-cpu")]
 pub(crate) use ribbons::pipeline as ribbon_pipeline;
 pub use shadows::SHADOWS_WGSL;
 pub(crate) use timing::{GpuTimer, Span};
@@ -1694,11 +1697,15 @@ impl State {
             + compiling
             + self.built_ins.compiling()
             + usize::from(self.culling.compiling())
+            + crate::deferred_shaders::pending()
     }
 
     /// Whether nothing is streaming in or settling, and the veil is gone.
     pub fn quiet(&self) -> bool {
-        self.streaming.is_empty() && self.fading.is_empty() && self.veil.is_none()
+        self.streaming.is_empty()
+            && self.fading.is_empty()
+            && self.veil.is_none()
+            && crate::deferred_shaders::pending() == 0
     }
 
     /// Whether something the last frame draws is still on its way.

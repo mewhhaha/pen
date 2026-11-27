@@ -1,3 +1,4 @@
+#![cfg_attr(not(feature = "render-3d"), allow(dead_code, unused_imports))]
 // What differs between the native renderer and the one in the browser: where
 // asset bytes come from (files under the asset root, or fetched from under
 // its URL), how images are decoded, the clock, and how the loader's work runs
@@ -13,8 +14,8 @@ mod imp {
 
     use anyhow::{Result, bail};
 
-    use crate::asset_store::validate_asset_key;
     use crate::texture::DecodedImage;
+    use crate::validate_asset_key;
 
     /// The asset's bytes, from its file under `root`; keys cannot leave it.
     pub async fn read_asset(root: &str, key: &str) -> Result<Vec<u8>> {
@@ -54,8 +55,8 @@ mod imp {
     use wasm_bindgen::{JsCast, JsValue};
     use wasm_bindgen_futures::JsFuture;
 
-    use crate::asset_store::validate_asset_key;
     use crate::texture::DecodedImage;
+    use crate::validate_asset_key;
 
     fn failed(error: JsValue) -> anyhow::Error {
         anyhow!(
@@ -155,6 +156,7 @@ mod imp {
     }
 }
 
+#[cfg_attr(not(feature = "render-3d"), allow(unused_imports))]
 pub(crate) use imp::{Clock, yield_now};
 
 pub(crate) async fn read_asset(root: &str, key: &str) -> Result<Vec<u8>> {

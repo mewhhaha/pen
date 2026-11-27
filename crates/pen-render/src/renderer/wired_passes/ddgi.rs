@@ -343,6 +343,9 @@ impl State {
         let (sky_zenith, sky_horizon) = resolve_rt_sky_colors(frame);
         let local_lights = pack_rt_local_lights(frame);
 
+        if !crate::deferred_shaders::ready_all(&["ddgi.wgsl", "tlas_traversal.wgsl"]) {
+            return Ok(());
+        }
         let ddgi_params = DdgiFrameParams {
             sun_direction,
             sun_color,

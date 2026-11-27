@@ -9,15 +9,18 @@
 //! as natively.
 #![allow(clippy::cast_possible_truncation, reason = "page positions and wheel deltas narrow to f32 lanes")]
 use pen_protocol::{GameEvent, touch_phase};
+#[cfg(feature = "gamepad")]
 use pen_runtime::gamepad::{AXES, BUTTONS, Gamepads, Pad};
 use pen_runtime::{text, touch::Touches};
 use std::cell::RefCell;
 use std::rc::Rc;
 use wasm_bindgen::{JsCast, closure::Closure};
 use web_sys::{
-    CompositionEvent, Event, EventTarget, Gamepad, GamepadButton, GamepadMappingType, HtmlCanvasElement,
-    HtmlTextAreaElement, InputEvent, KeyboardEvent, MouseEvent, PointerEvent, WheelEvent,
+    CompositionEvent, Event, EventTarget, HtmlCanvasElement, HtmlTextAreaElement, InputEvent, KeyboardEvent,
+    MouseEvent, PointerEvent, WheelEvent,
 };
+#[cfg(feature = "gamepad")]
+use web_sys::{Gamepad, GamepadButton, GamepadMappingType};
 
 /// What came in since the frame loop last looked: the game's events (which
 /// the dev tools see first), assistive technology's actions on the dev
@@ -31,6 +34,7 @@ pub struct Input {
     held: std::collections::HashSet<String>,
     canvas: HtmlCanvasElement,
     touches: Touches,
+    #[cfg(feature = "gamepad")]
     gamepads: Gamepads,
     /// The hidden field an input method composes into, and the text box
     /// (in the canvas's backing pixels) it lies over while one has the focus.
@@ -65,6 +69,7 @@ fn place(canvas: &HtmlCanvasElement, mouse: &MouseEvent) -> (f32, f32) {
 
 /// A gamepad as the standard layout reads it: the first buttons and axes,
 /// in the order the browser gives them.
+#[cfg(feature = "gamepad")]
 fn read(gamepad: &Gamepad) -> Pad {
     let mut pad = Pad { standard: gamepad.mapping() == GamepadMappingType::Standard, ..Pad::default() };
     for (slot, button) in pad.buttons.iter_mut().zip(gamepad.buttons().iter().take(BUTTONS)) {
@@ -101,6 +106,7 @@ impl Input {
             held: Default::default(),
             canvas: canvas.clone(),
             touches: Touches::default(),
+            #[cfg(feature = "gamepad")]
             gamepads: Gamepads::default(),
             field: field.clone(),
             text_box: None,
@@ -288,54 +294,63 @@ impl Input {
     /// Reads the gamepads (the Gamepad API has no events for their buttons
     /// and sticks): what changed since the last frame, and those that left.
     pub fn poll_gamepads(&mut self) {
-        let Ok(list) = web_sys::window().unwrap().navigator().get_gamepads() else { return };
-        let mut present = Vec::new();
-        for gamepad in list.iter().filter_map(|gamepad| gamepad.dyn_into::<Gamepad>().ok()) {
-            if !gamepad.connected() {
-                continue;
+        #[cfg(feature = "gamepad")]
+        {
+            let Ok(list) = web_sys::window().unwrap().navigator().get_gamepads() else { return };
+            let mut present = Vec::new();
+            for gamepad in list.iter().filter_map(|gamepad| gamepad.dyn_into::<Gamepad>().ok()) {
+                if !gamepad.connected() {
+                    continue;
+                }
+                let key = u64::from(gamepad.index());
+                present.push(key);
+                self.gamepads.update(key, &read(&gamepad), &mut self.events);
             }
-            let key = u64::from(gamepad.index());
-            present.push(key);
-            self.gamepads.update(key, &read(&gamepad), &mut self.events);
-        }
-        for key in self.gamepads.keys() {
-            if !present.contains(&key) {
-                self.gamepads.disconnect(key, &mut self.events);
+            for key in self.gamepads.keys() {
+                if !present.contains(&key) {
+                    self.gamepads.disconnect(key, &mut self.events);
+                }
             }
         }
     }
 
     /// Triggers dual-rumble haptic pulses on connected gamepads supporting `vibrationActuator`.
-    pub fn apply_haptics(&self, haptics: &[pen_protocol::Haptic]) {
-        if haptics.is_empty() {
-            return;
-        }
-        let Ok(list) = web_sys::window().unwrap().navigator().get_gamepads() else { return };
-        for cmd in haptics {
-            let Some(key) = self.gamepads.key_for(cmd.pad) else { continue };
-            for gamepad in list.iter().filter_map(|g| g.dyn_into::<Gamepad>().ok()) {
-                if !gamepad.connected() || u64::from(gamepad.index()) != key {
-                    continue;
+    pub fn apply_haptics(
+        &self,
+        #[cfg_attr(not(feature = "gamepad"), allow(unused_variables))] haptics: &[pen_protocol::Haptic],
+    ) {
+        #[cfg(feature = "gamepad")]
+        {
+            if haptics.is_empty() {
+                return;
+            }
+            let Ok(list) = web_sys::window().unwrap().navigator().get_gamepads() else { return };
+            for cmd in haptics {
+                let Some(key) = self.gamepads.key_for(cmd.pad) else { continue };
+                for gamepad in list.iter().filter_map(|g| g.dyn_into::<Gamepad>().ok()) {
+                    if !gamepad.connected() || u64::from(gamepad.index()) != key {
+                        continue;
+                    }
+                    let Ok(actuator) = js_sys::Reflect::get(&gamepad, &"vibrationActuator".into()) else { continue };
+                    if actuator.is_null() || actuator.is_undefined() {
+                        continue;
+                    }
+                    let Ok(play) = js_sys::Reflect::get(&actuator, &"playEffect".into()) else { continue };
+                    let Ok(func) = play.dyn_into::<js_sys::Function>() else { continue };
+                    let low = if cmd.low.is_finite() { f64::from(cmd.low.clamp(0.0, 1.0)) } else { 0.0 };
+                    let high = if cmd.high.is_finite() { f64::from(cmd.high.clamp(0.0, 1.0)) } else { 0.0 };
+                    let duration_ms = if cmd.duration.is_finite() && cmd.duration > 0.0 {
+                        f64::from(cmd.duration.clamp(0.016, 10.0)) * 1000.0
+                    } else {
+                        50.0
+                    };
+                    let params = js_sys::Object::new();
+                    let _ = js_sys::Reflect::set(&params, &"startDelay".into(), &0.0.into());
+                    let _ = js_sys::Reflect::set(&params, &"duration".into(), &duration_ms.into());
+                    let _ = js_sys::Reflect::set(&params, &"strongMagnitude".into(), &low.into());
+                    let _ = js_sys::Reflect::set(&params, &"weakMagnitude".into(), &high.into());
+                    let _ = func.call2(&actuator, &"dual-rumble".into(), &params);
                 }
-                let Ok(actuator) = js_sys::Reflect::get(&gamepad, &"vibrationActuator".into()) else { continue };
-                if actuator.is_null() || actuator.is_undefined() {
-                    continue;
-                }
-                let Ok(play) = js_sys::Reflect::get(&actuator, &"playEffect".into()) else { continue };
-                let Ok(func) = play.dyn_into::<js_sys::Function>() else { continue };
-                let low = if cmd.low.is_finite() { f64::from(cmd.low.clamp(0.0, 1.0)) } else { 0.0 };
-                let high = if cmd.high.is_finite() { f64::from(cmd.high.clamp(0.0, 1.0)) } else { 0.0 };
-                let duration_ms = if cmd.duration.is_finite() && cmd.duration > 0.0 {
-                    f64::from(cmd.duration.clamp(0.016, 10.0)) * 1000.0
-                } else {
-                    50.0
-                };
-                let params = js_sys::Object::new();
-                let _ = js_sys::Reflect::set(&params, &"startDelay".into(), &0.0.into());
-                let _ = js_sys::Reflect::set(&params, &"duration".into(), &duration_ms.into());
-                let _ = js_sys::Reflect::set(&params, &"strongMagnitude".into(), &low.into());
-                let _ = js_sys::Reflect::set(&params, &"weakMagnitude".into(), &high.into());
-                let _ = func.call2(&actuator, &"dual-rumble".into(), &params);
             }
         }
     }

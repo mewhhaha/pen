@@ -12,7 +12,7 @@ use web_sys::{Element, Event, HtmlElement, KeyboardEvent};
 /// The interface shown last, and whose it is: the dev tools' (their actions
 /// go to them) or the game's.
 pub struct Accessibility {
-    root: Element,
+    root: Option<Element>,
     last: Vec<UiNode>,
     tools: bool,
     replacing: Rc<Cell<bool>>,
@@ -24,17 +24,8 @@ pub struct Accessibility {
 }
 impl Accessibility {
     pub fn new(input: Rc<RefCell<Input>>) -> Result<Self> {
-        let document = web_sys::window().unwrap().document().unwrap();
-        let root = document.create_element("div").map_err(error)?;
-        root.set_attribute(
-            "style",
-            "position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%);top:0;left:0",
-        )
-        .map_err(error)?;
-        root.set_attribute("aria-label", "Game interface").map_err(error)?;
-        document.body().unwrap().append_child(&root).map_err(error)?;
         Ok(Self {
-            root,
+            root: None,
             last: Vec::new(),
             tools: false,
             replacing: Rc::default(),
@@ -44,10 +35,28 @@ impl Accessibility {
         })
     }
 
+    fn ensure_root(&mut self) -> Result<&Element> {
+        if self.root.is_none() {
+            let document = web_sys::window().unwrap().document().unwrap();
+            let root = document.create_element("div").map_err(error)?;
+            root.set_attribute(
+                "style",
+                "position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%);top:0;left:0",
+            )
+            .map_err(error)?;
+            root.set_attribute("aria-label", "Game interface").map_err(error)?;
+            document.body().unwrap().append_child(&root).map_err(error)?;
+            self.root = Some(root);
+        }
+        Ok(self.root.as_ref().unwrap())
+    }
+
     /// The selected game language and its reading direction.
-    pub fn set_locale(&self, tag: &str, rtl: bool) -> Result<()> {
-        self.root.set_attribute("lang", tag).map_err(error)?;
-        self.root.set_attribute("dir", if rtl { "rtl" } else { "ltr" }).map_err(error)
+    #[cfg_attr(not(feature = "locales"), allow(dead_code))]
+    pub fn set_locale(&mut self, tag: &str, rtl: bool) -> Result<()> {
+        let root = self.ensure_root()?;
+        root.set_attribute("lang", tag).map_err(error)?;
+        root.set_attribute("dir", if rtl { "rtl" } else { "ltr" }).map_err(error)
     }
     /// The captions showing, a line each, in a polite live region after the
     /// interface; none when the game's sounds carry none.
@@ -59,12 +68,13 @@ impl Accessibility {
             return Ok(());
         };
         if self.captions.is_none() {
+            let root = self.ensure_root()?.clone();
             let document = web_sys::window().unwrap().document().unwrap();
             let element = document.create_element("div").map_err(error)?;
             for (key, value) in [("role", "status"), ("aria-live", "polite"), ("aria-label", "Captions")] {
                 element.set_attribute(key, value).map_err(error)?;
             }
-            self.root.after_with_node_1(&element).map_err(error)?;
+            root.after_with_node_1(&element).map_err(error)?;
             self.captions = Some((element, String::new()));
         }
         if let Some((element, shown)) = &mut self.captions
@@ -80,10 +90,15 @@ impl Accessibility {
         if self.tools == tools && a11y_nodes_equal(&self.last, nodes) {
             return Ok(());
         }
+        if nodes.is_empty() && self.root.is_none() {
+            self.tools = tools;
+            return Ok(());
+        }
+        let root = self.ensure_root()?.clone();
         let document = web_sys::window().unwrap().document().unwrap();
         let focused = document
             .active_element()
-            .filter(|element| self.tools == tools && self.root.contains(Some(element)))
+            .filter(|element| self.tools == tools && root.contains(Some(element)))
             .map(|element| element.id());
         let tree = AccessibilityTree::new(nodes);
         let modal = tree.active_modal();
@@ -188,9 +203,9 @@ impl Accessibility {
         self.replacing.set(true);
         self.generation.set(generation);
         let replaced: Result<()> = (|| {
-            self.root.set_text_content(None);
+            root.set_text_content(None);
             for index in top_level {
-                self.root.append_child(elements[index].as_ref().unwrap()).map_err(error)?;
+                root.append_child(elements[index].as_ref().unwrap()).map_err(error)?;
             }
             if let Some(element) =
                 focus.and_then(|index| elements[index].as_ref()).and_then(|element| element.dyn_ref::<HtmlElement>())
@@ -285,7 +300,9 @@ impl Accessibility {
 impl Drop for Accessibility {
     fn drop(&mut self) {
         self.generation.set(self.generation.get().wrapping_add(1));
-        self.root.remove();
+        if let Some(root) = self.root.take() {
+            root.remove();
+        }
         if let Some((captions, _)) = &self.captions {
             captions.remove();
         }

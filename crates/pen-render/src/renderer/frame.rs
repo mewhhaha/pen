@@ -13,7 +13,9 @@ use super::validate::validate_frame;
 use super::{Drawing, GpuAsset, MeshAsset, ReadyEntry, Scratch, ShaderAsset, Shape, State, particles, ribbons};
 use crate::asset_store::{AssetKind, Material};
 use crate::built_in::BuiltIn;
-use crate::decals::{DECAL_MARK, Decals};
+use crate::decals::DECAL_MARK;
+#[cfg(feature = "render-decals")]
+use crate::decals::Decals;
 use crate::loader::{Job, Priority};
 use crate::post::{Extras, Post};
 use crate::shader::Layer;
@@ -954,6 +956,7 @@ impl State {
                 );
             }
         }
+        #[cfg(feature = "render-decals")]
         if !scratch.decals.is_empty() {
             let decals = self.decals.get_or_insert_with(|| Decals::new(&device));
             let mut decal_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1094,7 +1097,10 @@ impl State {
                 draw_layers(&mut pass, filter_group, lights, &[(&[entry], Layer::Translucent)], &mut stats);
             }
             #[cfg(feature = "render-oit")]
-            let drew_oit = if frame.quality.oit && oit_pipelines.iter().any(Option::is_some) {
+            let drew_oit = if frame.quality.oit
+                && oit_pipelines.iter().any(Option::is_some)
+                && crate::deferred_shaders::ready_all(&["oit_composite.wgsl"])
+            {
                 let mut fallback_translucent = Vec::new();
                 for (slot, &entry_idx) in scratch.translucent.iter().enumerate() {
                     if oit_pipelines.get(slot).and_then(Option::as_ref).is_none() {

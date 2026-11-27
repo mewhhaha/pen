@@ -25,9 +25,11 @@ install: plugins web-host install-player install-wtime-aot
   cp plugins/target/wasm32-wasip2/release/pen_plugin_blot.wasm ~/.local/lib/pen-runtime/plugins/blot.wasm.new
   mv -f ~/.local/lib/pen-runtime/plugins/blot.wasm.new ~/.local/lib/pen-runtime/plugins/blot.wasm
   cp crates/pen-web/pkg/{pen_web.js,pen_web_bg.wasm,guest.js,structured.js,kernels.js,kernel_worker.js,index.html} ~/.local/lib/pen-runtime/web/
+  rm -rf ~/.local/lib/pen-runtime/web/shaders
+  if [ -d crates/pen-web/pkg/shaders ]; then cp -r crates/pen-web/pkg/shaders ~/.local/lib/pen-runtime/web/shaders; fi
   find ~/.local/lib/pen-runtime/plugins -mindepth 1 -maxdepth 1 ! -name blot.wasm \
     -exec echo removing stale {} \; -exec rm -rf {} +
-  find ~/.local/lib/pen-runtime/web -mindepth 1 -maxdepth 1 ! -name pen_web.js ! -name pen_web_bg.wasm ! -name guest.js ! -name structured.js ! -name kernels.js ! -name kernel_worker.js ! -name index.html \
+  find ~/.local/lib/pen-runtime/web -mindepth 1 -maxdepth 1 ! -name pen_web.js ! -name pen_web_bg.wasm ! -name guest.js ! -name structured.js ! -name kernels.js ! -name kernel_worker.js ! -name index.html ! -name shaders \
     -exec echo removing stale {} \; -exec rm -rf {} +
   cp LICENSE THIRD_PARTY_NOTICES.md ~/.local/lib/pen-runtime/
   ln -sf ~/.local/lib/pen-runtime/pen ~/.local/bin/pen

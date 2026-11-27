@@ -100,11 +100,7 @@ pub fn build_meshlets(
         adj[b].push(t);
         adj[c].push(t);
         let (pa, pb, pc) = (positions[a], positions[b], positions[c]);
-        let tc = [
-            (pa[0] + pb[0] + pc[0]) / 3.0,
-            (pa[1] + pb[1] + pc[1]) / 3.0,
-            (pa[2] + pb[2] + pc[2]) / 3.0,
-        ];
+        let tc = [(pa[0] + pb[0] + pc[0]) / 3.0, (pa[1] + pb[1] + pc[1]) / 3.0, (pa[2] + pb[2] + pc[2]) / 3.0];
         for axis in 0..3 {
             cmin[axis] = cmin[axis].min(tc[axis]);
             cmax[axis] = cmax[axis].max(tc[axis]);
@@ -116,11 +112,8 @@ pub fn build_meshlets(
         if cmax[1] > cmin[1] { 1.0 / (cmax[1] - cmin[1]) } else { 0.0 },
         if cmax[2] > cmin[2] { 1.0 / (cmax[2] - cmin[2]) } else { 0.0 },
     ];
-    let mut morton_order: Vec<(u32, usize)> = tri_centroids
-        .iter()
-        .enumerate()
-        .map(|(t, &tc)| (morton3_10(tc, cmin, inv_span), t))
-        .collect();
+    let mut morton_order: Vec<(u32, usize)> =
+        tri_centroids.iter().enumerate().map(|(t, &tc)| (morton3_10(tc, cmin, inv_span), t)).collect();
     morton_order.sort_unstable();
     let morton_tris: Vec<usize> = morton_order.into_iter().map(|(_, t)| t).collect();
 
@@ -649,7 +642,7 @@ impl MeshletCuller {
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("meshlet_cull_shader"),
-            source: wgpu::ShaderSource::Wgsl(MESHLET_CULL_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(crate::deferred_wgsl!("meshlet_cull.wgsl").into()),
         });
         let layout = Self::pipeline_layout(device, &bgl);
         let pipeline = Self::pipeline(device, &shader, &layout, "cull_meshlets");
@@ -1094,8 +1087,16 @@ mod tests {
         assert_eq!(built.indices.len(), idx.len(), "every input triangle must be preserved exactly once");
         assert!(built.meshlets.len() >= 7, "800 tris at max 124/cluster must yield >=7 meshlets");
         for m in &built.meshlets {
-            assert!(m.meta[0] <= 64 && m.counts[3] <= 124, "meshlet violated vertex/tri cap: {:?} {:?}", m.meta, m.counts);
-            assert!(m.cone_axis_cutoff[1] > 0.99 && m.cone_axis_cutoff[3] < 0.01, "flat grid normal cone must be sharp +Y");
+            assert!(
+                m.meta[0] <= 64 && m.counts[3] <= 124,
+                "meshlet violated vertex/tri cap: {:?} {:?}",
+                m.meta,
+                m.counts
+            );
+            assert!(
+                m.cone_axis_cutoff[1] > 0.99 && m.cone_axis_cutoff[3] < 0.01,
+                "flat grid normal cone must be sharp +Y"
+            );
         }
     }
 
@@ -1141,10 +1142,30 @@ mod tests {
         // 2: Off-frustum at (50, 0, -5), normal +Z -> FRUSTUM CULLED
         // 3: Front-facing in frustum at (0, 0, -15) behind Hi-Z occluder -> HI-Z OCCLUDED
         let meshlets = [
-            MeshletGpu { sphere: [0.0, 0.0, -5.0, 0.5], cone_axis_cutoff: [0.0, 0.0, -1.0, 0.0], counts: [0, 6, 0, 2], meta: [4, 0, 0, 0] },
-            MeshletGpu { sphere: [0.0, 0.0, -5.0, 0.5], cone_axis_cutoff: [0.0, 0.0, 1.0, 0.0], counts: [6, 6, 0, 2], meta: [4, 0, 0, 0] },
-            MeshletGpu { sphere: [50.0, 0.0, -5.0, 0.5], cone_axis_cutoff: [0.0, 0.0, 1.0, 0.0], counts: [12, 6, 0, 2], meta: [4, 0, 0, 0] },
-            MeshletGpu { sphere: [0.0, 0.0, -15.0, 0.5], cone_axis_cutoff: [0.0, 0.0, 1.0, 0.0], counts: [18, 6, 0, 2], meta: [4, 0, 0, 0] },
+            MeshletGpu {
+                sphere: [0.0, 0.0, -5.0, 0.5],
+                cone_axis_cutoff: [0.0, 0.0, -1.0, 0.0],
+                counts: [0, 6, 0, 2],
+                meta: [4, 0, 0, 0],
+            },
+            MeshletGpu {
+                sphere: [0.0, 0.0, -5.0, 0.5],
+                cone_axis_cutoff: [0.0, 0.0, 1.0, 0.0],
+                counts: [6, 6, 0, 2],
+                meta: [4, 0, 0, 0],
+            },
+            MeshletGpu {
+                sphere: [50.0, 0.0, -5.0, 0.5],
+                cone_axis_cutoff: [0.0, 0.0, 1.0, 0.0],
+                counts: [12, 6, 0, 2],
+                meta: [4, 0, 0, 0],
+            },
+            MeshletGpu {
+                sphere: [0.0, 0.0, -15.0, 0.5],
+                cone_axis_cutoff: [0.0, 0.0, 1.0, 0.0],
+                counts: [18, 6, 0, 2],
+                meta: [4, 0, 0, 0],
+            },
         ];
         let m_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("test_meshlets"),
@@ -1171,7 +1192,12 @@ mod tests {
             view_formats: &[],
         });
         queue.write_texture(
-            wgpu::TexelCopyTextureInfo { texture: &hiz_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyTextureInfo {
+                texture: &hiz_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
             bytemuck::bytes_of(&0.85f32),
             wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4), rows_per_image: Some(1) },
             wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
@@ -1180,10 +1206,22 @@ mod tests {
 
         let (near, far) = (1.0f32, 100.0f32);
         let proj = [
-            1.0, 0.0, 0.0, 0.0,
-            0.0, 1.0, 0.0, 0.0,
-            0.0, 0.0, far / (near - far), -1.0,
-            0.0, 0.0, (far * near) / (near - far), 0.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            far / (near - far),
+            -1.0,
+            0.0,
+            0.0,
+            (far * near) / (near - far),
+            0.0,
         ];
         let inv_sqrt2 = std::f32::consts::FRAC_1_SQRT_2;
         let planes = [
@@ -1198,7 +1236,8 @@ mod tests {
         let culler = MeshletCuller::new(&device);
 
         // Build a minimal render pass drawing meshlet 1 via `draw_indexed_indirect` on default device!
-        let verts: [[f32; 4]; 4] = [[-0.5, -0.5, -5.0, 1.0], [0.5, -0.5, -5.0, 1.0], [0.5, 0.5, -5.0, 1.0], [-0.5, 0.5, -5.0, 1.0]];
+        let verts: [[f32; 4]; 4] =
+            [[-0.5, -0.5, -5.0, 1.0], [0.5, -0.5, -5.0, 1.0], [0.5, 0.5, -5.0, 1.0], [-0.5, 0.5, -5.0, 1.0]];
         let indices: [u32; 24] = [
             0, 1, 2, 0, 2, 3, // meshlet 0
             0, 1, 2, 0, 2, 3, // meshlet 1 (visible!)
@@ -1225,7 +1264,8 @@ mod tests {
             label: Some("m_draw"),
             source: wgpu::ShaderSource::Wgsl(
                 "@vertex fn vs(@location(0) p: vec4f) -> @builtin(position) vec4f { return vec4f(p.x, p.y, 0.5, 1.0); }
-                 @fragment fn fs() -> @location(0) vec4f { return vec4f(0.0, 1.0, 0.0, 1.0); }".into(),
+                 @fragment fn fs() -> @location(0) vec4f { return vec4f(0.0, 1.0, 0.0, 1.0); }"
+                    .into(),
             ),
         });
         let draw_pipe = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -1238,7 +1278,11 @@ mod tests {
                 buffers: &[Some(wgpu::VertexBufferLayout {
                     array_stride: 16,
                     step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &[wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 0, shader_location: 0 }],
+                    attributes: &[wgpu::VertexAttribute {
+                        format: wgpu::VertexFormat::Float32x4,
+                        offset: 0,
+                        shader_location: 0,
+                    }],
                 })],
             },
             primitive: wgpu::PrimitiveState::default(),
@@ -1297,7 +1341,10 @@ mod tests {
                     view: &rt_view,
                     depth_slice: None,
                     resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
                 })],
                 ..Default::default()
             });
@@ -1331,7 +1378,12 @@ mod tests {
         enc.copy_buffer_to_buffer(culler.stats_buffer(), 0, &s_rb, 0, s_rb.size());
         enc.copy_buffer_to_buffer(&d_buf, 0, &d_rb, 0, d_rb.size());
         enc.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo { texture: &rt_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            wgpu::TexelCopyTextureInfo {
+                texture: &rt_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
             wgpu::TexelCopyBufferInfo {
                 buffer: &img_rb,
                 layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(bpr), rows_per_image: Some(16) },
@@ -1362,7 +1414,10 @@ mod tests {
         assert_eq!(st.backface_culled, 1, "meshlet 0 backface culled: {st:?}");
         assert_eq!(st.frustum_culled, 1, "meshlet 2 frustum culled: {st:?}");
         assert_eq!(st.hiz_culled, 1, "meshlet 3 Hi-Z culled: {st:?}");
-        assert_eq!([dr[0].instance_count, dr[1].instance_count, dr[2].instance_count, dr[3].instance_count], [0, 1, 0, 0]);
+        assert_eq!(
+            [dr[0].instance_count, dr[1].instance_count, dr[2].instance_count, dr[3].instance_count],
+            [0, 1, 0, 0]
+        );
         assert!(dr.iter().all(|d| d.first_instance == 0), "first_instance must stay 0 for baseline WebGPU");
         // Verify meshlet 1 actually rasterized green pixels at screen center!
         let center_o = (8 * bpr + 8 * 4) as usize;

@@ -1,3 +1,4 @@
+#![cfg_attr(not(feature = "render-particles-cpu"), allow(dead_code, unused_imports))]
 // World-space camera-facing ribbon and beam trails built from `frame.ribbons`
 // and drawn in the translucent pass alongside particles.
 use anyhow::Result;
@@ -9,8 +10,6 @@ use crate::built_in::BuiltIn;
 use crate::matrix::{invert, multiply, narrow};
 use crate::post::SCENE_FORMAT;
 use crate::shader::PipelineContext;
-
-const RIBBONS_WGSL: &str = crate::wgsl!("ribbons.wgsl");
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -26,7 +25,7 @@ const VERTEX_BYTES: u64 = size_of::<RibbonVertex>() as u64;
 pub(crate) fn pipeline(context: &PipelineContext, samples: u32, additive: bool) -> wgpu::RenderPipeline {
     use wgpu::{BlendComponent, BlendFactor, BlendOperation};
     let device = &context.device;
-    let code = RIBBONS_WGSL
+    let code = crate::deferred_wgsl!("ribbons.wgsl")
         .replace("${translucency}", crate::volume::TRANSLUCENCY_WGSL)
         .replace("${additive}", if additive { "true" } else { "false" });
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -274,79 +273,88 @@ fn emit_strip(points: &[RibbonPoint], camera_pos: [f32; 3], tint: [f32; 4], out:
 impl State {
     pub(super) fn prepare_ribbons(
         &mut self,
-        frame: &RenderFrame,
-        catalog: &Catalog,
-        samples: u32,
-        scratch: &mut Scratch,
+        #[cfg_attr(not(feature = "render-particles-cpu"), allow(unused_variables))] frame: &RenderFrame,
+        #[cfg_attr(not(feature = "render-particles-cpu"), allow(unused_variables))] catalog: &Catalog,
+        #[cfg_attr(not(feature = "render-particles-cpu"), allow(unused_variables))] samples: u32,
+        #[cfg_attr(not(feature = "render-particles-cpu"), allow(unused_variables))] scratch: &mut Scratch,
     ) -> Result<()> {
-        if frame.ribbons.is_empty() {
-            return Ok(());
-        }
-        let ribbons = self.ribbons.get_or_insert_with(|| Ribbons::new(&self.device));
-        ribbons.vertices.clear();
-        let inv_view = invert(&frame.view);
-        let camera_pos = [inv_view[12], inv_view[13], inv_view[14]];
+        #[cfg(not(feature = "render-particles-cpu"))]
+        return Ok(());
+        #[cfg(feature = "render-particles-cpu")]
+        {
+            if frame.ribbons.is_empty() || !crate::deferred_shaders::ready_all(&["ribbons.wgsl"]) {
+                return Ok(());
+            }
+            let ribbons = self.ribbons.get_or_insert_with(|| Ribbons::new(&self.device));
+            ribbons.vertices.clear();
+            let inv_view = invert(&frame.view);
+            let camera_pos = [inv_view[12], inv_view[13], inv_view[14]];
 
-        let mut vertices = std::mem::take(&mut ribbons.vertices);
-        let mut cursor = 0;
-        while cursor < frame.ribbons.len() {
-            let head = &frame.ribbons[cursor];
-            let mut end = cursor + 1;
-            while end < frame.ribbons.len()
-                && frame.ribbons[end].ribbon == head.ribbon
-                && frame.ribbons[end].material == head.material
-                && frame.ribbons[end].additive == head.additive
-            {
-                end += 1;
-            }
-            let slice = &frame.ribbons[cursor..end];
-            cursor = end;
-            if slice.len() < 2 {
-                continue;
-            }
-            let Some(material) = self.material(catalog, head.material)? else { continue };
-            let material = &material.material;
-            let texture = match &material.texture {
-                None => None,
-                Some(key) => {
-                    let slot = self.resolve(AssetKind::Texture, key)?;
-                    match self.assets.current(slot) {
-                        Some(GpuAsset::Texture(texture)) => Some(texture.view.clone()),
-                        _ if self.assets.loading(slot) => continue,
-                        _ => None,
-                    }
+            let mut vertices = std::mem::take(&mut ribbons.vertices);
+            let mut cursor = 0;
+            while cursor < frame.ribbons.len() {
+                let head = &frame.ribbons[cursor];
+                let mut end = cursor + 1;
+                while end < frame.ribbons.len()
+                    && frame.ribbons[end].ribbon == head.ribbon
+                    && frame.ribbons[end].material == head.material
+                    && frame.ribbons[end].additive == head.additive
+                {
+                    end += 1;
                 }
-            };
-            let which = BuiltIn::Ribbons { samples, additive: head.additive };
-            if !self.built_ins.ready([which]) {
-                self.built_ins.prepare([which]);
-                self.waiting = true;
-                continue;
+                let slice = &frame.ribbons[cursor..end];
+                cursor = end;
+                if slice.len() < 2 {
+                    continue;
+                }
+                let Some(material) = self.material(catalog, head.material)? else { continue };
+                let material = &material.material;
+                let texture = match &material.texture {
+                    None => None,
+                    Some(key) => {
+                        let slot = self.resolve(AssetKind::Texture, key)?;
+                        match self.assets.current(slot) {
+                            Some(GpuAsset::Texture(texture)) => Some(texture.view.clone()),
+                            _ if self.assets.loading(slot) => continue,
+                            _ => None,
+                        }
+                    }
+                };
+                let which = BuiltIn::Ribbons { samples, additive: head.additive };
+                if !self.built_ins.ready([which]) {
+                    self.built_ins.prepare([which]);
+                    self.waiting = true;
+                    continue;
+                }
+                let first_vertex = u32::try_from(vertices.len()).unwrap_or(0);
+                emit_strip(slice, camera_pos, material.color.map(narrow), &mut vertices);
+                let vertex_count = u32::try_from(vertices.len()).unwrap_or(first_vertex) - first_vertex;
+                if vertex_count > 0 {
+                    let pipeline = self.built_ins.get(which).clone();
+                    scratch.ribbons.push(Ready { pipeline, shape: texture, group: None, first_vertex, vertex_count });
+                }
             }
-            let first_vertex = u32::try_from(vertices.len()).unwrap_or(0);
-            emit_strip(slice, camera_pos, material.color.map(narrow), &mut vertices);
-            let vertex_count = u32::try_from(vertices.len()).unwrap_or(first_vertex) - first_vertex;
-            if vertex_count > 0 {
-                let pipeline = self.built_ins.get(which).clone();
-                scratch.ribbons.push(Ready { pipeline, shape: texture, group: None, first_vertex, vertex_count });
+            let ribbons = self.ribbons.as_mut().unwrap();
+            ribbons.vertices = vertices;
+            if ribbons.vertices.is_empty() {
+                return Ok(());
             }
+            let bytes = ribbons.vertices.len() as u64 * VERTEX_BYTES;
+            if ribbons.vertex_buffer.as_ref().is_none_or(|b| b.size() < bytes) {
+                ribbons.vertex_buffer = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("ribbon vertices"),
+                    size: bytes.next_power_of_two().max(256),
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }));
+            }
+            self.queue.write_buffer(
+                ribbons.vertex_buffer.as_ref().unwrap(),
+                0,
+                bytemuck::cast_slice(&ribbons.vertices),
+            );
+            Ok(())
         }
-        let ribbons = self.ribbons.as_mut().unwrap();
-        ribbons.vertices = vertices;
-        if ribbons.vertices.is_empty() {
-            return Ok(());
-        }
-        let bytes = ribbons.vertices.len() as u64 * VERTEX_BYTES;
-        if ribbons.vertex_buffer.as_ref().is_none_or(|b| b.size() < bytes) {
-            ribbons.vertex_buffer = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("ribbon vertices"),
-                size: bytes.next_power_of_two().max(256),
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            }));
-        }
-        self.queue.write_buffer(ribbons.vertex_buffer.as_ref().unwrap(), 0, bytemuck::cast_slice(&ribbons.vertices));
-        Ok(())
     }
 
     pub(super) fn bind_ribbons(

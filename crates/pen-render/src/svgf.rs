@@ -200,7 +200,7 @@ impl SvgfDenoiser {
         });
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("svgf_wgsl"),
-            source: wgpu::ShaderSource::Wgsl(SVGF_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(crate::deferred_wgsl!("svgf.wgsl").into()),
         });
         let temporal_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("svgf_temporal_pl"),

@@ -121,7 +121,7 @@ impl JfaOutlinePass {
     pub fn new(device: &wgpu::Device) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("JFA outline"),
-            source: wgpu::ShaderSource::Wgsl(JFA_OUTLINE_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(crate::deferred_wgsl!("jfa_outline.wgsl").into()),
         });
         let styles = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("JFA outline palette"),

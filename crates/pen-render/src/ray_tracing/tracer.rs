@@ -1,7 +1,7 @@
 use anyhow::{Result, ensure};
 
 use super::bvh::{BvhNodeGpu, BvhScene, BvhTriGpu, TlasScene, TlasSceneGpu};
-use super::{BVH_RAYTRACE_WGSL, TLAS_RAYTRACE_WGSL, TLAS_TRAVERSAL_WGSL, encode_copy};
+use super::{BVH_RAYTRACE_WGSL, encode_copy};
 #[cfg(not(target_arch = "wasm32"))]
 use super::{TLAS_TRAVERSAL_HW_WGSL, device_supports_hardware_ray_query};
 
@@ -466,11 +466,11 @@ impl TlasRayTracer {
                 sharc_u_entry,
             ],
         });
-        let sw_body = TLAS_RAYTRACE_WGSL
+        let sw_body = crate::deferred_wgsl!("tlas_raytrace.wgsl")
             .replace("// __TLAS_BINDING_1__", "@group(0) @binding(1) var<storage, read> tlas_nodes: array<BvhNode>;");
         let sharc_hash = crate::sharc::SHARC_HASH_WGSL;
         let sharc_ro = crate::sharc::SHARC_QUERY_RO_FN_WGSL;
-        let source = format!("{TLAS_TRAVERSAL_WGSL}\n{sharc_hash}\n{sharc_ro}\n{sw_body}");
+        let source = format!("{}\n{sharc_hash}\n{sharc_ro}\n{sw_body}", crate::deferred_wgsl!("tlas_traversal.wgsl"));
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("tlas_raytrace"),
             source: wgpu::ShaderSource::Wgsl(source.into()),
@@ -517,7 +517,7 @@ impl TlasRayTracer {
                     sharc_u_entry,
                 ],
             });
-            let hw_body = TLAS_RAYTRACE_WGSL
+            let hw_body = crate::deferred_wgsl!("tlas_raytrace.wgsl")
                 .replace("// __TLAS_BINDING_1__", "@group(0) @binding(1) var hw_tlas: acceleration_structure;");
             let hw_src = format!("{TLAS_TRAVERSAL_HW_WGSL}\n{sharc_hash}\n{sharc_ro}\n{hw_body}");
             let hw_mod = device.create_shader_module(wgpu::ShaderModuleDescriptor {

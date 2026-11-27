@@ -178,6 +178,9 @@ impl State {
         let bias = if outline_scene.depth_bias > 0.0 { outline_scene.depth_bias } else { 1e-4 };
         let resolved_r32 =
             (samples > 1).then(|| wired.resolve_msaa_depth(device, built_ins, encoder, depth_only, (w, h), samples));
+        if !crate::deferred_shaders::ready_all(&["jfa_outline.wgsl"]) {
+            return Ok(());
+        }
         let pass_obj = wired.jfa_outline.pass.get_or_insert_with(|| JfaOutlinePass::new(device));
         pass_obj.resize(device, w, h);
         let style_slice = &outline_scene.styles[..outline_scene.styles.len().min(OUTLINE_STYLE_CAPACITY)];

@@ -3,12 +3,17 @@
 ## Current status
 
 Web exports list their startup files in `game.json`, prune unused optional JS
-glue (`structured.js`, `kernels.js`, `kernel_worker.js`), and load required
-assets alongside GPU setup. Optional files absent from the export cause no
-requests. `pen build --web --web-compact` selects the compact browser host for
-static single-player games (auto-tailoring features per game when `build.sh` is
-available, or via `--web-features LIST`). The Linux tools bundle publishes both
-full and general compact browser hosts.
+glue (`structured.js`, `kernels.js`, `kernel_worker.js`), externalize heavy
+optional 3D WGSL pass shaders into lazy `shaders/*.wgsl` files
+(`deferred-shaders`), and load required assets alongside GPU setup. Optional
+files absent from the export cause no requests. `pen build --web --web-compact`
+supports optional `pen.json` `"web"` config (`mode` / `features`), auto-detects
+pure-2D games (omitting `render-3d` and `audio-advanced`), caches tailored
+source builds under `~/.cache/pen/web-hosts/`, and otherwise picks the tightest
+prebuilt tier (`web-2d`, `web-3d`, `web-compact`, `web`). `crates/pen-web/build.sh`
+uses `-Z build-std=std,panic_abort` with `-Cpanic=immediate-abort` when
+`rust-src` is installed. The Linux tools bundle publishes all four prebuilt
+browser hosts (`web`, `web-compact`, `web-3d`, `web-2d`).
 
 Read `AGENTS.md` and [Blot's shared continuation](../blot2/CONTINUE.md). Use the
 existing sibling checkouts and pinned toolchains. This is a greenfield project;

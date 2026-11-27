@@ -90,7 +90,7 @@ impl State {
         } else {
             0.0
         };
-        if sharp > 0.0 {
+        if sharp > 0.0 && crate::deferred_shaders::ready_all(&["upscale_rcas.wgsl"]) {
             let rcas = wired.rcas.get_or_insert_with(|| RcasSharpener::new(device));
             // `polish_src` is already display-tonemapped for SDR targets (skip Reinhard distortion),
             // while HDR Rgba16Float targets keep the HDR-safe Reinhard compression knee.
@@ -101,7 +101,9 @@ impl State {
             }
         }
 
-        if frame.grade.grain > 0.0 || frame.grade.flare > 0.0 || frame.grade.outline_strength > 0.0 {
+        if (frame.grade.grain > 0.0 || frame.grade.flare > 0.0 || frame.grade.outline_strength > 0.0)
+            && crate::deferred_shaders::ready_all(&["post_fx.wgsl"])
+        {
             let outline = frame.grade.outline_strength.clamp(0.0, 1.0);
             let depth_for_fx = if samples > 1 {
                 if outline > 0.0 {

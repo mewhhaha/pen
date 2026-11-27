@@ -17,6 +17,7 @@ use super::{
 use crate::RenderStats;
 use crate::asset_store::{AssetKind, MAPS_FLOATS, MAX_LODS, SURFACE_FLOATS};
 use crate::culling::{ALL_VIEWS, CAMERA, Detail, Frustum, Sphere, ViewMask, Views, stretch};
+#[cfg(feature = "render-decals")]
 use crate::decals::DecalBatch;
 use crate::local_shadows::Selection;
 use crate::matrix::{IDENTITY, narrow};
@@ -137,6 +138,7 @@ impl Scratch {
         self.motion_for_draw.get(draw).is_some_and(|&slot| slot != u32::MAX)
     }
 
+    #[cfg_attr(not(feature = "render-taa"), allow(dead_code))]
     pub(super) fn motion_previous<'a>(&self, frame: &'a RenderFrame, draw: usize) -> Option<&'a Matrix> {
         let slot = *self.motion_for_draw.get(draw)?;
         (slot != u32::MAX).then(|| &frame.motions[slot as usize].previous)
@@ -904,54 +906,62 @@ impl State {
     /// material and texture.
     pub(super) fn decal_batches(
         &mut self,
-        frame: &RenderFrame,
-        catalog: &Catalog,
-        scratch: &mut Scratch,
+        #[cfg_attr(not(feature = "render-decals"), allow(unused_variables))] frame: &RenderFrame,
+        #[cfg_attr(not(feature = "render-decals"), allow(unused_variables))] catalog: &Catalog,
+        #[cfg_attr(not(feature = "render-decals"), allow(unused_variables))] scratch: &mut Scratch,
     ) -> Result<()> {
-        // Each decal's batch, then the decals in batch order.
-        let placed = &mut scratch.decal_order;
-        for decal in &frame.decals {
-            placed.push(LEFT_OUT);
-            let material_slot = self.resolve(AssetKind::Material, catalog.material(decal.material))?;
-            let Some(GpuAsset::Material(material)) = self.assets.current(material_slot) else { continue };
-            let material = material.clone();
-            let Some(key) = &material.material.texture else { continue };
-            let image = self.resolve(AssetKind::Texture, key)?;
-            let Some(GpuAsset::Texture(image)) = self.assets.current(image) else { continue };
-            let paint = !material.material.lit;
-            self.built_ins.prepare([crate::built_in::BuiltIn::Decal { samples: self.samples_shown, paint }]);
-            let found = scratch.decals.iter().position(|other| {
-                other.texture_id == image.view_id && other.paint == paint && other.material == material_slot
-            });
-            let batch = found.unwrap_or_else(|| {
-                scratch.decals.push(DecalBatch {
-                    texture: image.view.clone(),
-                    texture_id: image.view_id,
-                    material: material_slot,
-                    color: material.material.color,
-                    paint,
-                    first: 0,
-                    count: 0,
+        #[cfg(not(feature = "render-decals"))]
+        return Ok(());
+        #[cfg(feature = "render-decals")]
+        {
+            if frame.decals.is_empty() || !crate::deferred_shaders::ready_all(&["decals.wgsl"]) {
+                return Ok(());
+            }
+            // Each decal's batch, then the decals in batch order.
+            let placed = &mut scratch.decal_order;
+            for decal in &frame.decals {
+                placed.push(LEFT_OUT);
+                let material_slot = self.resolve(AssetKind::Material, catalog.material(decal.material))?;
+                let Some(GpuAsset::Material(material)) = self.assets.current(material_slot) else { continue };
+                let material = material.clone();
+                let Some(key) = &material.material.texture else { continue };
+                let image = self.resolve(AssetKind::Texture, key)?;
+                let Some(GpuAsset::Texture(image)) = self.assets.current(image) else { continue };
+                let paint = !material.material.lit;
+                self.built_ins.prepare([crate::built_in::BuiltIn::Decal { samples: self.samples_shown, paint }]);
+                let found = scratch.decals.iter().position(|other| {
+                    other.texture_id == image.view_id && other.paint == paint && other.material == material_slot
                 });
-                scratch.decals.len() - 1
-            });
-            scratch.decals[batch].count += 1;
-            *placed.last_mut().unwrap() = u32::try_from(batch)?;
+                let batch = found.unwrap_or_else(|| {
+                    scratch.decals.push(DecalBatch {
+                        texture: image.view.clone(),
+                        texture_id: image.view_id,
+                        material: material_slot,
+                        color: material.material.color,
+                        paint,
+                        first: 0,
+                        count: 0,
+                    });
+                    scratch.decals.len() - 1
+                });
+                scratch.decals[batch].count += 1;
+                *placed.last_mut().unwrap() = u32::try_from(batch)?;
+            }
+            let mut first = 0;
+            for batch in &mut scratch.decals {
+                batch.first = first;
+                first += batch.count;
+                batch.count = 0;
+            }
+            let batch_of = std::mem::take(placed);
+            placed.resize(first as usize, 0);
+            for (index, &batch) in batch_of.iter().enumerate() {
+                let Some(batch) = scratch.decals.get_mut(batch as usize) else { continue };
+                placed[(batch.first + batch.count) as usize] = u32::try_from(index)?;
+                batch.count += 1;
+            }
+            Ok(())
         }
-        let mut first = 0;
-        for batch in &mut scratch.decals {
-            batch.first = first;
-            first += batch.count;
-            batch.count = 0;
-        }
-        let batch_of = std::mem::take(placed);
-        placed.resize(first as usize, 0);
-        for (index, &batch) in batch_of.iter().enumerate() {
-            let Some(batch) = scratch.decals.get_mut(batch as usize) else { continue };
-            placed[(batch.first + batch.count) as usize] = u32::try_from(index)?;
-            batch.count += 1;
-        }
-        Ok(())
     }
 
     /// `sprites` in batches of one texture and shader, in order, into

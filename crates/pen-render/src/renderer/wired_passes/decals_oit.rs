@@ -181,7 +181,7 @@ impl State {
         scene_size: (u32, u32),
         depth_mode: DepthMode,
     ) -> Result<()> {
-        if batches.is_empty() {
+        if batches.is_empty() || !crate::deferred_shaders::ready_all(&["decal_pbr.wgsl"]) {
             return Ok(());
         }
         if let std::collections::hash_map::Entry::Vacant(e) = wired.pbr_decals.entry(samples) {

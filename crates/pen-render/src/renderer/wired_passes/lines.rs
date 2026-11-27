@@ -132,7 +132,7 @@ impl State {
         samples: u32,
         depth_mode: DepthMode,
     ) -> Result<()> {
-        if !scene.batch.has_3d() {
+        if !scene.batch.has_3d() || !crate::deferred_shaders::ready_all(&["lines.wgsl"]) {
             return Ok(());
         }
         let batch_3d = scene.batch.only_3d();
@@ -181,7 +181,7 @@ impl State {
         target_format: wgpu::TextureFormat,
         size: (u32, u32),
     ) -> Result<()> {
-        if !scene.batch.has_2d() {
+        if !scene.batch.has_2d() || !crate::deferred_shaders::ready_all(&["lines.wgsl"]) {
             return Ok(());
         }
         let batch_2d = scene.batch.only_2d();

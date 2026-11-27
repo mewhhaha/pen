@@ -1,3 +1,4 @@
+#![cfg_attr(not(feature = "render-3d"), allow(dead_code))]
 // Sprites: the rectangles a frame lays over the finished image, in order. Each
 // draws with its material's sprite shader (a WGSL asset) over the material's
 // texture. Every sprite shader sees the same bindings:

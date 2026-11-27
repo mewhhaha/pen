@@ -1,3 +1,17 @@
+#![cfg_attr(
+    any(
+        all(target_arch = "wasm32", feature = "deferred-shaders"),
+        not(all(
+            feature = "render-ssgi",
+            feature = "render-taa",
+            feature = "render-dof",
+            feature = "render-subsurface",
+            feature = "render-decals",
+            feature = "render-particles-cpu",
+        )),
+    ),
+    allow(dead_code, unused_mut)
+)]
 use crate::camera_precision::DepthMode;
 // The renderer's own pipelines, beside its materials' shaders: the passes
 // around the scene (post.rs), decals, particles and the inset composite. They compile on
@@ -60,14 +74,9 @@ pub(crate) enum BuiltIn {
 
 impl BuiltIn {
     /// Pipelines prepared at startup for this sample count. Decals compile on their first draw.
-    pub fn all(samples: u32) -> [BuiltIn; 15] {
-        [
-            BuiltIn::Occlusion(samples),
+    pub fn all(samples: u32) -> Vec<BuiltIn> {
+        let mut list = vec![
             BuiltIn::Atmosphere(samples),
-            BuiltIn::Ssgi(samples),
-            BuiltIn::Taa(samples),
-            BuiltIn::Dof(samples),
-            BuiltIn::MotionBlur(samples),
             BuiltIn::Present(samples),
             BuiltIn::BloomDown { first: true },
             BuiltIn::BloomDown { first: false },
@@ -76,8 +85,22 @@ impl BuiltIn {
             BuiltIn::OpaqueDepth(samples),
             BuiltIn::OpaqueMip,
             BuiltIn::Backdrop(samples),
-            BuiltIn::Subsurface(samples),
-        ]
+        ];
+        #[cfg(all(feature = "render-ssgi", not(all(target_arch = "wasm32", feature = "deferred-shaders"))))]
+        {
+            list.push(BuiltIn::Occlusion(samples));
+            list.push(BuiltIn::Ssgi(samples));
+        }
+        #[cfg(all(feature = "render-taa", not(all(target_arch = "wasm32", feature = "deferred-shaders"))))]
+        {
+            list.push(BuiltIn::Taa(samples));
+            list.push(BuiltIn::MotionBlur(samples));
+        }
+        #[cfg(all(feature = "render-dof", not(all(target_arch = "wasm32", feature = "deferred-shaders"))))]
+        list.push(BuiltIn::Dof(samples));
+        #[cfg(all(feature = "render-subsurface", not(all(target_arch = "wasm32", feature = "deferred-shaders"))))]
+        list.push(BuiltIn::Subsurface(samples));
+        list
     }
 
     /// Whether this pipeline depends on the active `DepthMode` (Forward-Z vs Reversed-Z).
@@ -95,10 +118,19 @@ impl BuiltIn {
     pub fn compile(self, context: &PipelineContext) -> wgpu::RenderPipeline {
         let clock = crate::platform::Clock::new();
         let pipeline = match self {
+            #[cfg(feature = "render-decals")]
             BuiltIn::Decal { samples, paint } => crate::decals::pipeline(context, samples, paint),
+            #[cfg(not(feature = "render-decals"))]
+            BuiltIn::Decal { .. } => unreachable!("render-decals feature disabled"),
             BuiltIn::Composite => crate::renderer::composite_pipeline(context),
+            #[cfg(feature = "render-particles-cpu")]
             BuiltIn::Particles { samples, additive } => crate::renderer::particle_pipeline(context, samples, additive),
+            #[cfg(not(feature = "render-particles-cpu"))]
+            BuiltIn::Particles { .. } => unreachable!("render-particles-cpu feature disabled"),
+            #[cfg(feature = "render-particles-cpu")]
             BuiltIn::Ribbons { samples, additive } => crate::renderer::ribbon_pipeline(context, samples, additive),
+            #[cfg(not(feature = "render-particles-cpu"))]
+            BuiltIn::Ribbons { .. } => unreachable!("render-particles-cpu feature disabled"),
             BuiltIn::Backdrop(samples) => crate::post::backdrop_pipeline(context, samples),
             _ => crate::post::pipeline(context, self),
         };
@@ -196,7 +228,7 @@ mod tests {
                 assert!(all.contains(&needed), "{needed:?}");
             }
             assert!(!all.iter().any(|pipeline| matches!(pipeline, BuiltIn::Decal { .. })));
-            let distinct: HashSet<BuiltIn> = all.into_iter().collect();
+            let distinct: HashSet<BuiltIn> = all.iter().copied().collect();
             assert_eq!(distinct.len(), all.len());
         }
     }

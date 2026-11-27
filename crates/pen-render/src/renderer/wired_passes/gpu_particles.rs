@@ -264,6 +264,9 @@ impl State {
             sample_count: samples,
         };
         if recreated {
+            if !crate::deferred_shaders::ready_all(&["gpu_particles_sim.wgsl", "gpu_particles_draw.wgsl"]) {
+                return Ok(None);
+            }
             particles.system = Some(GpuParticleSystem::new(
                 device,
                 max_particles,

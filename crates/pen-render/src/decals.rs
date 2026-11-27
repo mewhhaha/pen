@@ -1,3 +1,4 @@
+#![cfg_attr(not(feature = "render-decals"), allow(dead_code))]
 // Decals: a material's texture laid onto the surfaces inside a box. Each box
 // is drawn from the inside, between the opaque surfaces and the translucent
 // ones; every pixel it covers finds the surface the depth buffer holds there,
@@ -19,12 +20,11 @@ pub(crate) const DECAL_MARK: u32 = 2;
 // Model and inverse matrices, then color times opacity, per decal.
 const DECAL_FLOATS: usize = 36;
 
-const SHADER: &str = crate::wgsl!("decals.wgsl");
 /// Standalone WGSL source for physically based deferred decals (albedo + tangent-space normal + ORM + emissive).
 pub const PBR_DECAL_WGSL: &str = crate::wgsl!("decal_pbr.wgsl");
 
 fn shader(samples: u32, paint: bool) -> String {
-    SHADER
+    crate::deferred_wgsl!("decals.wgsl")
         .replace("${depth_texture}", if samples > 1 { "texture_depth_multisampled_2d" } else { "texture_depth_2d" })
         .replace("${paint}", if paint { "true" } else { "false" })
 }
@@ -35,7 +35,7 @@ fn pbr_shader(samples: u32) -> String {
     } else {
         ("texture_depth_2d", "", "0")
     };
-    PBR_DECAL_WGSL
+    crate::deferred_wgsl!("decal_pbr.wgsl")
         .replace("${depth_texture}", depth_ty)
         .replace("${sample_param}", sample_param)
         .replace("${sample_arg}", sample_arg)

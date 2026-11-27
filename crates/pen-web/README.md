@@ -8,14 +8,23 @@ page says so.
 `pen build --web --web-compact` ships a smaller browser host for static
 single-player games (omitting development reload, dev tools, netplay, video
 textures, replay recording, runtime mesh/texture/shader recipes, and software
-RT). When building from a source checkout without `PEN_WEB_COMPACT_HOST`, it
-automatically inspects `game.wasm`, `game.json`, and shipped assets to build a
-tailored host containing only the subsystems the game uses, and `--web-features
-LIST` selects an exact feature set manually. All `pen build --web` exports omit
-`structured.js` and `kernels.js`/`kernel_worker.js` when unused. Build the
-general compact host locally with `./build.sh OUTPUT --compact`, or a tailored
-host with `./build.sh OUTPUT --features LIST`. The release bundle contains both
-the full and general compact hosts.
+RT). It inspects `game.wasm`, `game.json`, shipped assets, and any optional
+`"web": { "mode": "2d" | "3d", "features": [...] }` block in `pen.json`:
+pure-2D games drop the 3D PBR renderer (`render-3d`) and advanced WebAudio
+graph (`audio-advanced`) automatically, while 3D games externalize heavy
+optional WGSL pass shaders into `shaders/*.wgsl` (`deferred-shaders`) so
+browsers only fetch shaders for passes a game actually activates. When building
+from a source checkout without `PEN_WEB_COMPACT_HOST`, tailored builds are
+cached under `~/.cache/pen/web-hosts/<hash>/` (override with `PEN_WEB_NO_CACHE=1`,
+or pass `--web-features LIST` manually). Binary-only installs automatically
+pick the tightest prebuilt host tier (`web-2d`, `web-3d`, `web-compact`, or
+`web`). All `pen build --web` exports omit `structured.js` and
+`kernels.js`/`kernel_worker.js` when unused. Build host tiers locally with
+`./build.sh OUTPUT [--compact | --3d | --2d | --features LIST]`; when
+`rust-src` is installed on the pinned toolchain, `build.sh` automatically
+builds std with `-Z build-std=std,panic_abort` and `-Cpanic=immediate-abort`
+(override via `PEN_WEB_BUILD_STD=0|1`). The release bundle contains all four
+prebuilt hosts (`web`, `web-compact`, `web-3d`, `web-2d`).
 
 `pen-runtime` contains what native pen and the browser share: request
 validation and the frame protocol, the guest ABI manifest, transactional

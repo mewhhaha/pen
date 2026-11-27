@@ -64,7 +64,7 @@ impl State {
         frame: &RenderFrame,
         scene_size: (u32, u32),
     ) -> Result<Option<PhysicalSkyBinding>> {
-        if !frame.quality.physical_sky {
+        if !frame.quality.physical_sky || !crate::deferred_shaders::ready_all(&["atmosphere_lut.wgsl", "clouds.wgsl"]) {
             return Ok(None);
         }
         let device = self.device.clone();
@@ -113,7 +113,7 @@ impl State {
         active_projection: &Matrix,
         scene_size: (u32, u32),
     ) -> Result<()> {
-        if !frame.quality.physical_sky {
+        if !frame.quality.physical_sky || !crate::deferred_shaders::ready_all(&["atmosphere_lut.wgsl", "clouds.wgsl"]) {
             return Ok(());
         }
         let device = self.device.clone();
@@ -190,6 +190,9 @@ impl State {
             return Ok(());
         }
         let key = (samples.max(1), depth_mode == DepthMode::ReversedZ);
+        if !crate::deferred_shaders::ready_all(&["terrain.wgsl", "water.wgsl", "foliage.wgsl"]) {
+            return Ok(());
+        }
         let pipes = wired.env_pipelines.entry(key).or_insert_with(|| EnvPipelines::new(device, samples, depth_mode));
         pipes.terrain.begin_frame();
         pipes.water.begin_frame();

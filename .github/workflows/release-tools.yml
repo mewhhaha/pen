@@ -30,6 +30,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends clang cmake libasound2-dev libdbus-1-dev libudev-dev ninja-build pkg-config
           rustup toolchain install --profile minimal
           rustup target add wasm32-unknown-unknown
+          rustup component add rust-src
       - name: Install Binaryen
         run: |
           cd "$RUNNER_TEMP"
@@ -52,6 +53,8 @@ jobs:
           install -m 644 plugins/target/wasm32-wasip2/release/pen_plugin_blot.wasm bundle/plugins/blot.wasm
           sh crates/pen-web/build.sh "$PWD/bundle/web"
           sh crates/pen-web/build.sh "$PWD/bundle/web-compact" --compact
+          sh crates/pen-web/build.sh "$PWD/bundle/web-3d" --3d
+          sh crates/pen-web/build.sh "$PWD/bundle/web-2d" --2d
           cp LICENSE THIRD_PARTY_NOTICES.md bundle/
           printf '%s\n' "$PEN_BUILD" > bundle/source-commit
       - name: Smoke check and publish
@@ -66,7 +69,12 @@ jobs:
           grep -F 'tool NAME [ARGS...]' bundle-help.txt
           test -s bundle/plugins/blot.wasm
           test -s bundle/web/pen_web_bg.wasm
+          test -d bundle/web/shaders
           test -s bundle/web-compact/pen_web_bg.wasm
+          test -d bundle/web-compact/shaders
+          test -s bundle/web-3d/pen_web_bg.wasm
+          test -d bundle/web-3d/shaders
+          test -s bundle/web-2d/pen_web_bg.wasm
           archive="pen-tools-$version-ubuntu-24.04-x86_64.tar.gz"
           tar -czf "$archive" -C bundle .
           sha256sum "$archive" > "$archive.sha256"

@@ -301,7 +301,7 @@ impl PhysicalAtmosphere {
 
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("atmosphere_lut"),
-            source: wgpu::ShaderSource::Wgsl(ATMOSPHERE_LUT_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(crate::deferred_wgsl!("atmosphere_lut.wgsl").into()),
         });
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("atmo_lut_pl"),
@@ -349,7 +349,7 @@ impl PhysicalAtmosphere {
         });
         let cloud_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("clouds"),
-            source: wgpu::ShaderSource::Wgsl(CLOUDS_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(crate::deferred_wgsl!("clouds.wgsl").into()),
         });
         let cloud_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("clouds_pl"),

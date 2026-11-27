@@ -1,3 +1,4 @@
+#![cfg_attr(not(feature = "render-gpu-culling"), allow(dead_code, unused_imports))]
 // Hierarchical-Z (Hi-Z) farthest-depth pyramid built from opaque depth
 // (max-depth for Forward-Z, min-depth for Reversed-Z) for conservative GPU
 // occlusion culling (`cull.wgsl` and two-phase `meshlet_cull.wgsl`).
@@ -10,9 +11,6 @@ use super::timing::{GpuTimer, Span};
 use crate::camera_precision::DepthMode;
 use crate::matrix::IDENTITY;
 use crate::packed_texture::mip_levels;
-
-const HIZ_BASE_WGSL: &str = crate::wgsl!("hiz_base.wgsl");
-const HIZ_REDUCE_WGSL: &str = crate::wgsl!("hiz.wgsl");
 
 const WORKGROUP: u32 = 8;
 static NEXT_VIEW_ID: AtomicU64 = AtomicU64::new(1);
@@ -150,147 +148,159 @@ impl HiZ {
     #[allow(clippy::too_many_arguments, reason = "explicit render-pass inputs")]
     pub fn build(
         &mut self,
-        device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
-        depth_only: &wgpu::TextureView,
-        size: (u32, u32),
-        samples: u32,
-        depth_mode: DepthMode,
-        vp: Matrix,
-        cache: Option<&wgpu::PipelineCache>,
-        timer: &GpuTimer,
+        #[cfg_attr(not(feature = "render-gpu-culling"), allow(unused_variables))] device: &wgpu::Device,
+        #[cfg_attr(not(feature = "render-gpu-culling"), allow(unused_variables))] encoder: &mut wgpu::CommandEncoder,
+        #[cfg_attr(not(feature = "render-gpu-culling"), allow(unused_variables))] depth_only: &wgpu::TextureView,
+        #[cfg_attr(not(feature = "render-gpu-culling"), allow(unused_variables))] size: (u32, u32),
+        #[cfg_attr(not(feature = "render-gpu-culling"), allow(unused_variables))] samples: u32,
+        #[cfg_attr(not(feature = "render-gpu-culling"), allow(unused_variables))] depth_mode: DepthMode,
+        #[cfg_attr(not(feature = "render-gpu-culling"), allow(unused_variables))] vp: Matrix,
+        #[cfg_attr(not(feature = "render-gpu-culling"), allow(unused_variables))] cache: Option<&wgpu::PipelineCache>,
+        #[cfg_attr(not(feature = "render-gpu-culling"), allow(unused_variables))] timer: &GpuTimer,
     ) {
-        if !self.enabled || size.0 == 0 || size.1 == 0 {
+        #[cfg(not(feature = "render-gpu-culling"))]
+        {
             self.valid = false;
             return;
         }
-        let reversed_z = depth_mode == DepthMode::ReversedZ;
-        let (init_depth, far_op) = if reversed_z { ("1.0", "min") } else { ("0.0", "max") };
-        let reduce_pl = &self.reduce_pl;
-        let reduce_pipeline = self.reduce_pipelines[usize::from(reversed_z)].get_or_insert_with(|| {
-            let source = HIZ_REDUCE_WGSL.replace("${far_op}", far_op);
-            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("hiz reduce"),
-                source: wgpu::ShaderSource::Wgsl(source.into()),
-            });
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("hiz reduce"),
-                layout: Some(reduce_pl),
-                module: &module,
-                entry_point: Some("main"),
-                compilation_options: Default::default(),
-                cache,
-            })
-        });
-        let base_pipeline = self.base_pipelines.entry((samples, reversed_z)).or_insert_with(|| {
-            let depth_ty = if samples > 1 { "texture_depth_multisampled_2d" } else { "texture_depth_2d" };
-            let source = HIZ_BASE_WGSL
-                .replace("${depth_texture}", depth_ty)
-                .replace("${samples}", &samples.to_string())
-                .replace("${init_depth}", init_depth)
-                .replace("${far_op}", far_op);
-            let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("hiz base"),
-                source: wgpu::ShaderSource::Wgsl(source.into()),
-            });
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("hiz base"),
-                layout: None,
-                module: &module,
-                entry_point: Some("main"),
-                compilation_options: Default::default(),
-                cache,
-            })
-        });
-
-        let needs_pyramid = self.pyramid.as_ref().is_none_or(|p| p.size != size);
-        if needs_pyramid {
-            let mips = mip_levels(size.0, size.1);
-            let texture = device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("hiz pyramid"),
-                size: wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 1 },
-                mip_level_count: mips,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::R32Float,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
-                view_formats: &[],
-            });
-            let full_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-            let mip_views: Vec<_> = (0..mips)
-                .map(|mip| {
-                    texture.create_view(&wgpu::TextureViewDescriptor {
-                        base_mip_level: mip,
-                        mip_level_count: Some(1),
-                        ..Default::default()
-                    })
-                })
-                .collect();
-            let reduce_groups: Vec<_> = (1..mips as usize)
-                .map(|mip| {
-                    device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some("hiz reduce"),
-                        layout: &self.reduce_bgl,
-                        entries: &[
-                            wgpu::BindGroupEntry {
-                                binding: 0,
-                                resource: wgpu::BindingResource::TextureView(&mip_views[mip - 1]),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 1,
-                                resource: wgpu::BindingResource::TextureView(&mip_views[mip]),
-                            },
-                        ],
-                    })
-                })
-                .collect();
-            let view_id = NEXT_VIEW_ID.fetch_add(1, Ordering::Relaxed);
-            self.pyramid =
-                Some(Pyramid { _texture: texture, size, mips, full_view, mip_views, reduce_groups, view_id });
-            self.base_group = None;
-        }
-
-        let pyramid = self.pyramid.as_ref().unwrap();
-        let depth_serial = self.depth_serial;
-        if self
-            .base_group
-            .as_ref()
-            .is_none_or(|(s, rev, ser, _)| *s != samples || *rev != reversed_z || *ser != depth_serial)
+        #[cfg(feature = "render-gpu-culling")]
         {
-            let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("hiz base"),
-                layout: &base_pipeline.get_bind_group_layout(0),
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(depth_only) },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::TextureView(&pyramid.mip_views[0]),
-                    },
-                ],
+            if !self.enabled
+                || size.0 == 0
+                || size.1 == 0
+                || !crate::deferred_shaders::ready_all(&["hiz_base.wgsl", "hiz.wgsl"])
+            {
+                self.valid = false;
+                return;
+            }
+            let reversed_z = depth_mode == DepthMode::ReversedZ;
+            let (init_depth, far_op) = if reversed_z { ("1.0", "min") } else { ("0.0", "max") };
+            let reduce_pl = &self.reduce_pl;
+            let reduce_pipeline = self.reduce_pipelines[usize::from(reversed_z)].get_or_insert_with(|| {
+                let source = crate::deferred_wgsl!("hiz.wgsl").replace("${far_op}", far_op);
+                let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("hiz reduce"),
+                    source: wgpu::ShaderSource::Wgsl(source.into()),
+                });
+                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("hiz reduce"),
+                    layout: Some(reduce_pl),
+                    module: &module,
+                    entry_point: Some("main"),
+                    compilation_options: Default::default(),
+                    cache,
+                })
             });
-            self.base_group = Some((samples, reversed_z, depth_serial, group));
+            let base_pipeline = self.base_pipelines.entry((samples, reversed_z)).or_insert_with(|| {
+                let depth_ty = if samples > 1 { "texture_depth_multisampled_2d" } else { "texture_depth_2d" };
+                let source = crate::deferred_wgsl!("hiz_base.wgsl")
+                    .replace("${depth_texture}", depth_ty)
+                    .replace("${samples}", &samples.to_string())
+                    .replace("${init_depth}", init_depth)
+                    .replace("${far_op}", far_op);
+                let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("hiz base"),
+                    source: wgpu::ShaderSource::Wgsl(source.into()),
+                });
+                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("hiz base"),
+                    layout: None,
+                    module: &module,
+                    entry_point: Some("main"),
+                    compilation_options: Default::default(),
+                    cache,
+                })
+            });
+
+            let needs_pyramid = self.pyramid.as_ref().is_none_or(|p| p.size != size);
+            if needs_pyramid {
+                let mips = mip_levels(size.0, size.1);
+                let texture = device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("hiz pyramid"),
+                    size: wgpu::Extent3d { width: size.0, height: size.1, depth_or_array_layers: 1 },
+                    mip_level_count: mips,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::R32Float,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
+                    view_formats: &[],
+                });
+                let full_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+                let mip_views: Vec<_> = (0..mips)
+                    .map(|mip| {
+                        texture.create_view(&wgpu::TextureViewDescriptor {
+                            base_mip_level: mip,
+                            mip_level_count: Some(1),
+                            ..Default::default()
+                        })
+                    })
+                    .collect();
+                let reduce_groups: Vec<_> = (1..mips as usize)
+                    .map(|mip| {
+                        device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("hiz reduce"),
+                            layout: &self.reduce_bgl,
+                            entries: &[
+                                wgpu::BindGroupEntry {
+                                    binding: 0,
+                                    resource: wgpu::BindingResource::TextureView(&mip_views[mip - 1]),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 1,
+                                    resource: wgpu::BindingResource::TextureView(&mip_views[mip]),
+                                },
+                            ],
+                        })
+                    })
+                    .collect();
+                let view_id = NEXT_VIEW_ID.fetch_add(1, Ordering::Relaxed);
+                self.pyramid =
+                    Some(Pyramid { _texture: texture, size, mips, full_view, mip_views, reduce_groups, view_id });
+                self.base_group = None;
+            }
+
+            let pyramid = self.pyramid.as_ref().unwrap();
+            let depth_serial = self.depth_serial;
+            if self
+                .base_group
+                .as_ref()
+                .is_none_or(|(s, rev, ser, _)| *s != samples || *rev != reversed_z || *ser != depth_serial)
+            {
+                let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("hiz base"),
+                    layout: &base_pipeline.get_bind_group_layout(0),
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(depth_only) },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(&pyramid.mip_views[0]),
+                        },
+                    ],
+                });
+                self.base_group = Some((samples, reversed_z, depth_serial, group));
+            }
+
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("hiz"),
+                timestamp_writes: timer.compute(Span::Culling),
+            });
+            pass.set_pipeline(base_pipeline);
+            pass.set_bind_group(0, &self.base_group.as_ref().unwrap().3, &[]);
+            pass.dispatch_workgroups(size.0.div_ceil(WORKGROUP), size.1.div_ceil(WORKGROUP), 1);
+
+            pass.set_pipeline(reduce_pipeline);
+            let (mut w, mut h) = size;
+            for group in &pyramid.reduce_groups {
+                w = (w / 2).max(1);
+                h = (h / 2).max(1);
+                pass.set_bind_group(0, group, &[]);
+                pass.dispatch_workgroups(w.div_ceil(WORKGROUP), h.div_ceil(WORKGROUP), 1);
+            }
+
+            self.depth_mode = depth_mode;
+            self.vp = vp;
+            self.valid = true;
         }
-
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-            label: Some("hiz"),
-            timestamp_writes: timer.compute(Span::Culling),
-        });
-        pass.set_pipeline(base_pipeline);
-        pass.set_bind_group(0, &self.base_group.as_ref().unwrap().3, &[]);
-        pass.dispatch_workgroups(size.0.div_ceil(WORKGROUP), size.1.div_ceil(WORKGROUP), 1);
-
-        pass.set_pipeline(reduce_pipeline);
-        let (mut w, mut h) = size;
-        for group in &pyramid.reduce_groups {
-            w = (w / 2).max(1);
-            h = (h / 2).max(1);
-            pass.set_bind_group(0, group, &[]);
-            pass.dispatch_workgroups(w.div_ceil(WORKGROUP), h.div_ceil(WORKGROUP), 1);
-        }
-
-        self.depth_mode = depth_mode;
-        self.vp = vp;
-        self.valid = true;
     }
 }
 

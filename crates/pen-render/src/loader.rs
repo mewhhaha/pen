@@ -452,8 +452,18 @@ impl Worker {
                 self.send(Message::BuiltIn { which, depth_mode, result });
             }
             Job::Culling => {
-                let result = shader::checked(device, || crate::renderer::culling_pipeline(&self.context)).await;
-                self.send(Message::Culling(result));
+                #[cfg(feature = "render-gpu-culling")]
+                {
+                    #[cfg(all(target_arch = "wasm32", feature = "deferred-shaders"))]
+                    if let Err(err) = crate::deferred_shaders::load_async("cull.wgsl").await {
+                        self.send(Message::Culling(Err(err)));
+                        return;
+                    }
+                    let result = shader::checked(device, || crate::renderer::culling_pipeline(&self.context)).await;
+                    self.send(Message::Culling(result));
+                }
+                #[cfg(not(feature = "render-gpu-culling"))]
+                self.send(Message::Culling(Err("render-gpu-culling disabled".to_owned())));
             }
             Job::Persist => self.context.cache.save(),
         }

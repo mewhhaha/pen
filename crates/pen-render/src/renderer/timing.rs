@@ -13,6 +13,7 @@ use super::readback::Readbacks;
 use crate::GpuTimes;
 
 /// Which part of a frame a timed pass belongs to.
+#[cfg_attr(not(all(feature = "render-volume", feature = "render-subsurface")), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Span {
     /// The sun's shadow maps.

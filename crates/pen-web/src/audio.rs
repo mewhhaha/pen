@@ -359,6 +359,7 @@ pub struct Audio {
     reverb_return: Option<GainNode>,
     reverb_room: (f32, f32),
     reverb_acoustics: Option<pen_runtime::reverb::AcousticProfile>,
+    reverb_initialized: bool,
     buses: Vec<BusNodes>,
     clips: Rc<RefCell<HashMap<u32, Loaded>>>,
     loading: HashSet<u32>,
@@ -390,6 +391,7 @@ impl Audio {
             reverb_return: None,
             reverb_room: (0.0, 0.0),
             reverb_acoustics: None,
+            reverb_initialized: false,
             buses: Vec::new(),
             clips: Rc::new(RefCell::new(HashMap::new())),
             loading: HashSet::new(),
@@ -442,13 +444,8 @@ impl Audio {
         convolver.set_normalize(false);
         let convolver_alt = context.create_convolver().map_err(error)?;
         convolver_alt.set_normalize(false);
-        let channels = pen_runtime::reverb::impulse_response(f64::from(context.sample_rate()));
-        let buffer =
-            context.create_buffer(2, u32::try_from(channels[0].len())?, context.sample_rate()).map_err(error)?;
-        buffer.copy_to_channel(&channels[0], 0).map_err(error)?;
-        buffer.copy_to_channel(&channels[1], 1).map_err(error)?;
-        convolver.set_buffer(Some(&buffer));
-        convolver_alt.set_buffer(Some(&buffer));
+        // Defer 192k-sample stereo reverb impulse synthesis until a frame actually
+        // uses reverb or room acoustics, avoiding synchronous startup work.
         let send_a = gain(&context, 1.0)?;
         let send_b = gain(&context, 0.0)?;
         let ret_a = gain(&context, 1.0)?;
@@ -822,6 +819,26 @@ impl Audio {
             if zone.decay.is_finite() { zone.decay.max(0.0) } else { 0.0 },
             if zone.damping.is_finite() { zone.damping.clamp(0.0, 1.0) } else { 0.0 },
         );
+        // Lazily populate default impulse buffer on first non-zero reverb send.
+        if !self.reverb_initialized {
+            let needs_reverb = frame.buses.iter().any(|b| b.reverb > 0.0)
+                || frame.sounds.iter().any(|s| s.reverb > 0.0)
+                || frame.voices.iter().any(|v| v.reverb > 0.0)
+                || frame.synths.iter().any(|s| s.reverb > 0.0)
+                || acoustics.is_some()
+                || room != (0.0, 0.0);
+            if needs_reverb && let (Some(conv_a), Some(conv_b)) = (&self.reverb_convolver, &self.reverb_convolver_alt) {
+                let channels = pen_runtime::reverb::impulse_response(f64::from(context.sample_rate()));
+                let buffer = context
+                    .create_buffer(2, u32::try_from(channels[0].len())?, context.sample_rate())
+                    .map_err(error)?;
+                buffer.copy_to_channel(&channels[0], 0).map_err(error)?;
+                buffer.copy_to_channel(&channels[1], 1).map_err(error)?;
+                conv_a.set_buffer(Some(&buffer));
+                conv_b.set_buffer(Some(&buffer));
+                self.reverb_initialized = true;
+            }
+        }
         // Crossfade between two persistent ConvolverNodes with room/acoustics hysteresis so zone
         // transitions and ray-traced acoustic sweeps never truncate active convolution tails.
         let room_changed = match (acoustics, self.reverb_acoustics.as_ref()) {

@@ -313,7 +313,7 @@ impl GpuParticleSystem {
         });
         let sim_mod = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("gpu_particles_sim"),
-            source: wgpu::ShaderSource::Wgsl(GPU_PARTICLES_SIM_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(crate::deferred_wgsl!("gpu_particles_sim.wgsl").into()),
         });
         let sim_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("gpu_particles_sim_pl"),
@@ -380,7 +380,7 @@ impl GpuParticleSystem {
         });
         let draw_mod = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("gpu_particles_draw"),
-            source: wgpu::ShaderSource::Wgsl(GPU_PARTICLES_DRAW_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(crate::deferred_wgsl!("gpu_particles_draw.wgsl").into()),
         });
         let draw_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("gpu_particles_draw_pl"),

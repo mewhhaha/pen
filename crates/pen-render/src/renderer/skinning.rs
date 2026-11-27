@@ -306,6 +306,7 @@ impl Skinning {
     }
 
     /// Byte offset of `(target, mesh_slot)` in the previous frame's joint buffer, if any.
+    #[cfg_attr(not(feature = "render-taa"), allow(dead_code))]
     pub fn previous_offset(&self, target: usize, mesh_slot: usize) -> Option<u32> {
         let prev = &self.slots[1 - self.current];
         if prev.buffer.is_none() || prev.largest == 0 {

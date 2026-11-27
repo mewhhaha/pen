@@ -4,8 +4,6 @@
 //! into dual offscreen targets (`accum: Rgba16Float`, `reveal: R8Unorm`) so
 //! final pixels are strictly independent of draw submission order.
 
-const OIT_COMPOSITE_WGSL: &str = crate::wgsl!("oit_composite.wgsl");
-
 /// WGSL helper snippet for translucent fragment shaders targeting WBOIT.
 pub const OIT_SHADER_HELPERS_WGSL: &str = r#"
 struct OitOutput {
@@ -318,7 +316,7 @@ impl OitPass {
     pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat, cache: Option<&wgpu::PipelineCache>) -> Self {
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("oit_composite"),
-            source: wgpu::ShaderSource::Wgsl(OIT_COMPOSITE_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(crate::deferred_wgsl!("oit_composite.wgsl").into()),
         });
         let tex_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
             binding,
@@ -447,7 +445,10 @@ impl OitPass {
                     view: reveal_resolved,
                     depth_slice: None,
                     resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::WHITE), store: wgpu::StoreOp::Store },
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::WHITE),
+                        store: wgpu::StoreOp::Store,
+                    },
                 }),
             ],
         }
@@ -641,7 +642,11 @@ mod tests {
                 target.as_image_copy(),
                 wgpu::TexelCopyBufferInfo {
                     buffer: &rb,
-                    layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(256), rows_per_image: Some(8) },
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(256),
+                        rows_per_image: Some(8),
+                    },
                 },
                 wgpu::Extent3d { width: 8, height: 8, depth_or_array_layers: 1 },
             );

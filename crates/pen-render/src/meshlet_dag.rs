@@ -1071,7 +1071,7 @@ impl MeshletDagCuller {
         let layout = Self::bind_group_layout(device, false);
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("meshlet_dag_cut.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(MESHLET_DAG_CUT_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(crate::deferred_wgsl!("meshlet_dag_cut.wgsl").into()),
         });
         let pipeline = Self::make_pipeline(device, &shader, &layout, "cull_meshlet_dag");
         let dummy_hiz = device

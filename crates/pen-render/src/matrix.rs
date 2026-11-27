@@ -1,3 +1,4 @@
+#![cfg_attr(not(feature = "render-3d"), allow(dead_code))]
 // Column-major 4x4 matrices, as WGSL and the render packet lay them out.
 // The arithmetic is in f64, and only the results are narrowed to f32 for the
 // GPU.

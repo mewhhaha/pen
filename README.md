@@ -1,5 +1,7 @@
 # Pen
 
+<img src="docs/art/squid-pens/loop.svg" width="160" alt="Loop, Pen’s magenta squid fountain pen" />
+
 Pen runs WebAssembly games natively and in the browser. It provides the host,
 renderer, audio, services, compiler plugins and development tools. Game logic
 lives in applications such as [Gdev](../gdev/README.md); reusable game systems

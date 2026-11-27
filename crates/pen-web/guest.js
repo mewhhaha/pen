@@ -1,8 +1,8 @@
 // The only JS runtime seam: a guest's Wasm stack waits at each host call.
-// Rust owns game requests, validation (the blot:abi manifest included),
+// Rust owns game requests, validation (the squid:abi manifest included),
 // commits and every platform operation. `ownership` is the manifest's ABI 3
-// flag: main runs between blot:ownership_enter and blot:ownership_leave, and
-// closing tears the instance down (blot:ownership_leave(2)). ABI 8 modules
+// flag: main runs between squid:ownership_enter and squid:ownership_leave, and
+// closing tears the instance down (squid:ownership_leave(2)). ABI 8 modules
 // can declare a separate hook for releasing each invocation on return or failure.
 //
 // With WebAssembly JS Promise Integration (JSPI) the guest runs on the page's
@@ -22,7 +22,7 @@ export async function openKernelPoolLazy(source, name, config) {
 }
 
 function hasTasksSection(module) {
-  return WebAssembly.Module.customSections(module, 'blot:tasks').length !== 0;
+  return WebAssembly.Module.customSections(module, 'squid:tasks').length !== 0;
 }
 export async function openGuest(bytes, ownership) {
   if (WebAssembly.Suspending && WebAssembly.promising) {
@@ -43,9 +43,9 @@ function isSimpleGuest(module) {
 }
 
 function guestArena(exports, simple) {
-  const memory = simple ? (exports.memory ?? exports['blot:memory']) : exports['blot:memory'];
-  const allocate = simple ? (exports['pen:allocate'] ?? exports['blot:allocate']) : exports['blot:allocate'];
-  const reset = simple ? (exports['pen:reset'] ?? exports['blot:reset'] ?? null) : exports['blot:reset'];
+  const memory = simple ? (exports.memory ?? exports['squid:memory']) : exports['squid:memory'];
+  const allocate = simple ? (exports['pen:allocate'] ?? exports['squid:allocate']) : exports['squid:allocate'];
+  const reset = simple ? (exports['pen:reset'] ?? exports['squid:reset'] ?? null) : exports['squid:reset'];
   if (!(memory instanceof WebAssembly.Memory) || typeof allocate !== 'function' || (!simple && typeof reset !== 'function')) {
     throw new Error('missing guest array arena');
   }
@@ -58,7 +58,7 @@ async function instantiate(module, ownership, exchange, simpleExchange) {
   const simple = isSimpleGuest(module);
   const imports = simple
     ? { 'pen:guest/1': { exchange: simpleExchange } }
-    : { 'blot:host/1': { call_array_f32_array_f32: exchange } };
+    : { 'squid:host/1': { call_array_f32_array_f32: exchange } };
   const instance = await WebAssembly.instantiate(module, imports);
   const exports = instance.exports;
   const arena = guestArena(exports, simple);
@@ -66,12 +66,12 @@ async function instantiate(module, ownership, exchange, simpleExchange) {
     if (typeof exports['pen:main'] !== 'function') throw new Error('missing guest pen:main export');
     return { exports, arena, simple };
   }
-  const enter = exports['blot:ownership_enter'];
-  const leave = exports['blot:ownership_leave'];
+  const enter = exports['squid:ownership_enter'];
+  const leave = exports['squid:ownership_leave'];
   if (ownership && (typeof enter !== 'function' || enter.length !== 0
     || typeof leave !== 'function' || leave.length !== 1)) throw new Error('missing guest ownership hooks');
-  const invocation = WebAssembly.Module.customSections(module, 'blot:invocation');
-  const finish = exports['blot:finish_invocation'];
+  const invocation = WebAssembly.Module.customSections(module, 'squid:invocation');
+  const finish = exports['squid:finish_invocation'];
   if (invocation.length !== 0) {
     const version = new Uint8Array(invocation[0]);
     if (invocation.length !== 1 || version.length !== 1 || version[0] !== 1
@@ -84,8 +84,8 @@ async function instantiate(module, ownership, exchange, simpleExchange) {
 
 function finishInvocation(exports, arena, ownership, outcome) {
   try {
-    if (ownership) exports['blot:ownership_leave'](outcome);
-    exports['blot:finish_invocation']?.();
+    if (ownership) exports['squid:ownership_leave'](outcome);
+    exports['squid:finish_invocation']?.();
   } finally {
     arena.reset?.(0);
   }
@@ -157,7 +157,7 @@ async function openSuspending(module, ownership) {
   const simpleExchange = new WebAssembly.Suspending(async pointer => exchangePacket(pointer));
   const { exports, arena, simple } = await instantiate(module, ownership, exchange, simpleExchange);
   guest = arrays(arena);
-  if (ownership) exports['blot:ownership_enter']();
+  if (ownership) exports['squid:ownership_enter']();
   arena.reset?.(0);
   const done = runSuspending(exports, arena, simple, ownership, capability, () => stopping);
   void done.catch(error => { failure = error; response.reject(error); });
@@ -176,10 +176,10 @@ async function openSuspending(module, ownership) {
       stopping = true;
       if (!failure) incoming.resolve(new Float32Array([0, 0]));
       try { await done; } catch { /* Rust reports the failed request. */ }
-      // Idle teardown, as Blot's adapter disposes of an instance: the module
+      // Idle teardown, as Squid's adapter disposes of an instance: the module
       // releases its roots now rather than whenever the instance is collected.
       if (ownership) {
-        exports['blot:ownership_leave'](2);
+        exports['squid:ownership_leave'](2);
         arena.reset?.(0);
       }
     }
@@ -321,7 +321,7 @@ function serveWorker() {
       } else {
         ({ exports, arena, simple } = await instantiate(module, ownership, exchange, simpleExchange));
         guest = arrays(arena);
-        if (ownership) exports['blot:ownership_enter']();
+        if (ownership) exports['squid:ownership_enter']();
         arena.reset?.(0);
         let invocationOutcome = 1;
         try {
@@ -352,10 +352,10 @@ function serveWorker() {
       postMessage({ closed: outcome });
       return;
     }
-    // Idle teardown, as Blot's adapter disposes of an instance: the module
+    // Idle teardown, as Squid's adapter disposes of an instance: the module
     // releases its roots now rather than whenever the instance is collected.
     if (ownership) {
-      exports['blot:ownership_leave'](2);
+      exports['squid:ownership_leave'](2);
       arena.reset?.(0);
     }
     postMessage({ closed: outcome });

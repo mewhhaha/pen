@@ -24,7 +24,7 @@ env:
 jobs:
   bench:
     name: Guest time against the base commit
-    if: ${{ vars.GDEV_REPOSITORY != '' && vars.BLOT2_REPOSITORY != '' && vars.GDEV_REF != '' && vars.BLOT2_REF != '' && vars.INK_REPOSITORY != '' && vars.INK_REF != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    if: ${{ vars.GDEV_REPOSITORY != '' && vars.SQUID_REPOSITORY != '' && vars.GDEV_REF != '' && vars.SQUID_REF != '' && vars.INK_REPOSITORY != '' && vars.INK_REF != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ubuntu-24.04
     defaults:
       run:
@@ -43,10 +43,10 @@ jobs:
           path: gdev
       - uses: actions/checkout@v7
         with:
-          repository: ${{ vars.BLOT2_REPOSITORY }}
-          ref: ${{ vars.BLOT2_REF }}
+          repository: ${{ vars.SQUID_REPOSITORY }}
+          ref: ${{ vars.SQUID_REF }}
           token: ${{ secrets.CHECKOUTS_TOKEN }}
-          path: blot2
+          path: squid-lang
       - uses: actions/checkout@v7
         with:
           repository: ${{ vars.INK_REPOSITORY }}
@@ -67,10 +67,10 @@ jobs:
           workspaces: pen
       - name: Native compiler and component
         run: |
-          cd ../blot2
+          cd ../squid-lang
           sh compiler-goose/build.sh --release
           mkdir -p generated/compiler
-          gzip -c compiler-goose/build/blotc-goose > generated/compiler/blotc.gz
+          gzip -c compiler-goose/build/squidc-goose > generated/compiler/squidc.gz
           cd ../pen
           just plugins
       - name: The base commit

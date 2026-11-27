@@ -61,7 +61,7 @@ codec's new `version` keeps saves, quicksaves and a reload's running state. A ch
 
 ## What pen does
 
-The adapter understands Ink's `persist.blot` (gdev's README, "Saved state"): a
+The adapter understands Ink's `persist.sq` (gdev's README, "Saved state"): a
 state is `magic, schema, section_count`, then per saved type `key, version,
 width, length` and its lanes. A resource's lanes are one value; a snapshotted
 resource's `current_count`, the current value and the previous; a component's
@@ -93,7 +93,7 @@ build` and `pen build --web` ship it with the assets.
   build saving `points` (version 1) to one saving `points, bonus` (version 2)
   with no migration: declared, the points survive and the bonus takes its
   default, and the reload says so; undeclared, the section resets.
-- gdev, compiled by blot2 (a scratch copy, not the checkout): a quicksave of
+- gdev, compiled by squid-lang (a scratch copy, not the checkout): a quicksave of
   the current build, then achievements given a `streak` field as version 2
   without a `migrate`. Loading the old save reset the section; with the
   declaration above it says `migrated section 119 from version 1 to 2 as

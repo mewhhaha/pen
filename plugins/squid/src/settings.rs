@@ -1,0 +1,848 @@
+//! A program's settings for the plugin (the crate's documentation has their
+//! schema), and the paths in them, resolved against the program's root.
+use serde_json::Value;
+
+/// The name a checkout grants the compiler under, unless `program` says
+/// otherwise.
+pub const PROGRAM: &str = "squidc";
+
+/// How much the compiler optimizes what it builds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CodegenTier {
+    Optimized,
+    /// Skips the optional scalar and vector passes, for quicker builds.
+    Development,
+}
+
+impl CodegenTier {
+    /// Its name in the protocol and in the settings.
+    pub fn name(self) -> &'static str {
+        match self {
+            CodegenTier::Optimized => "optimized",
+            CodegenTier::Development => "development",
+        }
+    }
+}
+
+/// A program's settings, with every path absolute.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Settings {
+    /// The name the compiler is granted under.
+    pub program: String,
+    /// Each import prefix (ending in `/`) and the directory behind it.
+    pub imports: Vec<(String, String)>,
+    /// The directory behind `std/`; none without one.
+    pub std: Option<String>,
+    /// The module every module sees; none without one.
+    pub prelude: Option<String>,
+    /// A `.sqdep` bundle of `squid dependencies`.
+    pub dependencies: Option<String>,
+    /// The compiler's own default (optimized) when none.
+    pub codegen_tier: Option<CodegenTier>,
+    /// Semantic workers (1 to 16); the compiler works serially when none.
+    pub semantic_workers: Option<u32>,
+    /// Explicit inference/evidence work limit; absent uses the compiler default.
+    pub inference_budget: Option<u32>,
+    /// Explicit scoped-storage budgets; absent fields use compiler defaults.
+    pub storage: Option<Value>,
+    /// The only compiler identity (64 lowercase hex digits) to accept.
+    pub expected_identity: Option<String>,
+    /// Native readers owned by squidc. Paths are resolved against the project.
+    pub native_assets: Option<Value>,
+    /// Stage-0 Squid virtual module generator rules.
+    pub generators: Vec<GeneratorRule>,
+    /// Export first-class test declarations and their metadata.
+    pub test_mode: bool,
+    /// Test layout, independent of a game entry.
+    pub tests: TestSettings,
+}
+
+/// How raw asset bytes are handed to a Stage-0 Squid generator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum GeneratorInputMode {
+    /// Raw byte values (`#[U32]`, one byte per element).
+    Bytes,
+    /// Strict UTF-8 decoded to Unicode scalar values (`Text`).
+    Text,
+}
+
+impl GeneratorInputMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GeneratorInputMode::Bytes => "bytes",
+            GeneratorInputMode::Text => "text",
+        }
+    }
+
+    pub fn field_name(self) -> &'static str {
+        self.as_str()
+    }
+}
+
+/// One Stage-0 Squid generator rule from `compiler.settings.generators`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GeneratorRule {
+    /// Explicit virtual module path (absolute, inside checkout root).
+    pub module: Option<String>,
+    /// Explicit input file path (absolute, inside checkout root).
+    pub input: Option<String>,
+    /// Single-star glob `(directory, suffix)` such as `("/root/src/assets", ".wgsl")`.
+    pub match_glob: Option<(String, String)>,
+    /// Stage-0 `.sq` generator entry path (absolute).
+    pub generator: String,
+    /// Generator `io` function name (defaults to `"generate"`).
+    pub export_name: String,
+    /// Raw bytes (`Bytes`, default) or strict UTF-8 scalars (`Text`).
+    pub input_mode: GeneratorInputMode,
+}
+
+/// Optional test layout. Paths are absolute, resolved against the checkout.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TestSettings {
+    /// A shared virtual entry: relative imports resolve beside this file.
+    pub entry: Option<String>,
+    /// The default modules; explicit CLI files override this list.
+    pub files: Option<Vec<String>>,
+}
+
+impl TestSettings {
+    fn parse(value: Option<&Value>, root: &str) -> Result<Self, String> {
+        let fields = match value {
+            None | Some(Value::Null) => return Ok(Self::default()),
+            Some(Value::Object(fields)) => fields,
+            _ => return Err("the settings' `tests` is not an object".into()),
+        };
+        if let Some(unknown) = fields.keys().find(|key| !["entry", "files"].contains(&key.as_str())) {
+            return Err(format!("tests has no `{unknown}` (it has entry, files)"));
+        }
+        let path = |value: &Value, name: &str| -> Result<String, String> {
+            let path = value.as_str().ok_or_else(|| format!("{name} must be a path"))?;
+            Ok(resolve(root, checked_path(path, name)?))
+        };
+        let entry = fields.get("entry").map(|value| path(value, "tests.entry")).transpose()?;
+        let files = fields
+            .get("files")
+            .map(|value| {
+                value
+                    .as_array()
+                    .ok_or_else(|| "tests.files must be an array of paths".to_owned())?
+                    .iter()
+                    .map(|value| path(value, "tests.files"))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?;
+        Ok(Self { entry, files })
+    }
+}
+
+/// Keep the public object's spelling and optional fields intact: squidc owns
+/// defaults and includes the resolved budget values in its retained identity.
+fn storage(value: Option<&Value>) -> Result<Option<Value>, String> {
+    let fields = match value {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::Object(fields)) => fields,
+        _ => return Err("the settings' `storage` is not an object".into()),
+    };
+    const BYTES: [&str; 4] = ["temporaryBytes", "growerBytes", "persistentBytes", "transportBytes"];
+    for (key, value) in fields {
+        if !BYTES.contains(&key.as_str()) && key != "ownerCapacity" {
+            return Err(format!(
+                "storage has no `{key}` (it has temporaryBytes, growerBytes, persistentBytes, transportBytes, ownerCapacity)"
+            ));
+        }
+        let number = value
+            .as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+            .filter(|n| *n > 0)
+            .ok_or_else(|| format!("storage.{key} is not a positive U32"))?;
+        if BYTES.contains(&key.as_str()) && number % 16 != 0 {
+            return Err(format!("storage.{key} is not aligned to 16 bytes"));
+        }
+    }
+    Ok(value.cloned())
+}
+
+impl Settings {
+    /// Reads `json` (a program's settings, "{}" for none), resolving the
+    /// relative paths in it against `root`.
+    pub fn parse(json: &str, root: &str) -> Result<Settings, String> {
+        let value: Value = serde_json::from_str(json).map_err(|error| format!("the settings are not JSON: {error}"))?;
+        let Value::Object(fields) = value else {
+            return Err("the settings are not a JSON object".into());
+        };
+        const KNOWN: [&str; 14] = [
+            "program",
+            "imports",
+            "std",
+            "prelude",
+            "dependencies",
+            "codegenTier",
+            "semanticWorkers",
+            "inferenceBudget",
+            "storage",
+            "expectedIdentity",
+            "nativeAssets",
+            "generators",
+            "testMode",
+            "tests",
+        ];
+        if let Some(unknown) = fields.keys().find(|key| !KNOWN.contains(&key.as_str())) {
+            return Err(format!("the settings have no `{unknown}` (they have {})", KNOWN.join(", ")));
+        }
+        let path = |name: &str| -> Result<Option<String>, String> {
+            match fields.get(name) {
+                None | Some(Value::Null) => Ok(None),
+                Some(Value::String(path)) => checked_path(path, name).map(|path| Some(resolve(root, path))),
+                Some(_) => Err(format!("the settings' `{name}` is not a path")),
+            }
+        };
+        let program = match fields.get("program") {
+            None => PROGRAM.to_string(),
+            Some(Value::String(name)) if !name.is_empty() => name.clone(),
+            Some(_) => return Err("the settings' `program` is not a name".into()),
+        };
+        let std = path("std")?;
+        // As squid-lang's `createCompiler` has it: the standard library's prelude
+        // unless the settings name another, or none (null).
+        let prelude = match fields.get("prelude") {
+            None => std.as_deref().map(|std| resolve(std, "prelude.sq")),
+            Some(_) => path("prelude")?,
+        };
+        let codegen_tier = match fields.get("codegenTier") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(tier)) if tier == "optimized" => Some(CodegenTier::Optimized),
+            Some(Value::String(tier)) if tier == "development" => Some(CodegenTier::Development),
+            Some(_) => return Err("the settings' `codegenTier` is not \"optimized\" or \"development\"".into()),
+        };
+        let semantic_workers = match fields.get("semanticWorkers") {
+            None | Some(Value::Null) => None,
+            Some(workers) => match workers.as_u64() {
+                Some(workers @ 1..=16) => Some(workers as u32),
+                _ => return Err("the settings' `semanticWorkers` is not a whole number from 1 to 16".into()),
+            },
+        };
+        let inference_budget = match fields.get("inferenceBudget") {
+            None | Some(Value::Null) => None,
+            Some(value) => match value.as_u64().and_then(|n| u32::try_from(n).ok()) {
+                Some(n) if n > 0 => Some(n),
+                _ => return Err("the settings' `inferenceBudget` is not a positive U32".into()),
+            },
+        };
+        let expected_identity = match fields.get("expectedIdentity") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(identity)) if is_identity(identity) => Some(identity.clone()),
+            Some(_) => return Err("the settings' `expectedIdentity` is not 64 lowercase hex digits".into()),
+        };
+        let test_mode = match fields.get("testMode") {
+            None => false,
+            Some(Value::Bool(enabled)) => *enabled,
+            Some(_) => return Err("the settings' `testMode` is not a boolean".into()),
+        };
+        let mut resolved_imports = imports(fields.get("imports"), root)?;
+        resolved_imports.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(Settings {
+            program,
+            imports: resolved_imports,
+            std,
+            prelude,
+            dependencies: path("dependencies")?,
+            codegen_tier,
+            semantic_workers,
+            inference_budget,
+            storage: storage(fields.get("storage"))?,
+            expected_identity,
+            native_assets: native_assets(fields.get("nativeAssets"), root)?,
+            generators: generators(fields.get("generators"), root)?,
+            test_mode,
+            tests: TestSettings::parse(fields.get("tests"), root)?,
+        })
+    }
+
+    /// Serializes a copy of these settings suitable for compiling a Stage-0
+    /// generator module (keeps `program`, `imports`, `std`, `prelude`,
+    /// `dependencies`, `codegenTier`, `semanticWorkers`, `inferenceBudget`,
+    /// `storage`, `expectedIdentity`; enables `testMode` so Stage-0 `@panic`
+    /// and array bounds traps carry full `squid:traps` v1 source spans; omits
+    /// `nativeAssets`, `generators`, and `tests`).
+    pub fn for_stage0_json(&self) -> String {
+        let mut map = serde_json::Map::new();
+        map.insert("program".into(), Value::String(self.program.clone()));
+        map.insert("testMode".into(), Value::Bool(true));
+        if !self.imports.is_empty() {
+            let mut imports = serde_json::Map::new();
+            for (prefix, dir) in &self.imports {
+                imports.insert(prefix.clone(), Value::String(dir.clone()));
+            }
+            map.insert("imports".into(), Value::Object(imports));
+        }
+        if let Some(std) = &self.std {
+            map.insert("std".into(), Value::String(std.clone()));
+        }
+        match &self.prelude {
+            Some(prelude) => {
+                map.insert("prelude".into(), Value::String(prelude.clone()));
+            }
+            None => {
+                map.insert("prelude".into(), Value::Null);
+            }
+        }
+        if let Some(dependencies) = &self.dependencies {
+            map.insert("dependencies".into(), Value::String(dependencies.clone()));
+        }
+        if let Some(tier) = self.codegen_tier {
+            map.insert("codegenTier".into(), Value::String(tier.name().to_owned()));
+        }
+        if let Some(workers) = self.semantic_workers {
+            map.insert("semanticWorkers".into(), Value::from(workers));
+        }
+        if let Some(budget) = self.inference_budget {
+            map.insert("inferenceBudget".into(), Value::from(budget));
+        }
+        if let Some(storage) = &self.storage {
+            map.insert("storage".into(), storage.clone());
+        }
+        if let Some(identity) = &self.expected_identity {
+            map.insert("expectedIdentity".into(), Value::String(identity.clone()));
+        }
+        Value::Object(map).to_string()
+    }
+
+    /// The compiler's arguments.
+    pub fn args(&self) -> Vec<String> {
+        let mut args = vec!["serve-project".to_string()];
+        if let Some(workers) = self.semantic_workers {
+            args.extend(["--semantic-workers".to_string(), workers.to_string()]);
+        }
+        if let Some(budget) = self.inference_budget {
+            args.extend(["--inference-budget".to_string(), budget.to_string()]);
+        }
+        if self.test_mode {
+            args.push("--test".to_string());
+        }
+        args
+    }
+
+    /// The paths whose changes need a new build of the program at `entry`:
+    /// its directory, every import's directory, the standard library's and
+    /// the prelude, each once.
+    pub fn watched(&self, entry: &str) -> Vec<String> {
+        let mut watched: Vec<String> = Vec::new();
+        let paths = std::iter::once(parent(entry))
+            .chain(self.imports.iter().map(|(_, root)| root.clone()))
+            .chain(self.std.clone())
+            .chain(self.prelude.clone());
+        for path in paths {
+            if !watched.contains(&path) {
+                watched.push(path);
+            }
+        }
+        if let Some(assets) = &self.native_assets {
+            for root in assets["roots"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+                let root = root.to_owned();
+                if !watched.contains(&root) {
+                    watched.push(root);
+                }
+            }
+            for import in assets["imports"].as_array().into_iter().flatten() {
+                if let Some(path) = import["path"].as_str() {
+                    let path = path.to_owned();
+                    if !watched.contains(&path) {
+                        watched.push(path);
+                    }
+                }
+            }
+        }
+        for rule in &self.generators {
+            for path in std::iter::once(&rule.generator)
+                .chain(rule.input.iter())
+                .chain(rule.match_glob.iter().map(|(dir, _)| dir))
+            {
+                if !watched.contains(path) {
+                    watched.push(path.clone());
+                }
+            }
+        }
+        watched
+    }
+}
+
+const MAX_GENERATOR_RULES: usize = 4096;
+
+const RESERVED_SQUID_IDENTIFIERS: [&str; 35] = [
+    "const", "let", "type", "data", "effect", "is", "func", "do", "use", "return", "break", "for", "ever", "continue",
+    "in", "case", "of", "if", "then", "else", "as", "import", "self", "where", "and", "or", "true", "false", "_",
+    "not", "own", "private", "export", "fork", "with",
+];
+
+fn is_valid_export_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else { return false };
+    if !(first.is_ascii_lowercase() || first == '_') {
+        return false;
+    }
+    chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_') && !RESERVED_SQUID_IDENTIFIERS.contains(&name)
+}
+
+fn check_relative_inside_root<'a>(path: &'a str, label: &str) -> Result<&'a str, String> {
+    if path.trim().is_empty()
+        || path.contains('\0')
+        || path.contains('\r')
+        || path.contains('\n')
+        || path.contains('\\')
+        || is_absolute(path)
+    {
+        return Err(format!("{label} must be a relative path inside the project"));
+    }
+    let mut depth: i32 = 0;
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => depth -= 1,
+            _ => depth += 1,
+        }
+        if depth < 0 {
+            return Err(format!("{label} must stay inside the project"));
+        }
+    }
+    if depth == 0 {
+        return Err(format!("{label} must name a path inside the project"));
+    }
+    Ok(path)
+}
+
+fn check_plain_relative<'a>(path: &'a str, label: &str) -> Result<&'a str, String> {
+    let path = check_relative_inside_root(path, label)?;
+    if path.contains(['*', '?', '[', ']']) {
+        return Err(format!("{label} must name one path"));
+    }
+    Ok(path)
+}
+
+fn generators(value: Option<&Value>, root: &str) -> Result<Vec<GeneratorRule>, String> {
+    let items = match value {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(Value::Array(items)) if items.len() <= MAX_GENERATOR_RULES => items,
+        Some(Value::Array(_)) => {
+            return Err(format!("generators must be an array of up to {MAX_GENERATOR_RULES} generator rules"));
+        }
+        Some(_) => return Err("the settings' `generators` is not an array".into()),
+    };
+    const FIELDS: [&str; 7] = ["module", "input", "match", "generator", "exportName", "inputMode", "reference"];
+    let mut out = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        let label = format!("generators[{index}]");
+        let Value::Object(fields) = item else {
+            return Err(format!("{label} must be an object"));
+        };
+        if let Some(unknown) = fields.keys().find(|key| !FIELDS.contains(&key.as_str())) {
+            return Err(format!("{label}: unknown field `{unknown}`"));
+        }
+        if fields.get("reference").is_some_and(|v| !v.is_null()) {
+            return Err(format!(
+                "{label}.reference is not supported in Pen; Pen references game assets through its asset catalog"
+            ));
+        }
+        let generator_raw = fields
+            .get("generator")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("{label}.generator must be a path"))?;
+        if generator_raw.trim().is_empty()
+            || generator_raw.contains('\0')
+            || generator_raw.contains('\r')
+            || generator_raw.contains('\n')
+            || generator_raw.contains('\\')
+            || generator_raw.contains(['*', '?', '[', ']'])
+            || !generator_raw.ends_with(".sq")
+        {
+            return Err(format!("{label}.generator must be a .sq path"));
+        }
+        let generator = resolve(root, generator_raw);
+        let export_name = match fields.get("exportName") {
+            None | Some(Value::Null) => "generate".to_owned(),
+            Some(Value::String(name)) if is_valid_export_name(name) => name.clone(),
+            Some(_) => return Err(format!("{label}.exportName must be a Squid function name")),
+        };
+        let input_mode = match fields.get("inputMode") {
+            None | Some(Value::Null) => GeneratorInputMode::Bytes,
+            Some(Value::String(mode)) if mode == "bytes" => GeneratorInputMode::Bytes,
+            Some(Value::String(mode)) if mode == "text" => GeneratorInputMode::Text,
+            Some(_) => return Err(format!("{label}.inputMode must be \"bytes\" or \"text\"")),
+        };
+        if let Some(match_value) = fields.get("match").filter(|v| !v.is_null()) {
+            if fields.get("module").is_some_and(|v| !v.is_null()) || fields.get("input").is_some_and(|v| !v.is_null()) {
+                return Err(format!("{label} must use either `match` or `module` and `input`"));
+            }
+            let pattern =
+                match_value.as_str().ok_or_else(|| format!("{label}.match must be a pattern like dir/*.ext"))?;
+            let pattern = check_relative_inside_root(pattern, &format!("{label}.match"))?;
+            let (dir_rel, base) = match pattern.rsplit_once('/') {
+                Some((dir, base)) => (dir, base),
+                None => (".", pattern),
+            };
+            if dir_rel.contains(['*', '?', '[', ']']) {
+                return Err(format!("{label}.match must have the form dir/*.ext"));
+            }
+            let Some(suffix) = base.strip_prefix("*.") else {
+                return Err(format!("{label}.match must have the form dir/*.ext"));
+            };
+            if suffix.is_empty() || suffix.contains(['*', '?', '[', ']']) {
+                return Err(format!("{label}.match must have the form dir/*.ext"));
+            }
+            let dir = resolve(root, dir_rel);
+            out.push(GeneratorRule {
+                module: None,
+                input: None,
+                match_glob: Some((dir, format!(".{suffix}"))),
+                generator,
+                export_name,
+                input_mode,
+            });
+        } else {
+            let module = fields
+                .get("module")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("{label}.module must be a relative path inside the project"))?;
+            let module = resolve(root, check_plain_relative(module, &format!("{label}.module"))?);
+            let input = fields
+                .get("input")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("{label}.input must be a relative path inside the project"))?;
+            let input = resolve(root, check_plain_relative(input, &format!("{label}.input"))?);
+            out.push(GeneratorRule {
+                module: Some(module),
+                input: Some(input),
+                match_glob: None,
+                generator,
+                export_name,
+                input_mode,
+            });
+        }
+    }
+    Ok(out)
+}
+
+fn native_assets(value: Option<&Value>, root: &str) -> Result<Option<Value>, String> {
+    let mut assets = match value {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::Object(assets)) => assets.clone(),
+        _ => return Err("nativeAssets must be an object".into()),
+    };
+    if assets.keys().any(|key| !["roots", "imports"].contains(&key.as_str())) {
+        return Err("nativeAssets accepts roots and imports".into());
+    }
+    for field in ["roots", "imports"] {
+        assets.entry(field.to_owned()).or_insert_with(|| Value::Array(Vec::new()));
+    }
+    let roots = assets.get_mut("roots").and_then(Value::as_array_mut).ok_or("nativeAssets.roots must be an array")?;
+    for path in roots {
+        let text = path.as_str().ok_or("nativeAssets root must be a path")?;
+        *path = Value::String(resolve(root, checked_path(text, "nativeAssets.roots")?));
+    }
+    let imports =
+        assets.get_mut("imports").and_then(Value::as_array_mut).ok_or("nativeAssets.imports must be an array")?;
+    for import in imports {
+        let fields = import.as_object_mut().ok_or("nativeAssets import must be an object")?;
+        for field in ["module", "path"] {
+            let path = fields
+                .get(field)
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("nativeAssets import needs {field}"))?;
+            let path = resolve(root, checked_path(path, field)?);
+            fields.insert(field.into(), Value::String(path));
+        }
+    }
+    Ok(Some(Value::Object(assets)))
+}
+
+/// The settings' `imports`: an object of prefixes, each ending in `/`, and
+/// the directories behind them.
+fn imports(value: Option<&Value>, root: &str) -> Result<Vec<(String, String)>, String> {
+    let fields = match value {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(Value::Object(fields)) => fields,
+        Some(_) => return Err("the settings' `imports` is not an object of prefixes and directories".into()),
+    };
+    let import = |(prefix, directory): (&String, &Value)| {
+        if !prefix.ends_with('/') || prefix.contains('\0') {
+            return Err(format!("the import prefix `{prefix}` does not end in /"));
+        }
+        let Value::String(directory) = directory else {
+            return Err(format!("the import `{prefix}` is not a directory"));
+        };
+        Ok((prefix.clone(), resolve(root, checked_path(directory, prefix)?)))
+    };
+    fields.iter().map(import).collect()
+}
+
+/// `path` when it can be one: not empty, and no NUL in it.
+fn checked_path<'a>(path: &'a str, name: &str) -> Result<&'a str, String> {
+    if path.is_empty() || path.contains('\0') {
+        return Err(format!("the settings' `{name}` is not a path"));
+    }
+    Ok(path)
+}
+
+/// Whether `identity` has the form of a compiler identity.
+pub(crate) fn is_identity(identity: &str) -> bool {
+    identity.len() == 64 && identity.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Whether `path` is absolute: from `/`, or a Windows drive's or share's.
+pub(crate) fn is_absolute(path: &str) -> bool {
+    path.starts_with('/') || path.starts_with("\\\\") || drive(path)
+}
+
+/// Whether `path` starts at a Windows drive (`C:\` or `C:/`).
+fn drive(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && matches!(bytes[2], b'/' | b'\\')
+}
+
+/// `path`, absolute: as it is when it is, else from `directory`, without
+/// its `.` and `..` (as Node's `path.resolve` has it). A Windows path (from
+/// a drive or a share) takes either separator. Protocol paths use `/`.
+pub(crate) fn resolve(directory: &str, path: &str) -> String {
+    let joined = if is_absolute(path) {
+        path.to_string()
+    } else {
+        format!("{}/{path}", directory.trim_end_matches(['/', '\\']))
+    };
+    let windows = drive(&joined) || (joined.starts_with("\\\\") || joined.starts_with("//"));
+    let separators: &[char] = if windows { &['/', '\\'] } else { &['/'] };
+    // What `..` never climbs above: `/`, `C:\` or `\\server\share\`.
+    let (prefix, rest) = if drive(&joined) {
+        (joined[..2].to_string() + "/", &joined[3..])
+    } else if windows {
+        let mut parts = joined[2..].splitn(3, separators);
+        let (server, share) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+        (format!("//{server}/{share}/"), parts.next().unwrap_or(""))
+    } else {
+        ("/".to_string(), joined.trim_start_matches('/'))
+    };
+    let mut parts: Vec<&str> = Vec::new();
+    for part in rest.split(separators) {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            part => parts.push(part),
+        }
+    }
+    prefix + &parts.join("/")
+}
+
+/// The directory the file at `path` (absolute) is in; the root's is itself.
+pub(crate) fn parent(path: &str) -> String {
+    resolve(path, "..")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn storage_budgets_preserve_optional_fields_and_reject_invalid_units() {
+        let settings = Settings::parse(
+            r#"{"storage":{"temporaryBytes":2097152,"persistentBytes":262144,"ownerCapacity":4096}}"#,
+            "/project",
+        )
+        .unwrap();
+        assert_eq!(
+            settings.storage,
+            Some(json!({"temporaryBytes":2097152,"persistentBytes":262144,"ownerCapacity":4096}))
+        );
+        assert_eq!(settings.args(), ["serve-project"]);
+        assert_eq!(Settings::parse("{}", "/project").unwrap().storage, None);
+        for value in [
+            r#"{"unknown":16}"#,
+            r#"{"growerBytes":0}"#,
+            r#"{"growerBytes":17}"#,
+            r#"{"transportBytes":4294967296}"#,
+            r#"{"ownerCapacity":0}"#,
+            r#"{"ownerCapacity":1.5}"#,
+            "[]",
+        ] {
+            assert!(Settings::parse(&format!("{{\"storage\":{value}}}"), "/project").is_err(), "{value}");
+        }
+    }
+
+    #[test]
+    fn inference_budget_is_explicit_positive_and_passed_to_the_compiler() {
+        let settings = Settings::parse(r#"{"inferenceBudget":20000000}"#, "/project").unwrap();
+        assert_eq!(settings.args(), ["serve-project", "--inference-budget", "20000000"]);
+        for invalid in ["0", "-1", "1.5", "4294967296", "true"] {
+            assert!(Settings::parse(&format!(r#"{{"inferenceBudget":{invalid}}}"#), "/project").is_err());
+        }
+    }
+
+    #[test]
+    fn resolves_relative_paths_against_the_root() {
+        assert_eq!(resolve("/a/b", "c/d"), "/a/b/c/d");
+        assert_eq!(resolve("/a/b", "../c/./d/"), "/a/c/d");
+        assert_eq!(resolve("/a/b", "/x/../y"), "/y");
+        assert_eq!(resolve("/a", "../../.."), "/");
+        assert_eq!(resolve("C:\\games\\gdev", "../squid-lang/std"), "C:/games/squid-lang/std");
+        assert_eq!(resolve("C:/games/gdev", "packages/"), "C:/games/gdev/packages");
+        assert_eq!(resolve("\\\\host\\share\\gdev", "..\\..\\x"), "//host/share/x");
+        assert_eq!(resolve("/a", "D:\\b"), "D:/b");
+    }
+
+    #[test]
+    fn finds_a_files_directory() {
+        assert_eq!(parent("/a/b/main.sq"), "/a/b");
+        assert_eq!(parent("/main.sq"), "/");
+        assert_eq!(parent("/"), "/");
+        assert_eq!(parent("C:\\gdev\\src\\main.sq"), "C:/gdev/src");
+        assert_eq!(parent("C:\\main.sq"), "C:/");
+    }
+
+    #[test]
+    fn reads_every_setting() {
+        let json = json!({
+            "program": "squidc-dev",
+            "imports": { "gdev/": "packages/", "abs/": "/elsewhere" },
+            "std": "../squid-lang/std",
+            "prelude": "../squid-lang/std/prelude.sq",
+            "dependencies": "deps.sqdep",
+            "codegenTier": "development",
+            "semanticWorkers": 4,
+            "testMode": true,
+            "expectedIdentity": "0123456789abcdef".repeat(4),
+        });
+        let settings = Settings::parse(&json.to_string(), "/src/gdev").unwrap();
+        assert_eq!(settings.program, "squidc-dev");
+        assert_eq!(
+            settings.imports,
+            [("abs/".to_string(), "/elsewhere".to_string()), ("gdev/".to_string(), "/src/gdev/packages".to_string())]
+        );
+        assert_eq!(settings.std.as_deref(), Some("/src/squid-lang/std"));
+        assert_eq!(settings.prelude.as_deref(), Some("/src/squid-lang/std/prelude.sq"));
+        assert_eq!(settings.dependencies.as_deref(), Some("/src/gdev/deps.sqdep"));
+        assert_eq!(settings.codegen_tier, Some(CodegenTier::Development));
+        assert_eq!(settings.args(), ["serve-project", "--semantic-workers", "4", "--test"]);
+        assert_eq!(
+            settings.watched("/src/gdev/src/main.sq"),
+            [
+                "/src/gdev/src",
+                "/elsewhere",
+                "/src/gdev/packages",
+                "/src/squid-lang/std",
+                "/src/squid-lang/std/prelude.sq"
+            ]
+        );
+    }
+
+    #[test]
+    fn defaults_to_no_std_and_the_stds_prelude() {
+        let none = Settings::parse("{}", "/p").unwrap();
+        assert_eq!(none.program, PROGRAM);
+        assert_eq!((&none.std, &none.prelude), (&None, &None));
+        assert_eq!(none.args(), ["serve-project"]);
+        let std = Settings::parse(r#"{"std": "std"}"#, "/p").unwrap();
+        assert_eq!(std.prelude.as_deref(), Some("/p/std/prelude.sq"));
+        let without = Settings::parse(r#"{"std": "std", "prelude": null}"#, "/p").unwrap();
+        assert_eq!(without.prelude, None);
+    }
+
+    #[test]
+    fn refuses_what_it_does_not_know() {
+        for (json, refusal) in [
+            ("[]", "not a JSON object"),
+            (r#"{"stdRoot": "x"}"#, "no `stdRoot`"),
+            (r#"{"std": 3}"#, "`std` is not a path"),
+            (r#"{"std": ""}"#, "`std` is not a path"),
+            (r#"{"imports": {"gdev": "packages"}}"#, "does not end in /"),
+            (r#"{"codegenTier": "fast"}"#, "`codegenTier`"),
+            (r#"{"semanticWorkers": 17}"#, "`semanticWorkers`"),
+            (r#"{"testMode": "true"}"#, "`testMode` is not a boolean"),
+            (r#"{"expectedIdentity": "ABC"}"#, "`expectedIdentity`"),
+            (r#"{"program": ""}"#, "`program`"),
+            (r#"{"tests": []}"#, "`tests` is not an object"),
+            (r#"{"tests": {"entries": []}}"#, "no `entries`"),
+            (r#"{"tests": {"entry": ""}}"#, "`tests.entry` is not a path"),
+            (r#"{"tests": {"files": "tests/a.sq"}}"#, "tests.files must be an array"),
+            (r#"{"tests": {"files": [2]}}"#, "tests.files must be a path"),
+            (r#"{"generators": {}}"#, "`generators` is not an array"),
+            (r#"{"generators": [{"generator": "tools/g.txt", "match": "a/*.wgsl"}]}"#, ".sq path"),
+            (
+                r#"{"generators": [{"generator": "tools/g.sq", "match": "a/*.wgsl", "reference": {"type": "S", "export": "s"}}]}"#,
+                "reference is not supported in Pen",
+            ),
+            (
+                r#"{"generators": [{"generator": "tools/g.sq", "match": "a/*.wgsl", "module": "a.wgsl"}]}"#,
+                "either `match` or `module` and `input`",
+            ),
+            (
+                r#"{"generators": [{"generator": "tools/g.sq", "match": "../outside/*.wgsl"}]}"#,
+                "stay inside the project",
+            ),
+            (r#"{"generators": [{"generator": "tools/g.sq", "match": "a/*/*.wgsl"}]}"#, "dir/*.ext"),
+            (
+                r#"{"generators": [{"generator": "tools/g.sq", "module": "../escape.csv", "input": "data.csv"}]}"#,
+                "stay inside the project",
+            ),
+            (
+                r#"{"generators": [{"generator": "tools/g.sq", "module": "a.csv", "input": "data.csv", "exportName": "Bad"}]}"#,
+                "Squid function name",
+            ),
+            (
+                r#"{"generators": [{"generator": "tools/g.sq", "module": "a.csv", "input": "data.csv", "exportName": "func"}]}"#,
+                "Squid function name",
+            ),
+            (
+                r#"{"generators": [{"generator": "tools/g.sq", "module": "a.csv", "input": "data.csv", "inputMode": "json"}]}"#,
+                "inputMode",
+            ),
+        ] {
+            let error = Settings::parse(json, "/p").unwrap_err();
+            assert!(error.contains(refusal), "{json}: {error}");
+        }
+    }
+
+    #[test]
+    fn parses_stage0_generator_rules_watches_them_and_strips_them_for_stage0() {
+        let json = json!({
+            "std": "../squid-lang/std",
+            "imports": { "ink/": "../ink/lib/" },
+            "testMode": true,
+            "generators": [
+                {
+                    "module": "src/units.csv",
+                    "input": "data/units.csv",
+                    "generator": "tools/csv_gen.sq",
+                    "inputMode": "text"
+                },
+                {
+                    "match": "src/assets/*.wgsl",
+                    "generator": "../squid-lang/examples/generators/wgsl_gen.sq",
+                    "exportName": "reflect_wgsl"
+                }
+            ]
+        });
+        let settings = Settings::parse(&json.to_string(), "/proj").unwrap();
+        assert_eq!(settings.generators.len(), 2);
+        assert_eq!(settings.generators[0].module.as_deref(), Some("/proj/src/units.csv"));
+        assert_eq!(settings.generators[0].input.as_deref(), Some("/proj/data/units.csv"));
+        assert_eq!(settings.generators[0].generator, "/proj/tools/csv_gen.sq");
+        assert_eq!(settings.generators[0].export_name, "generate");
+        assert_eq!(settings.generators[0].input_mode, GeneratorInputMode::Text);
+
+        assert_eq!(settings.generators[1].match_glob, Some(("/proj/src/assets".to_owned(), ".wgsl".to_owned())));
+        assert_eq!(settings.generators[1].generator, "/squid-lang/examples/generators/wgsl_gen.sq");
+        assert_eq!(settings.generators[1].export_name, "reflect_wgsl");
+        assert_eq!(settings.generators[1].input_mode, GeneratorInputMode::Bytes);
+
+        let watched = settings.watched("/proj/src/main.sq");
+        assert!(watched.contains(&"/proj/tools/csv_gen.sq".to_owned()), "{watched:?}");
+        assert!(watched.contains(&"/proj/data/units.csv".to_owned()), "{watched:?}");
+        assert!(watched.contains(&"/proj/src/assets".to_owned()), "{watched:?}");
+
+        let stage0 = Settings::parse(&settings.for_stage0_json(), "/proj").unwrap();
+        assert!(stage0.generators.is_empty());
+        assert!(stage0.test_mode);
+        assert_eq!(stage0.std.as_deref(), Some("/squid-lang/std"));
+        assert_eq!(stage0.imports, [("ink/".to_owned(), "/ink/lib".to_owned())]);
+    }
+}

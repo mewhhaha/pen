@@ -4,10 +4,10 @@
 use crate::program::NativeBackend;
 use crate::snapshot::{self, SavedState};
 use anyhow::Result;
-use blot_host::GuestModule;
 use pen_protocol::{Catalog, RenderFrame};
 pub use pen_runtime::game::{FrameTimings, Host, InvalidFrame, Moment, Quiet, ReloadResult, hash_lanes};
 pub use pen_runtime::program::Unresponsive;
+use squid_host::GuestModule;
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
 use wasmtime::Engine;

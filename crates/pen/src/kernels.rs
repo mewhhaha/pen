@@ -1,4 +1,4 @@
-//! Native Pen `service::KERNEL` (code 15) host service (`blot2/tasks/CONCURRENCY_VNEXT.md` §5.3).
+//! Native Pen `service::KERNEL` (code 15) host service (`squid-lang/tasks/CONCURRENCY_VNEXT.md` §5.3).
 //!
 //! All host→guest kernel traffic travels exclusively on `GameEvent::ServiceAnswer { request: 0 }`
 //! and immediately following contiguous `GameEvent::ServiceData { request: 0 }`:
@@ -17,11 +17,11 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use blot_host::GuestModule;
-use blot_host::kernels::{KernelConfig, KernelError, KernelPool};
 use pen_protocol::boundary::{EVENT_FLOATS, FRAME_HEADER_FLOATS, MAX_EVENTS, MAX_SERVICE_DATA, event_tags, whole};
 use pen_protocol::{ServiceRequest, kernel_op, service, service_status};
 use pen_runtime::abi::{KernelManifest, ValueType, WireSchema, WireSchemaKind};
+use squid_host::GuestModule;
+use squid_host::kernels::{KernelConfig, KernelError, KernelPool};
 
 pub const REPLY_KIND_CTL: f32 = 1.0;
 pub const REPLY_KIND_BATCH_ERR: f32 = 2.0;
@@ -1140,28 +1140,28 @@ mod tests {
     use pen_protocol::{Frame, Viewport};
 
     #[cfg(feature = "compiler")]
-    fn dummy_service_from_blot(source: &str) -> Option<KernelService> {
-        let blot_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../blot2");
-        let blotc = std::env::var_os("BLOTC")
+    fn dummy_service_from_squid(source: &str) -> Option<KernelService> {
+        let squid_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../squid-lang");
+        let squidc = std::env::var_os("SQUIDC")
             .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| blot_root.join("compiler-goose/build/blotc-goose"));
-        let prelude = blot_root.join("std/prelude.blot");
-        if !blotc.is_file() || !prelude.is_file() {
-            crate::fixtures::missing("kernel service Blot test needs blotc-goose and sibling blot2 checkout");
+            .unwrap_or_else(|| squid_root.join("compiler-goose/build/squidc-goose"));
+        let prelude = squid_root.join("std/prelude.sq");
+        if !squidc.is_file() || !prelude.is_file() {
+            crate::fixtures::missing("kernel service Squid test needs squidc-goose and sibling squid-lang checkout");
             return None;
         }
-        let tmp = std::env::temp_dir().join(format!("pen-kernel-svc-test-{}.blot", std::process::id()));
+        let tmp = std::env::temp_dir().join(format!("pen-kernel-svc-test-{}.sq", std::process::id()));
         let wasm_path = tmp.with_extension("wasm");
         std::fs::write(&tmp, source).unwrap();
-        let status = std::process::Command::new(&blotc)
+        let status = std::process::Command::new(&squidc)
             .args(["build", tmp.to_str().unwrap(), wasm_path.to_str().unwrap(), "--prelude", prelude.to_str().unwrap()])
             .status()
             .unwrap();
-        assert!(status.success(), "blotc failed");
+        assert!(status.success(), "squidc failed");
         let wasm = std::fs::read(&wasm_path).unwrap();
         let _ = std::fs::remove_file(&tmp);
         let _ = std::fs::remove_file(&wasm_path);
-        let engine = blot_host::engine().unwrap();
+        let engine = squid_host::engine().unwrap();
         let module = GuestModule::new(&engine, &wasm, None).unwrap();
         Some(KernelService::new_with_workers(engine, module, false, 2))
     }
@@ -1201,7 +1201,7 @@ func prep (ctx: #[F32]) => #[ctx[0], ctx[1]]
 func run_item (ctx: #[F32]) -> (x: F32) => #[x + ctx[0], x + ctx[1]]
 #kernel const scale_ctx: Kernel [#[F32], F32, #[F32]] = { prepare: prep, run: run_item }
 "#;
-        let Some(mut svc) = dummy_service_from_blot(src) else {
+        let Some(mut svc) = dummy_service_from_squid(src) else {
             return;
         };
         let manifest = svc.kernels[0].clone();

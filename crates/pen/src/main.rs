@@ -16,8 +16,6 @@ mod audio;
 mod bake_lightmaps;
 #[cfg(feature = "compiler")]
 mod bench;
-#[cfg(feature = "compiler")]
-mod blot_test;
 mod bugreport;
 mod cli;
 #[cfg(all(test, feature = "compiler"))]
@@ -86,6 +84,8 @@ mod session;
 mod snapshot;
 mod spectate;
 #[cfg(feature = "compiler")]
+mod squid_test;
+#[cfg(feature = "compiler")]
 mod staging;
 mod startup;
 #[cfg(feature = "steam")]
@@ -110,12 +110,12 @@ use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use blot_host::GuestModule;
 use cli::{Args, load_mods, size, usage};
 use pen_protocol::Catalog;
 #[cfg(feature = "compiler")]
 use pen_protocol::Viewport;
 use pen_protocol::boundary::read_catalog;
+use squid_host::GuestModule;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalSize};
 use winit::event::{DeviceEvent, DeviceId, WindowEvent};
@@ -208,7 +208,7 @@ fn load_packaged_workers(
         workers_meta_path.display(),
         workers_cwasm_path.display()
     );
-    let worker_engine = blot_host::bounded_engine(std::time::Duration::from_millis(2))?;
+    let worker_engine = squid_host::bounded_engine(std::time::Duration::from_millis(2))?;
     let meta = std::fs::read(&workers_meta_path).with_context(|| format!("reading {}", workers_meta_path.display()))?;
     let compiled = compiled::decode(
         &std::fs::read(&workers_cwasm_path).with_context(|| format!("reading {}", workers_cwasm_path.display()))?,
@@ -227,42 +227,43 @@ fn check_workers(package_dir: &Path) -> Result<()> {
         "packaged game not found in {} (expected game.meta and game.cwasm)",
         game_dir.display()
     );
-    let game_engine = blot_host::engine()?;
+    let game_engine = squid_host::engine()?;
     let game_module = load_module(&game_engine, &game_dir, false, false)?;
     let (worker_engine, worker_module, has_deadlines) = load_packaged_workers(&game_dir, &game_engine, &game_module)?;
     if worker_module.abi().kernel("double_fixed").is_some() {
-        let cfg = blot_host::kernels::KernelConfig {
+        let cfg = squid_host::kernels::KernelConfig {
             workers: 2,
             deadline: if has_deadlines { Some(std::time::Duration::from_millis(500)) } else { None },
-            ..blot_host::kernels::KernelConfig::default()
+            ..squid_host::kernels::KernelConfig::default()
         };
-        let mut pool = blot_host::kernels::KernelPool::open(&worker_engine, &worker_module, "double_fixed", cfg)?;
+        let mut pool = squid_host::kernels::KernelPool::open(&worker_engine, &worker_module, "double_fixed", cfg)?;
         let out = pool.run_fixed(&[1, 2, 3, 4])?;
         ensure!(out == vec![2, 4, 6, 8], "double_fixed output mismatch: got {out:?}");
         if !has_deadlines {
-            let bounded_cfg = blot_host::kernels::KernelConfig {
+            let bounded_cfg = squid_host::kernels::KernelConfig {
                 workers: 1,
                 deadline: Some(std::time::Duration::from_millis(50)),
-                ..blot_host::kernels::KernelConfig::default()
+                ..squid_host::kernels::KernelConfig::default()
             };
-            let err = blot_host::kernels::KernelPool::open(&worker_engine, &worker_module, "double_fixed", bounded_cfg)
-                .err()
-                .context("ordinary package should reject deadline on non-epoch engine")?;
+            let err =
+                squid_host::kernels::KernelPool::open(&worker_engine, &worker_module, "double_fixed", bounded_cfg)
+                    .err()
+                    .context("ordinary package should reject deadline on non-epoch engine")?;
             ensure!(
-                err == blot_host::kernels::KernelError::DeadlineRequiresBoundedEngine,
+                err == squid_host::kernels::KernelError::DeadlineRequiresBoundedEngine,
                 "expected DeadlineRequiresBoundedEngine, got {err:?}"
             );
         }
     }
     if has_deadlines && worker_module.abi().kernel("spin_forever").is_some() {
-        let spin_cfg = blot_host::kernels::KernelConfig {
+        let spin_cfg = squid_host::kernels::KernelConfig {
             workers: 2,
             deadline: Some(std::time::Duration::from_millis(40)),
-            ..blot_host::kernels::KernelConfig::default()
+            ..squid_host::kernels::KernelConfig::default()
         };
-        let mut pool = blot_host::kernels::KernelPool::open(&worker_engine, &worker_module, "spin_forever", spin_cfg)?;
+        let mut pool = squid_host::kernels::KernelPool::open(&worker_engine, &worker_module, "spin_forever", spin_cfg)?;
         let err = pool.run_fixed(&[1, 2]).expect_err("spin_forever must time out on bounded worker engine");
-        ensure!(err == blot_host::kernels::KernelError::Timeout, "expected Timeout for spin_forever, got {err:?}");
+        ensure!(err == squid_host::kernels::KernelError::Timeout, "expected Timeout for spin_forever, got {err:?}");
     }
     eprintln!("check-workers OK: worker_deadlines={has_deadlines}, kernels={}", worker_module.abi().kernels.len());
     Ok(())
@@ -321,13 +322,13 @@ fn load_module_with(
                 .map(|value| value.parse::<u64>())
                 .transpose()?
                 .unwrap_or(1_000_000);
-            let trace = blot_host::SystemTrace::create(Path::new(&path), limit)?;
+            let trace = squid_host::SystemTrace::create(Path::new(&path), limit)?;
             eprintln!("system trace: {} (up to {limit} events; summary on exit)", Path::new(&path).display());
             return GuestModule::traced(engine, &wasm, cache.as_deref(), trace);
         }
         #[cfg(feature = "compiler")]
-        if measure_systems && blot_host::read_abi(&wasm)?.function("main_trace").is_some() {
-            return GuestModule::traced(engine, &wasm, cache.as_deref(), blot_host::SystemTrace::live());
+        if measure_systems && squid_host::read_abi(&wasm)?.function("main_trace").is_some() {
+            return GuestModule::traced(engine, &wasm, cache.as_deref(), squid_host::SystemTrace::live());
         }
         let _ = measure_systems;
         let module = if prefer_aot {
@@ -706,7 +707,7 @@ fn play(args: &Args, game: Game, dev: bool, steam: bool, checkout: Option<&Path>
     // What the scene draws first is read while the program loads and the GPU opens.
     scene_assets::warm_up(&paths.assets, paths.scene_to_read());
     // Development recompiles after every edit, reusing unchanged functions.
-    let engine = if dev { blot_host::dev_engine()? } else { blot_host::engine()? };
+    let engine = if dev { squid_host::dev_engine()? } else { squid_host::engine()? };
     let module = if !dev {
         load_run_module(&engine, &game.directory, true, checkout.is_some())?
     } else {
@@ -823,9 +824,9 @@ fn play(args: &Args, game: Game, dev: bool, steam: bool, checkout: Option<&Path>
 /// `pen new DIR`.
 #[cfg(feature = "compiler")]
 fn new_game(args: &Args) -> Result<()> {
-    let root = new::create(Path::new(&args.operands[0]), args.path("--blot"))?;
+    let root = new::create(Path::new(&args.operands[0]), args.path("--squid"))?;
     println!(
-        "made {} in {}: `pen dev` there plays it as you edit it, `pen test-blot` runs its tests",
+        "made {} in {}: `pen dev` there plays it as you edit it, `pen test-squid` runs its tests",
         project::Project::find(Some(root.clone()))?.identity.name,
         root.display()
     );
@@ -1106,7 +1107,7 @@ fn run(words: impl IntoIterator<Item = String>) -> Result<()> {
         (None, Some(directory))
     } else {
         let project = if args.command == "tool"
-            || (matches!(args.command, "test-guest" | "test-blot") && !args.flag("--session"))
+            || (matches!(args.command, "test-guest" | "test-squid") && !args.flag("--session"))
         {
             Project::find_tests(args.path("--project"))?
         } else {
@@ -1282,7 +1283,7 @@ fn run(words: impl IntoIterator<Item = String>) -> Result<()> {
                 project.compile(&project.native())?;
             }
             let game = game(project.as_ref());
-            let engine = blot_host::engine()?;
+            let engine = squid_host::engine()?;
             let module = load_module(&engine, &game.directory, true, false)?;
             let catalog = read_catalog(&game.assets)?;
             let test = visual::TestOptions {
@@ -1304,7 +1305,7 @@ fn run(words: impl IntoIterator<Item = String>) -> Result<()> {
                 project.compile(&project.native())?;
             }
             let game = game(project.as_ref());
-            let engine = blot_host::engine()?;
+            let engine = squid_host::engine()?;
             let bench = command == "bench";
             // A bench times loading the module, so not from the cache.
             let loading = Instant::now();
@@ -1363,7 +1364,8 @@ fn run(words: impl IntoIterator<Item = String>) -> Result<()> {
                 project.compile(&project.native())?;
             }
             let game = game(project.as_ref());
-            let fuzzed = fuzz::Game::load(blot_host::engine()?, &game.directory, &game.assets, &game.scene_to_start())?;
+            let fuzzed =
+                fuzz::Game::load(squid_host::engine()?, &game.directory, &game.assets, &game.scene_to_start())?;
             let frames: usize = args.number("--frames")?.unwrap_or(600);
             // A script given (one a run was cut down to): the same checks on it.
             if !args.script.is_empty() {
@@ -1426,13 +1428,13 @@ fn run(words: impl IntoIterator<Item = String>) -> Result<()> {
         #[cfg(not(feature = "compiler"))]
         "tool" => bail!("this pen has no checkout tools; use a full build"),
         #[cfg(feature = "compiler")]
-        "test-guest" | "test-blot" => {
+        "test-guest" | "test-squid" => {
             let project = checkout()?;
             let files = args.operands.iter().map(PathBuf::from).collect();
             let deadline = args.number::<u64>("--deadline")?.map(std::time::Duration::from_secs);
             let session = if args.flag("--session") {
                 ensure!(!args.operands.is_empty(), "--session requires explicit guest scenario files");
-                Some(blot_test::SessionOptions {
+                Some(squid_test::SessionOptions {
                     out: args.path("--out"),
                     golden: args.path("--golden"),
                     update: args.flag("--update"),
@@ -1449,17 +1451,17 @@ fn run(words: impl IntoIterator<Item = String>) -> Result<()> {
                 );
                 None
             };
-            let options = blot_test::Options {
+            let options = squid_test::Options {
                 files,
                 filter: args.value("--filter"),
                 jobs: args.number("--jobs")?,
                 deadline,
                 session,
             };
-            blot_test::run(&project.root, options)
+            squid_test::run(&project.root, options)
         }
         #[cfg(not(feature = "compiler"))]
-        "test-guest" | "test-blot" => bail!("this pen has no plugins, which compile a checkout's guest tests"),
+        "test-guest" | "test-squid" => bail!("this pen has no plugins, which compile a checkout's guest tests"),
         other => unreachable!("Args::parse takes only known commands, and run the rest earlier, not {other}"),
     }
 }
@@ -1514,7 +1516,7 @@ mod player_tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("game.wasm"), b"\0asm\x01\0\0\0").unwrap();
         std::fs::write(root.join("game.cwasm"), b"old artifact must not be read").unwrap();
-        let error = load_module(&blot_host::engine().unwrap(), &root, false, false).err().unwrap();
+        let error = load_module(&squid_host::engine().unwrap(), &root, false, false).err().unwrap();
         assert!(error.to_string().contains("game.meta"), "{error:#}");
         assert!(error.to_string().contains("pen build"), "{error:#}");
         std::fs::remove_dir_all(root).unwrap();

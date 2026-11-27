@@ -4,7 +4,7 @@
 //! via [`crate::import`], and emits a neutral, host-agnostic `<name>.scene.json` manifest
 //! containing the glTF node tree, local TRS transforms, cameras, `KHR_lights_punctual` lights,
 //! collider conventions (`-col`, `-colonly`, `-convcol`), `_LOD0..3` sibling groups, and
-//! animation clip references so Blot/Ink applications can load scenes into their own state format.
+//! animation clip references so Squid/Ink applications can load scenes into their own state format.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};

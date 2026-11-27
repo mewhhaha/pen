@@ -3,20 +3,20 @@
 Beyond the suites `just test` runs ([Testing](reference.md#testing)), pen has
 tools for what goes wrong between builds and in players' hands: a review page
 for the golden images, replays that say where another build departs, input
-fuzzing, property tests between the Rust and Blot codecs, bug reports, and
+fuzzing, property tests between the Rust and Squid codecs, bug reports, and
 benchmarks compared from commit to commit. None of them needs a window; only the
 golden images and recording a session need the GPU.
 
-## Blot scenarios driving native sessions
+## Squid scenarios driving native sessions
 
-`pen test-blot --session FILE.blot` runs a separate Blot test guest against a
+`pen test-squid --session FILE.sq` runs a separate Squid test guest against a
 real, isolated native game session, including the GPU. No desktop window opens.
-Explicit files are required; ordinary `pen test-blot` remains the CPU test
+Explicit files are required; ordinary `pen test-squid` remains the CPU test
 suite. Session scenarios run sequentially, regardless of `--jobs`.
 
 ```sh
 pen codegen --project ../gdev
-pen test-blot --project ../gdev --session tests/scenarios/continue.blot
+pen test-squid --project ../gdev --session tests/scenarios/continue.sq
 ```
 
 The generated `pen/test` module supplies the driver API. A scenario entry takes
@@ -29,7 +29,7 @@ Selectors borrow their text until the driver call serializes it. Text and
 equality inputs accept read-only fixed, growing, resizable or borrowed
 collections; only copied numeric packets cross into the session host.
 
-```blot
+```squid
 import * as test from "pen/test"
 import * as fixtures from "test/scenario_fixtures"
 
@@ -48,7 +48,7 @@ io const test_continue = func (driver: Array F32 -> Array F32 ! { Foreign }) => 
 The example's `fixtures` is application code: `colony` returns
 `#test.Save { schema, state }`, using the game's ordinary save encoder;
 `inventory` decodes or inspects a returned save. Pen does not interpret its
-payload. gdev's `tests/scenarios/continue.blot` is a complete runnable example,
+payload. gdev's `tests/scenarios/continue.sq` is a complete runnable example,
 including its fixture and state reader.
 
 | Operation                                       | Behaviour                                                                                                                                                             |
@@ -69,7 +69,7 @@ Each step/wait is limited to 3,600 ticks. `--deadline SECONDS` bounds the test's
 wall time (default 600 seconds); renderer loading has its own bounded settling
 wait. Asset work settles with simulation time frozen before input advances.
 Assets' normal readiness events still enter the game through recorded input.
-GPU/driver calls cannot be forcibly interrupted by the Blot deadline.
+GPU/driver calls cannot be forcibly interrupted by the Squid deadline.
 
 Steam, clipboard and URL services report unavailable. The platform service is
 fixed to the test platform and `en-US`; simulation, locale, preferences,
@@ -109,7 +109,7 @@ cargo build --release -p pen-codegen
 deno run --no-config --no-lock -A scripts/check-examples.ts
 ```
 
-`BLOTC` and `PEN_CODEGEN` can select matching local candidates. The checker
+`SQUIDC` and `PEN_CODEGEN` can select matching local candidates. The checker
 compiles both real entries and every numeric test module, requires ABI 8,
 and checks create/frame/rejected-presentation/snapshot/restore exchanges using
 copied numeric callbacks. It also checks borrowed diagnostic inputs and exact
@@ -195,20 +195,20 @@ on `dist/gdev` fuzzes two runs and cuts a run that trips an extra check (a node
 taking the keyboard focus) down to the one step that does it. Time travel steps
 and checks that rewinds give the same packets are not fuzzed yet.
 
-## The Rust and Blot codecs agree
+## The Rust and Squid codecs agree
 
 pen-codegen generates the Rust codecs (`encode_frame`, `decode_frame`) and the
-game's Blot codecs (`decode_input_into`, `encode_render_views`) from `protocol/schema.json`.
+game's Squid codecs (`decode_input_into`, `encode_render_views`) from `protocol/schema.json`.
 A round trip through one side's encoder and decoder could not catch the two
 sides laying a field out differently, so the test compares values across
 languages through a canonical walk, also generated: every field in schema order,
 arrays as a count and their elements, options as a flag and the value, events as
 their tag and fields. Rust gets `canonical_input` and `canonical_render` (in
-`packets.rs`), Blot `canonical_input` and `render_packet_from_canonical`
-(`pen/protocol_canonical.blot`, which only tests import).
+`packets.rs`), Squid `canonical_input` and `render_packet_from_canonical`
+(`pen/protocol_canonical.sq`, which only tests import).
 
 `cargo test -p pen codec_round_trip` compiles a harness
-(`crates/pen/src/codec_round_trip.blot`) with the checkout's compiler, then for
+(`crates/pen/src/codec_round_trip.sq`) with the checkout's compiler, then for
 2000 seeded random frames each way checks that Rust's `encode_frame` read by the
 game's `decode_input_into` walks as Rust walks the frame, and that the canonical
 render writer streams its walk into packet lanes. A test-only flat packet
@@ -258,16 +258,16 @@ compares, and keeps both results as the artifact `bench-SHA`. It needs the same
 checkouts and variables as CI's game job. A base from before `--json` leaves
 nothing to compare, with a notice.
 
-## Blot tests' speed
+## Squid tests' speed
 
-`pen test-blot` says how long each test that takes a second or more ran, and how
+`pen test-squid` says how long each test that takes a second or more ran, and how
 many passes the guest runtime's cycle collector made meanwhile (read from the
-guest's exported `blot:cycle_passes` counter, `Guest::runtime_counters`). gdev's
-`tests/codec_saved_state.blot` is the slow module: its 19 tests start from
+guest's exported `squid:cycle_passes` counter, `Guest::runtime_counters`). gdev's
+`tests/codec_saved_state.sq` is the slow module: its 19 tests start from
 `created ()`, the tests' level with a crowd of 10,000 gnorps created and saved,
 and several restore and save it again.
 
-Measured on 2026-10-16 and 17 with the sibling blot2's compiler of that day, on
+Measured on 2026-10-16 and 17 with the sibling squid-lang's compiler of that day, on
 a machine shared with other builds (load 15 to 50 on 16 threads):
 
 - Creating the sandbox alone (`runtime.create sandbox state_schema`) took 196 s
@@ -275,8 +275,8 @@ a machine shared with other builds (load 15 to 50 on 16 threads):
   inlining, no epoch checks): the engine does not matter. Alone at a load of
   about 19 it took 248 s, 245 s of it CPU time.
 - Sampling the guest's stack every 100 ms (an epoch callback taking a backtrace)
-  put 3074 of 3078 samples, 99.9%, in the Blot runtime's cycle collection pass
-  and what it calls; 0.1% were the game's code. The pass (blot2's
+  put 3074 of 3078 samples, 99.9%, in the Squid runtime's cycle collection pass
+  and what it calls; 0.1% were the game's code. The pass (squid-lang's
   `zig-native/SHARED_OWNERSHIP.md`, "Complete cycle strategy") is trial deletion
   over the union of the strong closures of every queued candidate. It runs
   whenever candidates are queued and 64 KiB have been allocated (or 65,536
@@ -291,7 +291,7 @@ a machine shared with other builds (load 15 to 50 on 16 threads):
   s. After (a module's tests in parallel): all 19 took 1,744 s of wall time
   (6,822 s of CPU), 7 passing and 12 stopped by the 600 s deadline.
 
-The collector is blot2's, generated into every guest, which neither pen nor gdev
+The collector is squid-lang's, generated into every guest, which neither pen nor gdev
 can change: its passes need to scale with what changed rather than with what
 candidates reach (for example, a trigger that grows with the heap, or not
 walking into structures already traced live in an earlier pass). Until then the
@@ -317,8 +317,8 @@ can exercise the worker fallback as well.
 
 ## Library checkouts and native references
 
-`pen test-blot` also works in a library checkout with `pen.json` and no game
-entry. The Blot plugin accepts `compiler.settings.tests.entry` and an explicit
+`pen test-squid` also works in a library checkout with `pen.json` and no game
+entry. The Squid plugin accepts `compiler.settings.tests.entry` and an explicit
 `files` list. A check fixture can additionally export `trap_` functions (Unit to
 Array F32); only an unreachable trap passes. A source beginning with
 `// rejects: TEXT` passes when compilation fails with that diagnostic.
@@ -329,9 +329,9 @@ An optional top-level `tests` object names native Rust reference suites:
 { "tests": { "rust": ["tools/native/Cargo.toml"] } }
 ```
 
-After the Blot suite succeeds, Pen runs those Cargo tests. `--filter` applies to
-both suites and `--jobs` controls Rust test threads as well. Explicit Blot file
-operands and `--session` run only Blot tests. Pen supplies `PEN_EXECUTABLE`,
+After the Squid suite succeeds, Pen runs those Cargo tests. `--filter` applies to
+both suites and `--jobs` controls Rust test threads as well. Explicit Squid file
+operands and `--session` run only Squid tests. Pen supplies `PEN_EXECUTABLE`,
 `PEN_TEST_PROJECT` and `PEN_TEST_DEADLINE_SECONDS` to native suites; the suite
 owns its assertions and uses the deadline for guest execution.
 

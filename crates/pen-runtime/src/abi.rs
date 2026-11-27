@@ -1,14 +1,14 @@
-//! Blot's guest ABI manifest (`blot2/docs/host/guest-abi.md`): the
-//! `blot:abi` custom section a guest module declares its exports in, and
-//! the entry a game must have. Native pen (blot-host) and the browser read
+//! Squid's guest ABI manifest (`squid-lang/docs/host/guest-abi.md`): the
+//! `squid:abi` custom section a guest module declares its exports in, and
+//! the entry a game must have. Native pen (squid-host) and the browser read
 //! it alike, before a module runs. ABI 3's ownership hooks are specified in
-//! `blot2/docs/compiler/SHARED_OWNERSHIP.md`.
+//! `squid-lang/docs/compiler/SHARED_OWNERSHIP.md`.
 use std::fmt;
 
 use anyhow::{Result, anyhow, bail, ensure};
 
 /// The custom section the manifest is in.
-pub const ABI_SECTION: &str = "blot:abi";
+pub const ABI_SECTION: &str = "squid:abi";
 /// Host import module for the externref-free `pen:guest/1` guest ABI.
 pub const PEN_GUEST_MODULE: &str = "pen:guest/1";
 /// Host import function `(i32) -> i32` exchanging f32 packets without `externref`.
@@ -16,21 +16,21 @@ pub const PEN_GUEST_EXCHANGE: &str = "exchange";
 /// Game entrypoint export `() -> ()` for the externref-free `pen:guest/1` ABI.
 pub const PEN_MAIN_EXPORT: &str = "pen:main";
 /// The custom section declaring `#kernel` manifests (version 1).
-pub const KERNELS_SECTION: &str = "blot:kernels";
+pub const KERNELS_SECTION: &str = "squid:kernels";
 /// The custom section declaring `#process` manifests (version 1).
-pub const PROCESSES_SECTION: &str = "blot:processes";
+pub const PROCESSES_SECTION: &str = "squid:processes";
 /// The custom section declaring first-class tests (version 1).
-pub const TESTS_SECTION: &str = "blot:tests";
+pub const TESTS_SECTION: &str = "squid:tests";
 /// The custom section declaring runtime trap provenance sites (version 1).
-pub const TRAPS_SECTION: &str = "blot:traps";
-/// Fixed Page-0 linear-memory byte offset holding the 1-based `blot:traps`
+pub const TRAPS_SECTION: &str = "squid:traps";
+/// Fixed Page-0 linear-memory byte offset holding the 1-based `squid:traps`
 /// site ID written right before a guest traps (`u32` little-endian; `0` = none).
 pub const TRAP_SITE_OFFSET: usize = 772;
 /// Default logical transport packet ceiling in bytes (2 MiB).
 pub const DEFAULT_TRANSPORT_BUDGET: u32 = 2_097_152;
-/// `blot:kernels` manifest flag bit 0: kernel has a prepared context (`prepare`).
+/// `squid:kernels` manifest flag bit 0: kernel has a prepared context (`prepare`).
 pub const KERNEL_FLAG_HAS_CONTEXT: u8 = 1 << 0;
-/// `blot:kernels` manifest flag bit 1: kernel emits variable-length `[len, words...]` output.
+/// `squid:kernels` manifest flag bit 1: kernel emits variable-length `[len, words...]` output.
 pub const KERNEL_FLAG_VARIABLE_OUTPUT: u8 = 1 << 1;
 /// ABI 8 identifies data-stack storage, including scalar-only modules.
 /// Earlier profiles remain readable only during the compiler cutover.
@@ -56,7 +56,7 @@ impl WireSchemaKind {
     }
 }
 
-/// Canonical wire layout of a kernel or process boundary type (`blot:kernels` / `blot:processes` v1).
+/// Canonical wire layout of a kernel or process boundary type (`squid:kernels` / `squid:processes` v1).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct WireSchema {
     pub kind: WireSchemaKind,
@@ -66,7 +66,7 @@ pub struct WireSchema {
     pub schema_hash: u64,
 }
 
-/// One `#kernel` descriptor from `blot:kernels` v1 (0-based index == `kernel_id`).
+/// One `#kernel` descriptor from `squid:kernels` v1 (0-based index == `kernel_id`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KernelManifest {
     pub id: u32,
@@ -92,7 +92,7 @@ impl KernelManifest {
     }
 }
 
-/// One `#process` descriptor from `blot:processes` v1.
+/// One `#process` descriptor from `squid:processes` v1.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProcessManifest {
     pub name: String,
@@ -240,7 +240,7 @@ impl TrapKind {
     }
 }
 
-/// One recorded trap site from `blot:traps` v1 (1-based index == runtime `trap_id`).
+/// One recorded trap site from `squid:traps` v1 (1-based index == runtime `trap_id`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TrapMetadata {
     pub kind: TrapKind,
@@ -250,50 +250,50 @@ pub struct TrapMetadata {
     pub message: String,
 }
 
-/// The `blot:abi` manifest: the module's exports, in declaration order.
+/// The `squid:abi` manifest: the module's exports, in declaration order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GuestAbi {
     pub functions: Vec<GuestFunction>,
     pub constants: Vec<GuestConstant>,
     /// First-class test declarations, in metadata order.
     pub tests: Vec<TestMetadata>,
-    /// Runtime trap provenance sites parsed from `blot:traps` v1 (1-based index).
+    /// Runtime trap provenance sites parsed from `squid:traps` v1 (1-based index).
     pub traps: Vec<TrapMetadata>,
     /// ABI 8: named data-stack owners and copied numeric packets, with no
     /// counted ownership hooks, resource adapters or language tasks.
     pub data_stacks: bool,
     /// Optional ABI 8 post-invocation hook for scoped owners and callbacks.
     pub invocation_finish: bool,
-    /// ABI 3: the module exports `blot:ownership_enter`, which a host calls
-    /// before each call's inputs, and `blot:ownership_leave(outcome)`, which
+    /// ABI 3: the module exports `squid:ownership_enter`, which a host calls
+    /// before each call's inputs, and `squid:ownership_leave(outcome)`, which
     /// it calls after copying the result out (outcome 0) or after a failure
-    /// (1), before `blot:reset`.
+    /// (1), before `squid:reset`.
     pub ownership: bool,
-    /// Blot's structured tasks (guest-abi.md, "Structured task
-    /// extension"): the `blot:tasks` section's descriptor count.
+    /// Squid's structured tasks (guest-abi.md, "Structured task
+    /// extension"): the `squid:tasks` section's descriptor count.
     pub tasks: Option<u32>,
     /// Functions whose callback is `concurrent` (manifest tag 13): tasks
     /// may suspend in it side by side.
     pub concurrent: Vec<String>,
-    /// `#kernel` descriptors parsed from `blot:kernels` v1 (index == `kernel_id`).
+    /// `#kernel` descriptors parsed from `squid:kernels` v1 (index == `kernel_id`).
     pub kernels: Vec<KernelManifest>,
-    /// `#process` descriptors parsed from `blot:processes` v1.
+    /// `#process` descriptors parsed from `squid:processes` v1.
     pub processes: Vec<ProcessManifest>,
     /// Declared logical transport ceiling in bytes (`DEFAULT_TRANSPORT_BUDGET` if absent).
     pub transport_budget: u32,
-    /// Host-internal wrapper exports (`blot:kernel_ctx:*`, `blot:kernel_clear:*`,
-    /// `blot:proc_init:*`, `blot:proc_step:*`).
+    /// Host-internal wrapper exports (`squid:kernel_ctx:*`, `squid:kernel_clear:*`,
+    /// `squid:proc_init:*`, `squid:proc_step:*`).
     pub host_internal: Vec<String>,
     /// True when the module speaks the `externref`-free `pen:guest/1` ABI (or plain mod exports)
-    /// rather than a `blot:abi` custom section.
+    /// rather than a `squid:abi` custom section.
     pub simple_guest: bool,
-    /// Exported linear memory name (`"blot:memory"` for Blot ABI, `"memory"` or `"blot:memory"` for simple guests).
+    /// Exported linear memory name (`"squid:memory"` for Squid ABI, `"memory"` or `"squid:memory"` for simple guests).
     pub memory_export: String,
-    /// Exported allocator function name (`"blot:allocate"` or `"pen:allocate"`).
+    /// Exported allocator function name (`"squid:allocate"` or `"pen:allocate"`).
     pub allocate_export: String,
-    /// Optional exported arena-reset function name (`Some("blot:reset")` for Blot ABI; optional for simple guests).
+    /// Optional exported arena-reset function name (`Some("squid:reset")` for Squid ABI; optional for simple guests).
     pub reset_export: Option<String>,
-    /// Game entrypoint export name (`"main"` for Blot ABI, `"pen:main"` for `pen:guest/1`).
+    /// Game entrypoint export name (`"main"` for Squid ABI, `"pen:main"` for `pen:guest/1`).
     pub main_export: String,
 }
 
@@ -314,20 +314,20 @@ impl Default for GuestAbi {
             transport_budget: DEFAULT_TRANSPORT_BUDGET,
             host_internal: Vec::new(),
             simple_guest: false,
-            memory_export: "blot:memory".to_owned(),
-            allocate_export: "blot:allocate".to_owned(),
-            reset_export: Some("blot:reset".to_owned()),
+            memory_export: "squid:memory".to_owned(),
+            allocate_export: "squid:allocate".to_owned(),
+            reset_export: Some("squid:reset".to_owned()),
             main_export: "main".to_owned(),
         }
     }
 }
 
 /// The custom section a task module declares its task descriptors in.
-pub const TASKS_SECTION: &str = "blot:tasks";
+pub const TASKS_SECTION: &str = "squid:tasks";
 
 /// Optional ABI 8 invocation finish extension, version 1.
-pub const INVOCATION_SECTION: &str = "blot:invocation";
-pub const INVOCATION_FINISH: &str = "blot:finish_invocation";
+pub const INVOCATION_SECTION: &str = "squid:invocation";
+pub const INVOCATION_FINISH: &str = "squid:finish_invocation";
 
 /// What a game's `main` takes: the host, which answers each frame's
 /// request with the next frame's input.
@@ -383,7 +383,7 @@ impl GuestAbi {
             && !self.concurrent.is_empty()
         {
             bail!(
-                "unsupported_abi: the module uses Blot's structured tasks ({TASKS_SECTION}, {descriptors} \
+                "unsupported_abi: the module uses Squid's structured tasks ({TASKS_SECTION}, {descriptors} \
                  descriptors; concurrent callbacks for {}), which require suspended sibling stacks; native pen currently hosts synchronous tasks (docs/services-as-tasks.md)",
                 self.concurrent.join(", ")
             );
@@ -485,7 +485,7 @@ impl Reader<'_> {
     }
 }
 
-/// Parses a `blot:abi` custom section's payload.
+/// Parses a `squid:abi` custom section's payload.
 pub fn parse_abi(payload: &[u8]) -> Result<GuestAbi> {
     let mut reader = Reader { bytes: payload, at: 0 };
     let version = reader.u32()?;
@@ -622,7 +622,7 @@ pub fn read_memory_shape(wasm: &[u8]) -> Result<MemoryShape> {
 }
 
 /// Detects a language-agnostic, `externref`-free `pen:guest/1` game or plain `pen:allocate` mod
-/// directly from standard Wasm Import (id 2) and Export (id 7) sections when no `blot:abi` section
+/// directly from standard Wasm Import (id 2) and Export (id 7) sections when no `squid:abi` section
 /// is present.
 fn detect_simple_guest(wasm: &[u8]) -> Result<Option<GuestAbi>> {
     let mut imports: Vec<(String, String, u8)> = Vec::new();
@@ -687,22 +687,22 @@ fn detect_simple_guest(wasm: &[u8]) -> Result<Option<GuestAbi>> {
     let has_export = |name: &str, kind: u8| exports.iter().any(|(n, k)| n == name && *k == kind);
     let memory_export = if has_export("memory", 2) {
         Some("memory".to_owned())
-    } else if has_export("blot:memory", 2) {
-        Some("blot:memory".to_owned())
+    } else if has_export("squid:memory", 2) {
+        Some("squid:memory".to_owned())
     } else {
         None
     };
     let allocate_export = if has_export("pen:allocate", 0) {
         Some("pen:allocate".to_owned())
-    } else if has_export("blot:allocate", 0) {
-        Some("blot:allocate".to_owned())
+    } else if has_export("squid:allocate", 0) {
+        Some("squid:allocate".to_owned())
     } else {
         None
     };
     let reset_export = if has_export("pen:reset", 0) {
         Some("pen:reset".to_owned())
-    } else if has_export("blot:reset", 0) {
-        Some("blot:reset".to_owned())
+    } else if has_export("squid:reset", 0) {
+        Some("squid:reset".to_owned())
     } else {
         None
     };
@@ -744,7 +744,7 @@ fn detect_simple_guest(wasm: &[u8]) -> Result<Option<GuestAbi>> {
     Ok(None)
 }
 
-/// Finds the single `blot:abi` custom section in a module's bytes (or detects a
+/// Finds the single `squid:abi` custom section in a module's bytes (or detects a
 /// `pen:guest/1` game / `pen:allocate` mod directly from its imports and exports),
 /// plus optional tasks, invocation, kernel, process, test, and trap sections.
 pub fn read_abi(wasm: &[u8]) -> Result<GuestAbi> {
@@ -757,7 +757,7 @@ pub fn read_abi(wasm: &[u8]) -> Result<GuestAbi> {
     let mut tests_payload: Option<&[u8]> = None;
     let mut traps_payload: Option<&[u8]> = None;
     for (name, payload) in custom_sections(wasm)? {
-        if matches!(name.as_str(), "blot:ownership" | "blot:cycles" | "blot:memory-profile" | "blot:cleanup_data") {
+        if matches!(name.as_str(), "squid:ownership" | "squid:cycles" | "squid:memory-profile" | "squid:cleanup_data") {
             counted_section = true;
         }
         if name == ABI_SECTION {
@@ -1076,7 +1076,7 @@ fn parse_processes(payload: &[u8], abi: &GuestAbi) -> Result<(u32, Vec<ProcessMa
     Ok((transport_budget, processes))
 }
 
-/// A `blot:tasks` section's payload: version 2, then the descriptor count
+/// A `squid:tasks` section's payload: version 2, then the descriptor count
 /// (at most 4096), and nothing after.
 fn parse_tasks(payload: &[u8]) -> Result<u32> {
     let mut reader = Reader { bytes: payload, at: 0 };
@@ -1104,7 +1104,7 @@ mod tests {
     #[test]
     fn reads_test_metadata_v1() {
         let abi = section(ABI_SECTION, &[8, 0, 0]);
-        let payload = b"\x01\x82\x00\x00\x04test\x02\xc3\xa9\x06a.blot\xac\x02\x01\x04trap\x00\x00\x01";
+        let payload = b"\x01\x82\x00\x00\x04test\x02\xc3\xa9\x04a.sq\xac\x02\x01\x04trap\x00\x00\x01";
         let wasm = module(&[section(TESTS_SECTION, payload), abi.clone()]);
         assert_eq!(
             read_abi(&wasm).unwrap().tests,
@@ -1113,7 +1113,7 @@ mod tests {
                     kind: TestKind::Check,
                     export_name: "test".into(),
                     display_name: "é".into(),
-                    filename: "a.blot".into(),
+                    filename: "a.sq".into(),
                     line: 300,
                 },
                 TestMetadata {
@@ -1134,18 +1134,18 @@ mod tests {
         let abi = section(ABI_SECTION, &[8, 0, 0]);
         let empty = section(TESTS_SECTION, &[1, 0]);
         let duplicates = read_abi(&module(&[abi.clone(), empty.clone(), empty])).unwrap_err();
-        assert!(duplicates.to_string().contains("more than one blot:tests section"));
+        assert!(duplicates.to_string().contains("more than one squid:tests section"));
         for (payload, message) in [
             (&b""[..], "truncated"),
             (&b"\x01"[..], "truncated"),
-            (&b"\x02\x00"[..], "unsupported blot:tests version"),
-            (&b"\x01\x01\x02\x00\x00\x00\x00"[..], "unknown blot:tests kind"),
-            (&b"\x01\x01\x00\x00\x00\x00"[..], "truncated blot:tests entries"),
+            (&b"\x02\x00"[..], "unsupported squid:tests version"),
+            (&b"\x01\x01\x02\x00\x00\x00\x00"[..], "unknown squid:tests kind"),
+            (&b"\x01\x01\x00\x00\x00\x00"[..], "truncated squid:tests entries"),
             (&b"\x01\x01\x00\x05a\x00\x00"[..], "truncated name"),
             (&b"\x01\x01\x00\x01\xff\x00\x00\x01"[..], "not UTF-8"),
             (&b"\x01\x01\x00\x00\x00\x00\x80"[..], "truncated"),
             (&b"\x01\x01\x00\x00\x00\x00\xff\xff\xff\xff\x10"[..], "LEB128 exceeds u32"),
-            (&b"\x01\x00\xff"[..], "trailing blot:tests bytes"),
+            (&b"\x01\x00\xff"[..], "trailing squid:tests bytes"),
         ] {
             let error = read_abi(&module(&[abi.clone(), section(TESTS_SECTION, payload)])).unwrap_err().to_string();
             assert!(error.starts_with("invalid_abi:") && error.contains(message), "{payload:?}: {error}");
@@ -1201,7 +1201,7 @@ mod tests {
         let abi = section(ABI_SECTION, &[8, 0, 0]);
         let empty = section(TRAPS_SECTION, &[1, 0, 0, 0, 0]);
         let duplicates = read_abi(&module(&[abi.clone(), empty.clone(), empty])).unwrap_err();
-        assert!(duplicates.to_string().contains("more than one blot:traps section"));
+        assert!(duplicates.to_string().contains("more than one squid:traps section"));
         let unknown_kind = [&[1][..], &1u32.to_le_bytes(), &trap_entry(4, 1, 0, 0, b"")].concat();
         let zero_kind = [&[1][..], &1u32.to_le_bytes(), &trap_entry(0, 1, 0, 0, b"")].concat();
         let bad_utf8 = [&[1][..], &1u32.to_le_bytes(), &trap_entry(1, 1, 0, 0, &[0xff, 0xfe])].concat();
@@ -1221,15 +1221,15 @@ mod tests {
         for (payload, message) in [
             (&b""[..], "truncated"),
             (&b"\x01\x00\x00"[..], "truncated u32"),
-            (&b"\x02\x00\x00\x00\x00"[..], "unsupported blot:traps version"),
-            (&b"\x00\x00\x00\x00\x00"[..], "unsupported blot:traps version"),
-            (unknown_kind.as_slice(), "unknown blot:traps kind"),
-            (zero_kind.as_slice(), "unknown blot:traps kind"),
-            (huge_count.as_slice(), "truncated blot:traps entries"),
-            (&b"\x01\x01\x00\x00\x00\x01\x01\x00\x00"[..], "truncated blot:traps entries"),
-            (trunc_msg.as_slice(), "truncated blot:traps message"),
+            (&b"\x02\x00\x00\x00\x00"[..], "unsupported squid:traps version"),
+            (&b"\x00\x00\x00\x00\x00"[..], "unsupported squid:traps version"),
+            (unknown_kind.as_slice(), "unknown squid:traps kind"),
+            (zero_kind.as_slice(), "unknown squid:traps kind"),
+            (huge_count.as_slice(), "truncated squid:traps entries"),
+            (&b"\x01\x01\x00\x00\x00\x01\x01\x00\x00"[..], "truncated squid:traps entries"),
+            (trunc_msg.as_slice(), "truncated squid:traps message"),
             (bad_utf8.as_slice(), "not UTF-8"),
-            (trailing.as_slice(), "trailing blot:traps bytes"),
+            (trailing.as_slice(), "trailing squid:traps bytes"),
         ] {
             let error = read_abi(&module(&[abi.clone(), section(TRAPS_SECTION, payload)])).unwrap_err().to_string();
             assert!(error.starts_with("invalid_abi:") && error.contains(message), "{payload:?}: {error}");
@@ -1263,11 +1263,11 @@ mod tests {
         assert!(abi.check_game().is_ok(), "its main still takes the host");
         let refused = format!("{:#}", abi.check_hostable().unwrap_err());
         assert!(
-            refused.contains("structured tasks (blot:tasks, 3 descriptors; concurrent callbacks for main)"),
+            refused.contains("structured tasks (squid:tasks, 3 descriptors; concurrent callbacks for main)"),
             "{refused}"
         );
         let error = |sections: &[Vec<u8>]| format!("{:#}", read_abi(&module(sections)).unwrap_err());
-        assert!(error(&[section(ABI_SECTION, &manifest)]).contains("concurrent callbacks need blot:tasks"));
+        assert!(error(&[section(ABI_SECTION, &manifest)]).contains("concurrent callbacks need squid:tasks"));
         let mut version_2 = manifest;
         version_2[0] = 2;
         assert!(error(&[section(ABI_SECTION, &version_2), section(TASKS_SECTION, &[2, 3])]).contains("ownership"));
@@ -1275,7 +1275,7 @@ mod tests {
         assert!(GuestAbi::default().check_hostable().is_ok());
         let stack = section(ABI_SECTION, &[8, 0, 0]);
         assert!(read_abi(&module(std::slice::from_ref(&stack))).unwrap().data_stacks);
-        assert!(error(&[stack.clone(), section("blot:ownership", &[1, 0, 1])]).contains("counted runtime"));
+        assert!(error(&[stack.clone(), section("squid:ownership", &[1, 0, 1])]).contains("counted runtime"));
         assert!(error(&[stack, section(TASKS_SECTION, &[2, 0])]).contains("ownership"));
     }
 
@@ -1302,7 +1302,7 @@ mod tests {
         assert!(parse_abi(&wrong).unwrap().check_game().is_err(), "main returns U32");
         assert!(GuestAbi::default().check_game().is_err(), "no main");
         // In a module: the custom section, found among others.
-        let section = [&[8u8][..], &b"blot:abi"[..], &game[..]].concat();
+        let section = [&[9u8][..], &b"squid:abi"[..], &game[..]].concat();
         let mut module = b"\0asm\x01\0\0\0".to_vec();
         module.extend([1, 0, 0, u8::try_from(section.len()).unwrap()]);
         module.extend(&section);
@@ -1378,19 +1378,19 @@ mod tests {
             out.extend_from_slice(&hash.to_le_bytes());
             out
         };
-        // ABI 8 exports: k(ArrayU32->ArrayU32), blot:kernel_ctx:k(ArrayF32->Unit), blot:kernel_clear:k(Unit->Unit),
-        // blot:proc_init:p(U32->Unit), blot:proc_step:p(U32->U32)
+        // ABI 8 exports: k(ArrayU32->ArrayU32), squid:kernel_ctx:k(ArrayF32->Unit), squid:kernel_clear:k(Unit->Unit),
+        // squid:proc_init:p(U32->Unit), squid:proc_step:p(U32->U32)
         let abi_payload = [
             vec![8, 5],
             str_bytes("k"),
             vec![5, 5],
-            str_bytes("blot:kernel_ctx:k"),
+            str_bytes("squid:kernel_ctx:k"),
             vec![6, 0],
-            str_bytes("blot:kernel_clear:k"),
+            str_bytes("squid:kernel_clear:k"),
             vec![0, 0],
-            str_bytes("blot:proc_init:p"),
+            str_bytes("squid:proc_init:p"),
             vec![1, 0],
-            str_bytes("blot:proc_step:p"),
+            str_bytes("squid:proc_step:p"),
             vec![1, 1],
             vec![0],
         ]
@@ -1408,8 +1408,8 @@ mod tests {
             0x55u64.to_le_bytes().to_vec(),
             vec![3, 6, 0], // VarF32 ctx
             0x66u64.to_le_bytes().to_vec(),
-            str_bytes("blot:kernel_ctx:k"),
-            str_bytes("blot:kernel_clear:k"),
+            str_bytes("squid:kernel_ctx:k"),
+            str_bytes("squid:kernel_clear:k"),
         ]
         .concat();
         let processes_payload = [
@@ -1417,8 +1417,8 @@ mod tests {
             uleb(DEFAULT_TRANSPORT_BUDGET),
             vec![1],
             str_bytes("p"),
-            str_bytes("blot:proc_init:p"),
-            str_bytes("blot:proc_step:p"),
+            str_bytes("squid:proc_init:p"),
+            str_bytes("squid:proc_step:p"),
             wire_fixed(1, &[1], 0x77),
             wire_fixed(1, &[1], 0x88),
             wire_fixed(1, &[1], 0x99),
@@ -1441,10 +1441,10 @@ mod tests {
         assert_eq!(abi.kernels.len(), 1);
         assert_eq!(abi.processes.len(), 1);
         assert_eq!(abi.transport_budget, DEFAULT_TRANSPORT_BUDGET);
-        assert!(abi.is_host_internal("blot:kernel_ctx:k"));
-        assert!(abi.is_host_internal("blot:kernel_clear:k"));
-        assert!(abi.is_host_internal("blot:proc_init:p"));
-        assert!(abi.is_host_internal("blot:proc_step:p"));
+        assert!(abi.is_host_internal("squid:kernel_ctx:k"));
+        assert!(abi.is_host_internal("squid:kernel_clear:k"));
+        assert!(abi.is_host_internal("squid:proc_init:p"));
+        assert!(abi.is_host_internal("squid:proc_step:p"));
         assert!(!abi.is_host_internal("k"));
 
         // Mismatched transport budgets between kernels and processes rejected
@@ -1465,7 +1465,7 @@ mod tests {
             out.extend_from_slice(payload);
             out
         };
-        // Game: imports pen:guest/1::exchange, exports pen:main, memory, pen:allocate (no blot:abi).
+        // Game: imports pen:guest/1::exchange, exports pen:main, memory, pen:allocate (no squid:abi).
         let imports = [vec![1], str_bytes(PEN_GUEST_MODULE), str_bytes(PEN_GUEST_EXCHANGE), vec![0, 0]].concat();
         let exports = [
             vec![3],
@@ -1486,7 +1486,7 @@ mod tests {
         assert_eq!(abi.main_export, "pen:main");
         assert!(abi.check_game().is_ok());
 
-        // Mod: no imports, exports frame, memory, pen:allocate (no blot:abi).
+        // Mod: no imports, exports frame, memory, pen:allocate (no squid:abi).
         let mod_exports = [
             vec![3],
             str_bytes("frame"),
@@ -1503,7 +1503,7 @@ mod tests {
         assert_eq!(mod_abi.function("frame").unwrap().result, ValueType::ArrayF32);
         assert!(mod_abi.check_game().is_err());
 
-        // Random Wasm without blot:abi or pen:guest/1/pen:allocate is still refused.
+        // Random Wasm without squid:abi or pen:guest/1/pen:allocate is still refused.
         let random_exports = [vec![1], str_bytes("frame"), vec![0, 0]].concat();
         assert!(read_abi(&module(&[sec(7, &random_exports)])).is_err());
     }

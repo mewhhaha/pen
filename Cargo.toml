@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/blot-host", "crates/pen", "crates/pen-codegen", "crates/pen-gltf", "crates/pen-plugins", "crates/pen-protocol", "crates/pen-runtime", "crates/pen-ink", "crates/pen-render", "crates/pen-simulation", "crates/pen-texture", "crates/pen-web"]
+members = ["crates/squid-host", "crates/pen", "crates/pen-codegen", "crates/pen-gltf", "crates/pen-plugins", "crates/pen-protocol", "crates/pen-runtime", "crates/pen-ink", "crates/pen-render", "crates/pen-simulation", "crates/pen-texture", "crates/pen-web"]
 # Wasm plugins build apart, for wasm32-wasip2 (plugins/Cargo.toml).
 exclude = ["plugins"]
 
@@ -12,7 +12,7 @@ license = "MIT"
 anyhow = { version = "1", default-features = false }
 pen-codegen = { path = "crates/pen-codegen" }
 pen-gltf = { path = "crates/pen-gltf" }
-blot-host = { path = "crates/blot-host", default-features = false }
+squid-host = { path = "crates/squid-host", default-features = false }
 pen-plugins = { path = "crates/pen-plugins" }
 pen-runtime = { path = "crates/pen-runtime" }
 pen-ink = { path = "crates/pen-ink" }
@@ -22,7 +22,7 @@ pen-simulation = { path = "crates/pen-simulation" }
 pen-texture = { path = "crates/pen-texture" }
 wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "dx12", "metal", "vulkan", "wgsl", "webgpu"] }
 # What running a precompiled guest needs (externref lives on the GC heap;
-# `backtrace` names guest functions in traps). blot-host's `compiler`
+# `backtrace` names guest functions in traps). squid-host's `compiler`
 # feature adds Cranelift. Builds with and without it must agree on every
 # feature that changes the engine's Wasm features or tunables, or a
 # game.cwasm from one would not load in the other.

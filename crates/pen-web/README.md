@@ -1,7 +1,7 @@
 # pen in the browser
 
 `pen-web` is the browser front end: Rust input, frame scheduling, WebAudio,
-platform services, IndexedDB saves and the game's Blot dev tools, drawn through
+platform services, IndexedDB saves and the game's Squid dev tools, drawn through
 `pen-render` on WebGPU. A browser without WebGPU cannot run the game: the
 page says so.
 
@@ -38,7 +38,7 @@ adapter keeps separate send/receive calls so guest work can overlap drawing.
 Browsers suspend the long-lived guest `main(host)` with WebAssembly JS Promise
 Integration (JSPI). `guest.js` is the small required JavaScript seam for JSPI,
 capability identity and copied array memory. Rust owns the game protocol and
-checks the module's `blot:abi` manifest before it runs. A browser without JSPI
+checks the module's `squid:abi` manifest before it runs. A browser without JSPI
 (Firefox before 153, Safari before 27, Chrome before 137) runs each guest in a
 worker instead, `guest.js` again: the guest blocks at its host call with
 `Atomics.wait` on a SharedArrayBuffer until the page has written the next
@@ -196,7 +196,7 @@ clipboard and into the browser's console. Recordings are native pen's
 `.penrec` either way: one made in the browser replays natively with `pen run
 --replay`, and one made natively plays in the browser, on the same build.
 
-The backquote console and diagnostics are the same Blot program as native pen.
+The backquote console and diagnostics are the same Squid program as native pen.
 They draw as sprites and take input through the game's declared UI tree, and
 pen-runtime answers what they ask as it does natively.
 
@@ -222,7 +222,7 @@ services and WebAudio. Serve the exported game, set `PEN_PACKETS` to the packet
 directory and `PEN_CONFORMANCE_URL` to `qualification.html` beside the export;
 the harness supplies that blank page. `PLAYWRIGHT_MODULE` can point to the
 installed Playwright ES module. `tests/browser.mjs` captures the actual game,
-Blot panels and resize; `PEN_WEB_URL` and `PEN_WEB_SHOTS` select its URL/output.
+Squid panels and resize; `PEN_WEB_URL` and `PEN_WEB_SHOTS` select its URL/output.
 `tests/pacing.mjs` delays guest replies to check that canvas submission stays
 inside repaint, then holds GPU completion notifications to verify the two-frame
 bound, resume, pause and resize. `PEN_WEB_SITE` selects its export; `PEN_WEB_HOST`

@@ -14,9 +14,9 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use blot_host::GuestModule;
 use pen_protocol::boundary::{read_catalog, validate_state};
 use pen_protocol::{Catalog, Frame, RenderFrame, Viewport, service};
+use squid_host::GuestModule;
 
 use crate::game::{GameRuntime, Host};
 use crate::input::Input;
@@ -508,7 +508,7 @@ mod tests {
     #[test]
     fn fuzzes_the_game_and_cuts_failures_down() {
         let Some(directory) = bundle() else { return };
-        let engine = blot_host::engine().unwrap();
+        let engine = squid_host::engine().unwrap();
         let game = Game::load(engine, &directory, &directory.join("assets"), &directory.join("main.scene")).unwrap();
         let out = std::env::temp_dir().join(format!("pen-fuzz-{}", std::process::id()));
         let options = Options {

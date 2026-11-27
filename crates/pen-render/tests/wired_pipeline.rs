@@ -1437,7 +1437,7 @@ fn gpu_render_frame_drives_svgf_meshlets_environment_hdri_and_reversed_z() {
     );
     renderer.clear_environment_scene();
 
-    // 4b. Blot extension Gerstner water (`ENV_WATER_EXT_TAG`).
+    // 4b. Squid extension Gerstner water (`ENV_WATER_EXT_TAG`).
     let mut water_frame = env_base.clone();
     water_frame.extensions.push(Extension {
         tag: ENV_WATER_EXT_TAG,
@@ -1462,7 +1462,7 @@ fn gpu_render_frame_drives_svgf_meshlets_environment_hdri_and_reversed_z() {
         "ENV_WATER_EXT_TAG must draw blue-tinted Gerstner water: {px_water:?}"
     );
 
-    // 4c. Blot extension GPU foliage (`ENV_FOLIAGE_EXT_TAG`).
+    // 4c. Squid extension GPU foliage (`ENV_FOLIAGE_EXT_TAG`).
     let mut foliage_frame = common::frame(vec![]);
     foliage_frame.projection = proj_fwd;
     foliage_frame.light_direction = Vector { x: 0.0, y: -1.0, z: -0.3 };

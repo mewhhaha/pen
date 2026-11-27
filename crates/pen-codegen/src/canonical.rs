@@ -1,8 +1,8 @@
 //! The packets' canonical walks: their values in the schema's order, laid out
 //! by none of the packets' tricks, so that pen's tests can compare what the
-//! Rust and the Blot codecs make of the same values (pen's
+//! Rust and the Squid codecs make of the same values (pen's
 //! `codec_round_trip`). Rust gets `canonical_input` and `canonical_render`
-//! beside the codecs; the game's `pen/protocol_canonical.blot`, which only
+//! beside the codecs; the game's `pen/protocol_canonical.sq`, which only
 //! tests import, gets the same input walk and a flat render packet writer.
 //!
 //! The walk of a value, by its kind:
@@ -23,8 +23,8 @@
 //! The render frame's walk leaves out the layout's own lanes (the magic and
 //! sizes) and the sections whose values their owners carry, and takes the
 //! schema and state, which Rust's frame holds apart, in their places.
-use crate::blot::{chunk, comment};
 use crate::model::*;
+use crate::squid::{chunk, comment};
 use serde_json::Value;
 use std::collections::HashSet;
 
@@ -78,7 +78,7 @@ fn section_record<'a>(model: &'a Model, name: &str) -> &'a Value {
     &model.section(name).section["record"]
 }
 
-/// Whether an event's field crosses as a number (Blot's F32), not a whole one.
+/// Whether an event's field crosses as a number (Squid's F32), not a whole one.
 fn crosses_as_f32(field: &Value) -> bool {
     field["wire"] == "f32"
 }
@@ -190,7 +190,7 @@ fn rust_field(model: &Model, pushes: &mut Pushes, field: &Value, path: &str, out
 /// The walk of an input packet and of a render packet, for pen-protocol's
 /// codec module.
 pub fn rust(model: &Model) -> Vec<String> {
-    let mut out = "    /// The walk of an input packet's values that pen's tests compare with the game's\n    /// (`pen/protocol_canonical.blot`): elapsed, the viewport's width and height, the events'\n    /// count, each event's tag and then its fields in the schema's order (a key as its code),\n    /// then the state's count and lanes. It lays nothing out as the packet does.\n    pub fn canonical_input(frame: &Frame, elapsed: f64, state: &[f32]) -> Vec<f32> {\n        let viewport = frame.viewport;\n        let mut out = vec![elapsed as f32, viewport.width as f32, viewport.height as f32, frame.events.len() as f32];\n        for event in &frame.events {\n            match event {".lines().map(str::to_owned).collect::<Vec<_>>();
+    let mut out = "    /// The walk of an input packet's values that pen's tests compare with the game's\n    /// (`pen/protocol_canonical.sq`): elapsed, the viewport's width and height, the events'\n    /// count, each event's tag and then its fields in the schema's order (a key as its code),\n    /// then the state's count and lanes. It lays nothing out as the packet does.\n    pub fn canonical_input(frame: &Frame, elapsed: f64, state: &[f32]) -> Vec<f32> {\n        let viewport = frame.viewport;\n        let mut out = vec![elapsed as f32, viewport.width as f32, viewport.height as f32, frame.events.len() as f32];\n        for event in &frame.events {\n            match event {".lines().map(str::to_owned).collect::<Vec<_>>();
     for event in model.events() {
         let fields = event_fields(event);
         for host in hosts(event) {
@@ -227,7 +227,7 @@ pub fn rust(model: &Model) -> Vec<String> {
     out.extend("            }\n        }\n        out.push(state.len() as f32);\n        out.extend_from_slice(state);\n        out\n    }\n".split('\n').map(str::to_owned));
 
     out.extend(
-        "    mod canonical_sink {\n        pub(super) trait CanonicalSink {\n            fn push(&mut self, value: f32);\n            fn extend<const N: usize>(&mut self, values: [f32; N]);\n            fn extend_from_slice(&mut self, values: &[f32]);\n        }\n\n        impl CanonicalSink for Vec<f32> {\n            #[inline]\n            fn push(&mut self, value: f32) {\n                Vec::push(self, value);\n            }\n            #[inline]\n            fn extend<const N: usize>(&mut self, values: [f32; N]) {\n                Vec::extend_from_slice(self, &values);\n            }\n            #[inline]\n            fn extend_from_slice(&mut self, values: &[f32]) {\n                Vec::extend_from_slice(self, values);\n            }\n        }\n\n        pub(super) struct Fnv1aSink(pub(super) u64);\n\n        impl Fnv1aSink {\n            #[inline]\n            fn write_lane(&mut self, lane: f32) {\n                for byte in lane.to_bits().to_le_bytes() {\n                    self.0 = (self.0 ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3);\n                }\n            }\n        }\n\n        impl CanonicalSink for Fnv1aSink {\n            #[inline]\n            fn push(&mut self, value: f32) {\n                self.write_lane(value);\n            }\n            #[inline]\n            fn extend<const N: usize>(&mut self, values: [f32; N]) {\n                for value in values {\n                    self.write_lane(value);\n                }\n            }\n            #[inline]\n            fn extend_from_slice(&mut self, values: &[f32]) {\n                for &value in values {\n                    self.write_lane(value);\n                }\n            }\n        }\n    }\n\n    /// The walk of a render packet's values that pen's tests compare with the game's\n    /// (`pen/protocol_canonical.blot`): the header's values and then the sections, each in the\n    /// schema's order, as described in pen-codegen's canonical.rs. It takes the schema and\n    /// the state, which the frame does not hold, where the packet has them.\n    pub fn canonical_render(frame: &RenderFrame, schema: u32, state: &[f32]) -> Vec<f32> {\n        let mut out = Vec::new();\n        walk_canonical_render(&mut out, frame, schema, state);\n        out\n    }\n\n    /// Streaming FNV-1a hash of [`canonical_render`] without allocating a buffer.\n    pub fn hash_canonical_render(frame: &RenderFrame, schema: u32, state: &[f32]) -> u64 {\n        let mut out = canonical_sink::Fnv1aSink(0xcbf2_9ce4_8422_2325);\n        walk_canonical_render(&mut out, frame, schema, state);\n        out.0\n    }\n\n    fn walk_canonical_render<S: canonical_sink::CanonicalSink>(out: &mut S, frame: &RenderFrame, schema: u32, state: &[f32]) {"
+        "    mod canonical_sink {\n        pub(super) trait CanonicalSink {\n            fn push(&mut self, value: f32);\n            fn extend<const N: usize>(&mut self, values: [f32; N]);\n            fn extend_from_slice(&mut self, values: &[f32]);\n        }\n\n        impl CanonicalSink for Vec<f32> {\n            #[inline]\n            fn push(&mut self, value: f32) {\n                Vec::push(self, value);\n            }\n            #[inline]\n            fn extend<const N: usize>(&mut self, values: [f32; N]) {\n                Vec::extend_from_slice(self, &values);\n            }\n            #[inline]\n            fn extend_from_slice(&mut self, values: &[f32]) {\n                Vec::extend_from_slice(self, values);\n            }\n        }\n\n        pub(super) struct Fnv1aSink(pub(super) u64);\n\n        impl Fnv1aSink {\n            #[inline]\n            fn write_lane(&mut self, lane: f32) {\n                for byte in lane.to_bits().to_le_bytes() {\n                    self.0 = (self.0 ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3);\n                }\n            }\n        }\n\n        impl CanonicalSink for Fnv1aSink {\n            #[inline]\n            fn push(&mut self, value: f32) {\n                self.write_lane(value);\n            }\n            #[inline]\n            fn extend<const N: usize>(&mut self, values: [f32; N]) {\n                for value in values {\n                    self.write_lane(value);\n                }\n            }\n            #[inline]\n            fn extend_from_slice(&mut self, values: &[f32]) {\n                for &value in values {\n                    self.write_lane(value);\n                }\n            }\n        }\n    }\n\n    /// The walk of a render packet's values that pen's tests compare with the game's\n    /// (`pen/protocol_canonical.sq`): the header's values and then the sections, each in the\n    /// schema's order, as described in pen-codegen's canonical.rs. It takes the schema and\n    /// the state, which the frame does not hold, where the packet has them.\n    pub fn canonical_render(frame: &RenderFrame, schema: u32, state: &[f32]) -> Vec<f32> {\n        let mut out = Vec::new();\n        walk_canonical_render(&mut out, frame, schema, state);\n        out\n    }\n\n    /// Streaming FNV-1a hash of [`canonical_render`] without allocating a buffer.\n    pub fn hash_canonical_render(frame: &RenderFrame, schema: u32, state: &[f32]) -> u64 {\n        let mut out = canonical_sink::Fnv1aSink(0xcbf2_9ce4_8422_2325);\n        walk_canonical_render(&mut out, frame, schema, state);\n        out.0\n    }\n\n    fn walk_canonical_render<S: canonical_sink::CanonicalSink>(out: &mut S, frame: &RenderFrame, schema: u32, state: &[f32]) {"
             .lines()
             .map(str::to_owned),
     );
@@ -532,9 +532,9 @@ fn render_stream(model: &Model) -> Vec<String> {
     out
 }
 
-/// The game's `pen/protocol_canonical.blot`: the input walk, and the render
+/// The game's `pen/protocol_canonical.sq`: the input walk, and the render
 /// walk streamed into a packet, with its child draws and extras gathered beside it.
-pub fn blot(model: &Model, top: &[String]) -> String {
+pub fn squid(model: &Model, top: &[String]) -> String {
     let mut out = top.to_vec();
     out.extend([
         "//".to_owned(),

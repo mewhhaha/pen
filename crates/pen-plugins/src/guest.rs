@@ -1,6 +1,6 @@
-//! Sandboxed execution of pure, zero-import Blot ABI 8 Wasm modules built by a
+//! Sandboxed execution of pure, zero-import Squid ABI 8 Wasm modules built by a
 //! compiler plugin (e.g. Stage-0 generators), with host-shared compiled module
-//! caching, bounded linear memory, epoch deadline enforcement, and `blot:traps`
+//! caching, bounded linear memory, epoch deadline enforcement, and `squid:traps`
 //! v1 runtime provenance decoding.
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -17,7 +17,7 @@ use crate::bindings::pen::plugin::guest::{CallError, TrapInfo};
 const GUEST_MEMORY: usize = 256 << 20;
 /// Maximum table elements a Stage-0 guest instance may allocate.
 const GUEST_TABLE_ELEMENTS: usize = 1 << 20;
-/// Maximum Wasm call stack for a Stage-0 guest (matches `blot-host`).
+/// Maximum Wasm call stack for a Stage-0 guest (matches `squid-host`).
 const GUEST_STACK_BYTES: usize = 2 * 1024 * 1024;
 /// Upper bound on host-cached compiled Stage-0 Wasm modules per `Plugins`.
 const MAX_CACHED_MODULES: usize = 64;
@@ -64,7 +64,7 @@ impl GuestRuntime {
         }
         let abi = abi::read_abi(wasm).map_err(|error| CallError::Invalid(format!("{error:#}")))?;
         if !abi.data_stacks {
-            return Err(CallError::Invalid("Stage-0 guest does not use Blot ABI 8".into()));
+            return Err(CallError::Invalid("Stage-0 guest does not use Squid ABI 8".into()));
         }
         let module = Module::new(&self.engine, wasm)
             .map_err(|error| CallError::Invalid(format!("invalid Wasm module: {error:#}")))?;
@@ -84,7 +84,7 @@ impl GuestRuntime {
         Ok(entry)
     }
 
-    /// Runs `export_name(input)` on `wasm` as a pure Blot ABI 8
+    /// Runs `export_name(input)` on `wasm` as a pure Squid ABI 8
     /// `Array U32 -> Array U32` call in a fresh sandboxed instance.
     pub fn run_u32_packet(
         &self,
@@ -129,14 +129,14 @@ impl GuestRuntime {
         let instance =
             Instance::new(&mut store, &compiled.module, &[]).map_err(|error| map_trap(&compiled.abi, None, error))?;
         let memory = instance
-            .get_memory(&mut store, "blot:memory")
-            .ok_or_else(|| CallError::Invalid("Stage-0 guest does not export `blot:memory`".into()))?;
+            .get_memory(&mut store, "squid:memory")
+            .ok_or_else(|| CallError::Invalid("Stage-0 guest does not export `squid:memory`".into()))?;
         let allocate = instance
-            .get_typed_func::<i32, i32>(&mut store, "blot:allocate")
-            .map_err(|error| CallError::Invalid(format!("Stage-0 guest has invalid `blot:allocate`: {error:#}")))?;
+            .get_typed_func::<i32, i32>(&mut store, "squid:allocate")
+            .map_err(|error| CallError::Invalid(format!("Stage-0 guest has invalid `squid:allocate`: {error:#}")))?;
         let reset = instance
-            .get_typed_func::<i32, i32>(&mut store, "blot:reset")
-            .map_err(|error| CallError::Invalid(format!("Stage-0 guest has invalid `blot:reset`: {error:#}")))?;
+            .get_typed_func::<i32, i32>(&mut store, "squid:reset")
+            .map_err(|error| CallError::Invalid(format!("Stage-0 guest has invalid `squid:reset`: {error:#}")))?;
         let entry = instance.get_typed_func::<i32, i32>(&mut store, export_name).map_err(|error| {
             CallError::Invalid(format!("Stage-0 export `{export_name}` is not (i32) -> i32: {error:#}"))
         })?;
@@ -304,8 +304,8 @@ mod tests {
         }
 
         let mut funcs = FunctionSection::new();
-        funcs.function(0); // blot:allocate
-        funcs.function(0); // blot:reset
+        funcs.function(0); // squid:allocate
+        funcs.function(0); // squid:reset
         funcs.function(0); // generate
         module.section(&funcs);
 
@@ -315,20 +315,20 @@ mod tests {
 
         let base = u32::from(with_import);
         let mut exports = ExportSection::new();
-        exports.export("blot:memory", ExportKind::Memory, 0);
-        exports.export("blot:allocate", ExportKind::Func, base);
-        exports.export("blot:reset", ExportKind::Func, base + 1);
+        exports.export("squid:memory", ExportKind::Memory, 0);
+        exports.export("squid:allocate", ExportKind::Func, base);
+        exports.export("squid:reset", ExportKind::Func, base + 1);
         exports.export("generate", ExportKind::Func, base + 2);
         module.section(&exports);
 
         let mut code = CodeSection::new();
-        // blot:allocate: return 4096
+        // squid:allocate: return 4096
         let mut alloc_fn = Function::new([]);
         alloc_fn.instruction(&Instruction::I32Const(4096));
         alloc_fn.instruction(&Instruction::End);
         code.function(&alloc_fn);
 
-        // blot:reset: return 0
+        // squid:reset: return 0
         let mut reset_fn = Function::new([]);
         reset_fn.instruction(&Instruction::I32Const(0));
         reset_fn.instruction(&Instruction::End);
@@ -355,10 +355,10 @@ mod tests {
 
         // ArrayU32 = tag 5
         let abi = abi_section("generate", 5, 5);
-        module.section(&CustomSection { name: "blot:abi".into(), data: abi.into() });
+        module.section(&CustomSection { name: "squid:abi".into(), data: abi.into() });
         if trap_id.is_some() {
             let traps = traps_section(1, 0, 12, 34, "bad wgsl");
-            module.section(&CustomSection { name: "blot:traps".into(), data: traps.into() });
+            module.section(&CustomSection { name: "squid:traps".into(), data: traps.into() });
         }
         module.finish()
     }

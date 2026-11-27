@@ -125,15 +125,15 @@ images into pages, so that the sprites of an interface share a texture:
 
 ```json
 { "recipe": "ui-atlas", "builtin": "atlas", "sources": ["art/ui/*.png"],
-  "outputs": ["src/assets/ui_atlas*", "src/ui_atlas.blot"],
-  "options": { "out": "src/assets/ui_atlas", "blot": "src/ui_atlas.blot" } }
+  "outputs": ["src/assets/ui_atlas*", "src/ui_atlas.sq"],
+  "options": { "out": "src/assets/ui_atlas", "squid": "src/ui_atlas.sq" } }
 ```
 
 It writes `ui_atlas.png` (and `ui_atlas_1.png` on when one page of
 `maxSize`, 2048 by default, is not enough), `ui_atlas.atlas.json` with each
-sprite's page, pixels and texture coordinates, and, asked for, a Blot module
+sprite's page, pixels and texture coordinates, and, asked for, a Squid module
 with one `#Frame` constant per sprite (`u0`..`v1` for ink's `ui.image`, its
-size, and where its trimmed pixels were; Blot reads a frame bound first,
+size, and where its trimmed pixels were; Squid reads a frame bound first,
 `let aim = ui_atlas.aim` then `aim.u0`). Packing is MaxRects with the best
 short side fit, largest first, so the same sources give the same bytes.
 Each image loses its fully transparent border (`trim`), and its edge pixels

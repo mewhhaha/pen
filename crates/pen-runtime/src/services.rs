@@ -1,5 +1,5 @@
 //! Services: what the platform and native libraries do for the game, through
-//! one deterministic boundary (gdev's `packages/services.blot`). The game asks
+//! one deterministic boundary (gdev's `packages/services.sq`). The game asks
 //! in its render packet's `services` section; a [`Service`] answers each
 //! request once, and the answer reaches the game as input, a ServiceAnswer
 //! event and then ServiceData events carrying its values three at a time, in

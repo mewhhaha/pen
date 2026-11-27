@@ -135,7 +135,7 @@ impl Model {
     pub fn events(&self) -> &[Value] {
         array(&self.protocol["input"]["events"])
     }
-    /// The events pen's own Blot bindings decode: all but the one that
+    /// The events pen's own Squid bindings decode: all but the one that
     /// carries a game's own events (`"game": true`), which only the
     /// bindings a checkout's declarations make decode.
     pub fn core_events(&self) -> Vec<&Value> {
@@ -288,7 +288,7 @@ fn lane(value: &Value, header: bool) -> Result<()> {
         }
         "lanes" | "optional" => {
             integer(&value["count"])?;
-            ensure!(n(&value["count"]) == 4, "Blot requires four-lane values");
+            ensure!(n(&value["count"]) == 4, "Squid requires four-lane values");
             if kind(value) == "optional" {
                 string(&value["message"])?;
             }
@@ -307,7 +307,7 @@ fn lane(value: &Value, header: bool) -> Result<()> {
             validate_bound(&value["max"])?;
             if kind(value) == "tail" {
                 integer(&value["unit"])?;
-                ensure!(n(&value["unit"]) == 4, "Blot requires four-lane tails");
+                ensure!(n(&value["unit"]) == 4, "Squid requires four-lane tails");
             } else {
                 string(&value["over"])?;
                 string(&value["under"])?;

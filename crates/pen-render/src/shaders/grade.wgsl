@@ -3,7 +3,7 @@
 // Academy's S-2014-003 curve on the frame's own primaries, so no gamut change),
 // where equal steps are equal stops, so contrast turns about a stop rather than a
 // number and a look-up table covers 17 stops in 64 texels at most. The same
-// formula is Ink's `color.grade` (Blot) and the f64 reference in this crate's
+// formula is Ink's `color.grade` (Squid) and the f64 reference in this crate's
 // tests, term for term.
 //
 // Order: vignette, exposure offset and white balance, contrast about the pivot in

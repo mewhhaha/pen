@@ -56,7 +56,7 @@ page, and compares the tree as AccessKit gets it, and the audit's findings, with
 `crates/pen/tests/a11y/*.txt`. A change to the game's interface shows as a diff;
 `PEN_UPDATE_A11Y=1` writes the files.
 
-**Testing Library-style role queries.** Both Rust and Blot tests can query and
+**Testing Library-style role queries.** Both Rust and Squid tests can query and
 drive interfaces strictly by ARIA role and accessible name:
 - In Rust (`pen_runtime::role_testing` for `&[UiNode]` frames, and
   `pen::accessibility::testing::SessionTester` for live headless `Session`s):
@@ -67,9 +67,9 @@ drive interfaces strictly by ARIA role and accessible name:
   (`click`, `focus`, `blur`, `increment`, `decrement`, `set_value`, `expand`,
   `collapse`), and `assert_audit_clean()`, with formatted accessible tree dumps
   on `NotFound` / `MultipleMatches`.
-- In pure Blot (`ink/ui/testing`): matching `by_role`, `get_by_role`,
+- In pure Squid (`ink/ui/testing`): matching `by_role`, `get_by_role`,
   `query_by_role`, `within`, `user_click_role`, `user_expand`, `user_set_value`,
-  `user_type`, and `audit_tree` for host-independent `pen test-blot` suites.
+  `user_type`, and `audit_tree` for host-independent `pen test-squid` suites.
 
 ## The engine's preferences
 
@@ -106,7 +106,7 @@ player with that deficiency sees, for checking a game's colours; it is never
 kept. With no filter, frames draw straight to the output as before. The GPU test
 `pen-render/tests/filter.rs` checks the pass against the CPU's matrix.
 
-**gdev** (`src/access.blot`) keeps them in its state, shows them on the
+**gdev** (`src/access.sq`) keeps them in its state, shows them on the
 settings' Accessibility page (colour filter, text size 100 to 200%, reduced
 motion), grows the menu's and the HUD's text with the scale as far as the screen
 has room, and with reduced motion cuts the menu's flight to the stars (no smear,
@@ -149,7 +149,7 @@ the rest from fallback fonts in order (subsets of Noto Sans Arabic Bold and Noto
 Sans Bold, OFL), Arabic as the whole of Presentation Forms-B. Glyph metrics keep
 each font's own baseline.
 
-**gdev** (`src/locale.blot`) asks for the words of its menu, settings, HUD and
+**gdev** (`src/locale.sq`) asks for the words of its menu, settings, HUD and
 editor toolbar once (`text.locale_keys`), keeps them in its state, and shows its
 own until they come; it draws the drawn text and names its nodes with the read
 text; the HUD's gnorp count is said in the language's plural form, asked again
@@ -170,7 +170,7 @@ control partly off the screen); text whose contrast with what lies behind it is
 below WCAG 2's 4.5:1 (3:1 for large text), measured in the frame's pixels; and
 controls smaller than 24 by 24 pixels.
 
-The dev tools' `/audit` (gdev's `devtools/audit.blot`) shows the findings in a
+The dev tools' `/audit` (gdev's `devtools/audit.sq`) shows the findings in a
 dialog of their own, asked again every second (DEVTOOLS_OP_AUDIT); each finding
 is a list item for assistive technology. Natively the host reads back the next
 frame after each request, without the dev tools over it, and answers from the

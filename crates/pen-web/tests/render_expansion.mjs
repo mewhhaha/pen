@@ -330,15 +330,15 @@ function buildGuestWasm() {
     [0x60, 1, 0x6f, 1, 0x7f],
     [0x60, 1, 0x7f, 1, 0x7f],
   ]);
-  const imports = vector([[...text('blot:host/1'), ...text('call_array_f32_array_f32'), 0, 0]]);
+  const imports = vector([[...text('squid:host/1'), ...text('call_array_f32_array_f32'), 0, 0]]);
   const functions = vector([[1], [2], [2]]);
   const memory = vector([[0, 2]]); // 128 KiB
   const globals = vector([[0x7f, 1, ...i32Const(requestArena), 0x0b]]);
   const exports = vector([
     [...text('main'), 0, 1],
-    [...text('blot:memory'), 2, 0],
-    [...text('blot:allocate'), 0, 2],
-    [...text('blot:reset'), 0, 3],
+    [...text('squid:memory'), 2, 0],
+    [...text('squid:allocate'), 0, 2],
+    [...text('squid:reset'), 0, 3],
   ]);
   const body = code => {
     const bytes = [...vector([]), ...code, 0x0b];
@@ -365,7 +365,7 @@ function buildGuestWasm() {
   const manifest = [8, 1, ...text('main'), 4, 6, 6, 0, 0];
   return new Uint8Array([
     0, 0x61, 0x73, 0x6d, 1, 0, 0, 0,
-    ...custom('blot:abi', manifest),
+    ...custom('squid:abi', manifest),
     ...section(1, types),
     ...section(2, imports),
     ...section(3, functions),
@@ -382,10 +382,10 @@ async function verifyRequestArena(bytes) {
   let exchanged = 0;
   const frames = 4096;
   const { instance } = await WebAssembly.instantiate(bytes, {
-    'blot:host/1': {
+    'squid:host/1': {
       call_array_f32_array_f32() {
-        const memory = instance.exports['blot:memory'].buffer;
-        const pointer = instance.exports['blot:allocate'](256);
+        const memory = instance.exports['squid:memory'].buffer;
+        const pointer = instance.exports['squid:allocate'](256);
         const request = new Float32Array(memory, pointer + 4, 63);
         new DataView(memory).setUint32(pointer, request.length, true);
         request.fill(0);
@@ -396,7 +396,7 @@ async function verifyRequestArena(bytes) {
   });
   instance.exports.main(null);
   assert.equal(exchanged, frames + 1);
-  assert.equal(instance.exports['blot:memory'].buffer.byteLength, 128 * 1024);
+  assert.equal(instance.exports['squid:memory'].buffer.byteLength, 128 * 1024);
 }
 
 const guestBytes = buildGuestWasm();

@@ -2,7 +2,7 @@
 
 The 23 October 2026 isolated probe attributes a large native memory peak to
 Wasmtime's inlining compilation. It supplies an already compiled game module
-directly to `blot-host`; it does not run the Blot compiler, load assets, create
+directly to `squid-host`; it does not run the Squid compiler, load assets, create
 a renderer, or execute a frame. It therefore does not reproduce or attribute all
 of the historical application's roughly 5 GiB peak.
 
@@ -36,7 +36,7 @@ saves the example's own module timer separately in subsequent reports.
 Reproduce with an equivalent frozen module:
 
 ```sh
-cargo build --release -p blot-host --example compile_time
+cargo build --release -p squid-host --example compile_time
 python3 scripts/profile-compile.py /path/to/game.wasm --out target/module-profile
 ```
 
@@ -124,7 +124,7 @@ Production settings remain unchanged. The experiment identifies a real
 compile-time/memory tradeoff, not an accepted release optimization. Reproduce:
 
 ```sh
-cargo build --release -p blot-host --example memory_images
+cargo build --release -p squid-host --example memory_images
 python3 scripts/profile-runtime.py /path/to/game.wasm --out target/frame-profile
 ```
 
@@ -166,12 +166,12 @@ loading and game execution; they exclude rendering and GPU asset upload.
 
 ### Measured source export and startup, 23 October 2026
 
-Three alternating pairs compare Blot `93bc8d4` with the numeric/ownership
+Three alternating pairs compare Squid `93bc8d4` with the numeric/ownership
 compiler now published as `4091cb2`, using the same rebuilt Pen host. All 24
 commands pass, cold/warm Wasm stays identical per compiler, and every schema and
 packet witness matches across variants.
 
-| Phase        | Blot variant | Wall seconds | User + system seconds | wait4 maximum RSS, MiB |
+| Phase        | Squid variant | Wall seconds | User + system seconds | wait4 maximum RSS, MiB |
 | ------------ | ------------ | -----------: | --------------------: | ---------------------: |
 | export-cold  | baseline     |        6.912 |                14.798 |                 2548.9 |
 | export-cold  | candidate    |        6.749 |                14.584 |                 2472.2 |
@@ -187,7 +187,7 @@ separately records sampled process-tree sums and individual processes. For
 example, short warm packet launches reach 105.3 MiB by wait4 while 50 ms
 sampling observes less. Do not substitute the sampled value for the true peak.
 
-The largest observed resident process is Pen (up to 2,539 MiB); the Blot child
+The largest observed resident process is Pen (up to 2,539 MiB); the Squid child
 peaks at 319.4 MiB in these samples. This attributes the observed large headless
 peak to the host; it does not reproduce all of the historical 5 GiB observation
 or cover rendering/GPU upload. Cache directories have five entries for export
@@ -214,7 +214,7 @@ retention, and falls back to compilation when unavailable. Guest instances and
 scene execution remain fresh.
 
 Three alternating pairs compare the old and new **Pen executables**, using the
-same numeric Blot compiler, project and assets for both.
+same numeric Squid compiler, project and assets for both.
 
 | Phase               | Before wall seconds | After wall seconds | Before CPU seconds | After CPU seconds |
 | ------------------- | ------------------: | -----------------: | -----------------: | ----------------: |

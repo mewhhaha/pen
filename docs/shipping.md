@@ -71,7 +71,7 @@ codec, so packaging requires a player that can read it.
   each, in `dist/linux` and `dist/windows`.
 - `pen build --game DIR` packages a bundle compiled already (`pen export`'s, or
   a package's `game/`) instead of a checkout: no checkout, compiler plugin or
-  Blot compiler needed, only a pen with Cranelift for the runtime's
+  Squid compiler needed, only a pen with Cranelift for the runtime's
   architecture. CI packages the game job's bundle this way for the Windows
   player, and on a Mac for the macOS one.
 
@@ -84,7 +84,7 @@ game Wasm, packed assets, starting scene and startup asset list. Install
 compiler's output for comparisons. Development runs and `pen export` keep that
 output too.
 
-Optimization preserves the guest ABI and Blot metadata, retains function names,
+Optimization preserves the guest ABI and Squid metadata, retains function names,
 and regenerates embedded source maps for the rewritten instructions. Pen
 validates the result before replacing the staged Wasm. External source maps
 require `--no-optimize`. A versioned content stamp avoids optimizing an
@@ -103,7 +103,7 @@ has it, Windows 11 requires it, and it keeps Wasm's `floor`, `ceil`, `trunc` and
 `nearest` single instructions (SSE4.1) rather than calls into the host.
 `pen build --cpu PRESET` picks another Cranelift preset (`x86-64-v3` for AVX2
 and FMA, `znver2`, `baseline` for plain x86-64) or `native`. This is
-`blot_host::portable_engine`: `Config::target` with the triple, which starts
+`squid_host::portable_engine`: `Config::target` with the triple, which starts
 Cranelift from the architecture's baseline instead of detecting this CPU's
 features, plus the preset's ISA flags.
 
@@ -128,7 +128,7 @@ cannot.
 For the two builds to agree, the workspace's wasmtime dependency has only the
 features running a precompiled guest needs (`runtime`, `std`, `gc`, `gc-drc` for
 `externref`, `backtrace` for named guest frames in traps, `anyhow`), and
-blot-host's `compiler` feature adds only `cranelift`, `incremental-cache` and
+squid-host's `compiler` feature adds only `cranelift`, `incremental-cache` and
 `parallel-compilation`: a feature that changed the engine's Wasm features or
 tunables on one side only would make every `game.cwasm` incompatible.
 
@@ -278,7 +278,7 @@ in catalog order); with `SOURCE_DATE_EPOCH` set (seconds since 1970, the
 convention of reproducible-builds.org) `pen build` gives every file and
 directory that modification time, so an archive of the package is the same bytes
 too (`reproducible.rs`). `just reproducible` (`scripts/reproducible.sh`) builds
-the package twice, each with caches of its own (the Blot program and
+the package twice, each with caches of its own (the Squid program and
 `game.cwasm` compiled from nothing both times), and fails unless every file,
 mode and time is the same; CI's game job runs it.
 
@@ -549,7 +549,7 @@ latest 20. `PEN_REPORTS=off` sends nothing whatever was agreed, and the tests
 send nothing (they post to a stand-in, and the curl transport refuses in them).
 gdev asks on its settings' About page: a Reports row of none, crash reports, or
 crash and performance reports, or "Not collected" where the service is
-unavailable (gdev's `src/reports.blot`).
+unavailable (gdev's `src/reports.sq`).
 
 ## Steam
 
@@ -675,9 +675,9 @@ name, so that it cannot collide with another game's `gdev`.
 [ci.md](ci.md) has every job, what it proves and what the owner sets. In short:
 the workflow builds native and browser hosts, runs strict Clippy and tests on
 Mesa lavapipe, and cross-builds Linux (glibc 2.28) and Windows players. The game
-job checks out sibling repositories at `GDEV_REF` and `BLOT2_REF`, builds blotc
+job checks out sibling repositories at `GDEV_REF` and `SQUID_REF`, builds squidc
 with Zig, checks out Ink at `INK_REF`, compiles the plugin, then runs the full
-Blot suite, deterministic replays, required golden images and packaging.
+Squid suite, deterministic replays, required golden images and packaging.
 `CHECKOUTS_TOKEN` grants access to private siblings.
 
 Cross-compilation does not establish runtime compatibility. Only this Linux

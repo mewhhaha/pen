@@ -50,7 +50,7 @@ jobs:
             cd plugins
             cargo build --locked --release --target wasm32-wasip2
           )
-          install -m 644 plugins/target/wasm32-wasip2/release/pen_plugin_blot.wasm bundle/plugins/blot.wasm
+          install -m 644 plugins/target/wasm32-wasip2/release/pen_plugin_squid.wasm bundle/plugins/squid.wasm
           sh crates/pen-web/build.sh "$PWD/bundle/web"
           sh crates/pen-web/build.sh "$PWD/bundle/web-compact" --compact
           sh crates/pen-web/build.sh "$PWD/bundle/web-3d" --3d
@@ -67,7 +67,7 @@ jobs:
           [[ "$reported_version" == "pen $version "* ]]
           bundle/pen --help > bundle-help.txt
           grep -F 'tool NAME [ARGS...]' bundle-help.txt
-          test -s bundle/plugins/blot.wasm
+          test -s bundle/plugins/squid.wasm
           test -s bundle/web/pen_web_bg.wasm
           test -d bundle/web/shaders
           test -s bundle/web-compact/pen_web_bg.wasm
@@ -80,5 +80,5 @@ jobs:
           sha256sum "$archive" > "$archive.sha256"
           gh release create "$RELEASE_TAG" --verify-tag \
             --title "Pen $version" \
-            --notes 'Development CLI, Blot compiler plugin, and browser host for Ubuntu 24.04 x86_64. Extract the archive and add its directory to PATH. Install libasound2t64, libdbus-1-3, and libudev1 for the native CLI.' \
+            --notes 'Development CLI, Squid compiler plugin, and browser host for Ubuntu 24.04 x86_64. Extract the archive and add its directory to PATH. Install libasound2t64, libdbus-1-3, and libudev1 for the native CLI.' \
             "$archive" "$archive.sha256"

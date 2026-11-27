@@ -167,7 +167,7 @@ impl State {
     }
 
     /// Encodes outdoor GPU environment passes (CDLOD terrain, Gerstner water, GPU foliage)
-    /// driven by either [`Renderer::set_environment_scene`] or optional Blot `RenderFrame::extensions`.
+    /// driven by either [`Renderer::set_environment_scene`] or optional Squid `RenderFrame::extensions`.
     #[cfg(not(feature = "render-env"))]
     #[allow(clippy::too_many_arguments)]
     pub(in crate::renderer) fn encode_environment_passes(
@@ -184,7 +184,7 @@ impl State {
     }
 
     /// Encodes outdoor GPU environment passes (CDLOD terrain, Gerstner water, GPU foliage)
-    /// driven by either [`Renderer::set_environment_scene`] or optional Blot `RenderFrame::extensions`.
+    /// driven by either [`Renderer::set_environment_scene`] or optional Squid `RenderFrame::extensions`.
     #[cfg(feature = "render-env")]
     #[allow(clippy::too_many_arguments)]
     pub(in crate::renderer) fn encode_environment_passes(
@@ -247,7 +247,7 @@ impl State {
             }
         }
 
-        // Decode optional Blot environment extension sections.
+        // Decode optional Squid environment extension sections.
         for ext in &frame.extensions {
             match ext.tag {
                 ENV_TERRAIN_EXT_TAG if ext.values.len() >= 12 => {

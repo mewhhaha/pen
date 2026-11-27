@@ -30,7 +30,6 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow};
-use blot_host::GuestModule;
 use pen_protocol::{Catalog, GameEvent, RenderFrame, UiNode, Viewport};
 use pen_render::RenderTarget;
 use pen_runtime::captions::{self, Captions, CaptionsService};
@@ -40,6 +39,7 @@ use pen_runtime::state::{self, StateAdapter};
 #[cfg(all(test, feature = "compiler"))]
 use pen_runtime::transport;
 use pen_runtime::transport::{Replaying, Rewind, Transport};
+use squid_host::GuestModule;
 use std::sync::Arc;
 use winit::event::WindowEvent;
 use winit::window::Window;
@@ -386,8 +386,8 @@ impl Host for Shell<'_> {
     }
 
     fn report(&mut self, message: &str) {
-        // The runtime's word on a new build starts "Blot reload".
-        match message.strip_prefix("Blot reload") {
+        // The runtime's word on a new build starts "Squid reload".
+        match message.strip_prefix("Squid reload") {
             Some(rest) if rest.starts_with("ed") => devlog::info(Source::Reload, message),
             Some(_) => devlog::error(Source::Reload, message),
             None => devlog::info(Source::Game, message),
@@ -534,7 +534,7 @@ pub struct Session {
     engine: wasmtime::Engine,
     pub gpu: Gpu,
     #[cfg(feature = "devtools")]
-    pub system_trace: Option<std::sync::Arc<blot_host::SystemTrace>>,
+    pub system_trace: Option<std::sync::Arc<squid_host::SystemTrace>>,
     runtime: GameRuntime,
     state_adapter: Arc<dyn StateAdapter>,
     audio: Option<Audio>,
@@ -601,7 +601,7 @@ pub struct Session {
     packets: pen_runtime::inspect::Packets,
     /// The profile the game's guest is sampled into, while profiled.
     #[cfg(feature = "devtools")]
-    sampling: Option<std::sync::Arc<blot_host::Profile>>,
+    sampling: Option<std::sync::Arc<squid_host::Profile>>,
     /// Whether a sampling profile was attached to the running guest probe.
     #[cfg(feature = "devtools")]
     sampling_attached: bool,
@@ -1180,13 +1180,13 @@ impl Session {
     #[cfg(feature = "devtools")]
     /// The profile the game's guest is sampled into from the next frame
     /// on, and the engine it runs on (whose epoch a profile ticks).
-    pub fn profile(&mut self) -> (&mut Option<std::sync::Arc<blot_host::Profile>>, &wasmtime::Engine) {
+    pub fn profile(&mut self) -> (&mut Option<std::sync::Arc<squid_host::Profile>>, &wasmtime::Engine) {
         (&mut self.sampling, &self.engine)
     }
 
     #[cfg(feature = "devtools")]
     /// What the game's guest showed its probe: its memory and counters.
-    pub fn guest_seen(&self) -> blot_host::Seen {
+    pub fn guest_seen(&self) -> squid_host::Seen {
         self.runtime.program().probe().seen()
     }
 

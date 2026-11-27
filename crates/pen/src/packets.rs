@@ -6,10 +6,10 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use blot_host::GuestModule;
 use pen_protocol::boundary::{decode_frame, encode_frame, read_catalog};
 use pen_protocol::{Extension, Frame, GameEvent, Viewport};
 use pen_runtime::timeline::MOMENT_INTERVAL;
+use squid_host::GuestModule;
 
 use crate::program::{Operation, Program};
 use crate::script::{self, Script, Step};
@@ -157,7 +157,7 @@ mod tests {
     #[test]
     fn cpu_capture_leaves_loading_and_reaches_the_scripted_scene() {
         let Some(bundle) = crate::fixtures::bundle() else { return };
-        let engine = blot_host::engine().unwrap();
+        let engine = squid_host::engine().unwrap();
         let wasm = std::fs::read(bundle.join("game.wasm")).unwrap();
         let cache = std::env::temp_dir().join("pen-test-wasm");
         let module = GuestModule::new(&engine, &wasm, Some(&cache)).unwrap();

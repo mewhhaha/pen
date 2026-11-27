@@ -651,7 +651,7 @@ impl<B: Backend> GameRuntime<B> {
             let mut prepared = open_game(&self.engine, &module).await?;
             if prepared.schema != self.active.schema {
                 host.report(
-                    "Blot reload: the state schema changed; restart the application to initialize the new state",
+                    "Squid reload: the state schema changed; restart the application to initialize the new state",
                 );
                 return Ok(ReloadResult::Incompatible);
             }
@@ -672,14 +672,14 @@ impl<B: Backend> GameRuntime<B> {
             previous.program.close().await;
             host.restored();
             host.report(&match restored {
-                Some(changes) => format!("Blot reloaded; {changes}"),
-                None => "Blot reloaded; game state preserved".to_owned(),
+                Some(changes) => format!("Squid reloaded; {changes}"),
+                None => "Squid reloaded; game state preserved".to_owned(),
             });
             Ok(ReloadResult::Activated)
         })
         .await;
         result.unwrap_or_else(|error| {
-            host.report(&format!("Blot reload rejected: {error:#}"));
+            host.report(&format!("Squid reload rejected: {error:#}"));
             ReloadResult::Rejected
         })
     }

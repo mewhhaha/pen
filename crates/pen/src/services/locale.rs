@@ -167,12 +167,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
     /// The checkout's own tables (`../gdev`): nothing a translator must fix,
-    /// and every glyph they need, shaped, in the font its `src/font.blot`
+    /// and every glyph they need, shaped, in the font its `src/font.sq`
     /// says it has.
     #[test]
     fn the_games_tables_have_no_errors_and_the_font_has_their_glyphs() {
         let checkout = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../gdev");
-        let Ok(font) = std::fs::read_to_string(checkout.join("src/font.blot")) else {
+        let Ok(font) = std::fs::read_to_string(checkout.join("src/font.sq")) else {
             crate::fixtures::missing("no ../gdev checkout");
             return;
         };

@@ -10,8 +10,8 @@ What each job proves, and what it needs:
 | `deny` | ubuntu-24.04 | nothing | Licenses, advisories and bans of both lockfiles |
 | `player` | ubuntu-24.04 | nothing | The shipped player runtimes: Linux against glibc 2.28 and Windows (`x86_64-pc-windows-gnu`), cross-built with zig; uploads `player-runtimes` and their symbols |
 | `windows` | windows-latest | nothing | The player builds with MSVC and starts; the runtime, protocol and renderer tests (GPU tests included) pass on WARP, DX12's software adapter; the packaging and app bundle tests pass on Windows |
-| `android` | ubuntu-24.04 | nothing | Clippy for `aarch64-linux-android` over the portable crates: pen-protocol, pen-runtime, pen-render and blot-host with and without its compiler ([android.md](android.md)) |
-| `game` | ubuntu-24.04 | the sibling checkouts | Protocol freshness, every Cargo test with its fixtures required, the full Blot suite, determinism, the native package and browser export, browser engine conformance (the browser host replays the native run's input and must give the same packets, bit for bit), FXAA witnesses, and the golden images on lavapipe; uploads the image diffs, and for the jobs below the exported game, its pen and the conformance packets |
+| `android` | ubuntu-24.04 | nothing | Clippy for `aarch64-linux-android` over the portable crates: pen-protocol, pen-runtime, pen-render and squid-host with and without its compiler ([android.md](android.md)) |
+| `game` | ubuntu-24.04 | the sibling checkouts | Protocol freshness, every Cargo test with its fixtures required, the full Squid suite, determinism, the native package and browser export, browser engine conformance (the browser host replays the native run's input and must give the same packets, bit for bit), FXAA witnesses, and the golden images on lavapipe; uploads the image diffs, and for the jobs below the exported game, its pen and the conformance packets |
 | `package` | ubuntu-24.04 | `player`, `game` | `pen build --game` packages the game job's bundle for each player runtime without the checkouts; the Linux package plays headless on lavapipe, and its packets equal the checkout's |
 | `windows-smoke` | windows-latest | `package` | The shipped Windows package plays 30 frames headless on WARP (the frame is uploaded as `smoke-windows`), and its packets for the conformance script equal Linux's, bit for bit |
 | `macos` | macos-14 | `game`, when it ran | pen and the player build on Apple silicon; the runtime, protocol and renderer tests pass on Metal; with the game, an app bundle is packaged, signed (ad hoc without the owner's certificate), notarized with the owner's credentials, played on Metal, its packets compared with Linux's, and uploaded as `app-macos` |
@@ -28,12 +28,12 @@ Nothing below can be set from here: the commands are for the owner, with
 
 ### The game job (and package, windows-smoke, macOS packaging)
 
-The game job checks out gdev, blot2 and ink beside pen at fixed commits. Run
+The game job checks out gdev, squid-lang and ink beside pen at fixed commits. Run
 this in pen's checkout, with the siblings beside it at the commits CI
 should test; each must be pushed:
 
 ```sh
-for repo in gdev blot2 ink; do
+for repo in gdev squid-lang ink; do
   name=$(echo "$repo" | tr a-z A-Z)
   slug=$(git -C "../$repo" remote get-url origin | sed -E 's#^(git@github\.com:|https://github\.com/)##; s#\.git$##')
   ref=$(git -C "../$repo" rev-parse HEAD)
@@ -46,8 +46,8 @@ gh secret set CHECKOUTS_TOKEN
 
 `CHECKOUTS_TOKEN` is a fine-grained personal access token (GitHub →
 Settings → Developer settings → Fine-grained tokens) whose repository
-access is only gdev, blot2 and ink, with the permission Contents:
-Read-only; `gh secret set` asks for it. On 2026-10-16 blot2's and ink's
+access is only gdev, squid-lang and ink, with the permission Contents:
+Read-only; `gh secret set` asks for it. On 2026-10-16 squid-lang's and ink's
 checked-out commits were on no remote branch, so they need pushing first.
 
 ### macOS

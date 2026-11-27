@@ -1,11 +1,11 @@
-// Bundle the pinned local Blot adapter; generated output ships without Deno.
+// Bundle the pinned local Squid adapter; generated output ships without Deno.
 const root = new URL("../", import.meta.url);
 const source = new URL("crates/pen-web/structured-source.ts", root);
 const target = new URL("crates/pen-web/structured.js", root);
 // Resolve via the authored import so this tool cannot silently choose another checkout.
-const upstream = new URL("../../../blot2/host/guest.ts", source);
+const upstream = new URL("../../../squid-lang/host/guest.ts", source);
 const input = await Deno.readTextFile(source);
-if (!input.includes("../../../blot2/host/guest.ts")) {
+if (!input.includes("../../../squid-lang/host/guest.ts")) {
   throw Error("Unknown adapter source");
 }
 const temporary = new URL("crates/pen-web/structured.candidate.js", root);

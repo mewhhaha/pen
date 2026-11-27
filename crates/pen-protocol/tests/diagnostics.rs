@@ -43,7 +43,7 @@ fn provenance() -> Provenance {
             end: u32::try_from(lanes::header::CLEAR + 4).unwrap(),
             object: Some("building:7:42".into()),
             system: Some("lighting".into()),
-            source: Some(SourceSpan { file: "src/świat.blot".into(), start: 19, end: 47 }),
+            source: Some(SourceSpan { file: "src/świat.sq".into(), start: 19, end: 47 }),
         }],
     }
 }

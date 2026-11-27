@@ -9,9 +9,9 @@
   compiler and host pass one real Gdev frame with an inspected PNG. Use
   `CONTINUE.md` for exact identities and remaining original-export/backend
   qualification; source inventory success is not whole-runtime qualification.
-- Read `CONTINUE.md` and `../blot2/CONTINUE.md` first. Preserve exact candidate
+- Read `CONTINUE.md` and `../squid-lang/CONTINUE.md` first. Preserve exact candidate
   identities; installed binaries qualify only the revisions actually tested.
-- Use the existing sibling Blot, Ink and Gdev checkouts. Build the matching
+- Use the existing sibling Squid, Ink and Gdev checkouts. Build the matching
   compiler, native host and compiler plugin with the pinned Rust toolchain.
   `just install` also builds browser/player/Steam packaging; it is optional for
   the first frame with `target/release/pen`.
@@ -21,12 +21,12 @@
   escape through host or worker packets. Language tasks are retired; isolated
   host workers and data queues remain.
 - Verify headlessly; do not open windows on the owner's desktop.
-- With a separate `CARGO_TARGET_DIR`, the Blot compiler plugin that the CLI and
+- With a separate `CARGO_TARGET_DIR`, the Squid compiler plugin that the CLI and
   the codec tests load is not where they look. `just plugins` (`cd plugins &&
   cargo build --release --target wasm32-wasip2`) writes it under that target dir
   (or `plugins/target` with the variable unset); copy
-  `wasm32-wasip2/release/pen_plugin_blot.wasm` to `<target>/release/plugins/blot.wasm`
-  for the CLI and `<target>/release/deps/plugins/blot.wasm` for cargo tests.
+  `wasm32-wasip2/release/pen_plugin_squid.wasm` to `<target>/release/plugins/squid.wasm`
+  for the CLI and `<target>/release/deps/plugins/squid.wasm` for cargo tests.
 - Never start Steam with app 480 or accept Microsoft's cargo-xwin license.
 - Preserve unrelated work in sibling checkouts.
 - Keep large artifacts in `~/.cache/pen` or `/var/tmp`; `/tmp` is RAM-backed.

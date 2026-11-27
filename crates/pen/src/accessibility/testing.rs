@@ -84,17 +84,17 @@ impl<'a> SessionTester<'a> {
 mod tests {
     use std::path::Path;
 
-    use blot_host::GuestModule;
     use pen_protocol::boundary::{
         EVENT_FLOATS, FRAME_HEADER_FLOATS, PACKET_HEADER_FLOATS, PACKET_MAGIC, UI_NODE_FLOATS, event_tags,
         lanes::{header, ui_node},
     };
     use pen_protocol::{Catalog, ui_action, ui_role, ui_state};
     use pen_runtime::role_testing::QueryError;
+    use squid_host::GuestModule;
 
     use super::*;
-    use crate::blot_test::tests::{program, signed_leb};
     use crate::session::{Gpu, Options, Paths};
+    use crate::squid_test::tests::{program, signed_leb};
 
     const DIALOG: u32 = 10;
     const SLIDER: u32 = 11;
@@ -268,7 +268,7 @@ mod tests {
     fn start(directory: &Path) -> Session {
         let assets = directory.join("assets");
         std::fs::create_dir_all(&assets).unwrap();
-        let engine = blot_host::engine().unwrap();
+        let engine = squid_host::engine().unwrap();
         let gpu = Gpu::headless((64, 48), &assets, false).unwrap();
         let module = GuestModule::new(&engine, &fixture(), None).unwrap();
         Session::start(

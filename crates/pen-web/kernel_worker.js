@@ -1,4 +1,4 @@
-// Browser Web Worker for Blot vNext `KernelPool` (`pen-web/kernels.js`, §5.1).
+// Browser Web Worker for Squid vNext `KernelPool` (`pen-web/kernels.js`, §5.1).
 // Runs in a dedicated ES-module Web Worker (zero SharedArrayBuffer required).
 //
 // Messages (Worker -> Coordinator):
@@ -77,9 +77,9 @@ self.onmessage = ({ data: msg }) => {
       }
       const instance = new WebAssembly.Instance(module, stubImports);
       const exports = instance.exports;
-      const memory = exports["blot:memory"];
-      const allocate = exports["blot:allocate"];
-      const reset = exports["blot:reset"];
+      const memory = exports["squid:memory"];
+      const allocate = exports["squid:allocate"];
+      const reset = exports["squid:reset"];
       const entryFn = exports[msg.entryName];
       if (
         !(memory instanceof WebAssembly.Memory) ||
@@ -94,8 +94,8 @@ self.onmessage = ({ data: msg }) => {
         memory,
         allocate,
         reset,
-        finishInvocation: typeof exports["blot:finish_invocation"] === "function"
-          ? exports["blot:finish_invocation"]
+        finishInvocation: typeof exports["squid:finish_invocation"] === "function"
+          ? exports["squid:finish_invocation"]
           : null,
         entryFn,
         ctxFn: msg.ctxExport ? exports[msg.ctxExport] : null,

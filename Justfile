@@ -5,7 +5,7 @@ pen := "cargo run --release -q -p pen --"
 # too): pnpm, run through npx, and playwright-core, which picks Chromium.
 pnpm := "npx --yes pnpm@12.8.2"
 playwright := "1.63.0"
-# Pinned wtime-aot release (Linux x86-64 & aarch64 Blot ABI 8 AOT compiler).
+# Pinned wtime-aot release (Linux x86-64 & aarch64 Squid ABI 8 AOT compiler).
 wtime_version := "v0.1.7"
 wtime_aot_x86_64_archive_sha256 := "12929eb09c95d5abd0adbae27d744f7b190158282d1900401581617c380fd512"
 wtime_aot_x86_64_bin_sha256 := "88f6507b29c1cff3e06a6cabe65ad7b192b5e016a77609332187e6d9c21d6d12"
@@ -22,12 +22,12 @@ install: plugins web-host install-player install-wtime-aot
   mv -f ~/.local/lib/pen-runtime/pen.new ~/.local/lib/pen-runtime/pen
   cp "$(ls -t target/release/build/steamworks-sys-*/out/libsteam_api.so | head -1)" ~/.local/lib/pen-runtime/libsteam_api.so.new
   mv -f ~/.local/lib/pen-runtime/libsteam_api.so.new ~/.local/lib/pen-runtime/libsteam_api.so
-  cp plugins/target/wasm32-wasip2/release/pen_plugin_blot.wasm ~/.local/lib/pen-runtime/plugins/blot.wasm.new
-  mv -f ~/.local/lib/pen-runtime/plugins/blot.wasm.new ~/.local/lib/pen-runtime/plugins/blot.wasm
+  cp plugins/target/wasm32-wasip2/release/pen_plugin_squid.wasm ~/.local/lib/pen-runtime/plugins/squid.wasm.new
+  mv -f ~/.local/lib/pen-runtime/plugins/squid.wasm.new ~/.local/lib/pen-runtime/plugins/squid.wasm
   cp crates/pen-web/pkg/{pen_web.js,pen_web_bg.wasm,guest.js,structured.js,kernels.js,kernel_worker.js,index.html} ~/.local/lib/pen-runtime/web/
   rm -rf ~/.local/lib/pen-runtime/web/shaders
   if [ -d crates/pen-web/pkg/shaders ]; then cp -r crates/pen-web/pkg/shaders ~/.local/lib/pen-runtime/web/shaders; fi
-  find ~/.local/lib/pen-runtime/plugins -mindepth 1 -maxdepth 1 ! -name blot.wasm \
+  find ~/.local/lib/pen-runtime/plugins -mindepth 1 -maxdepth 1 ! -name squid.wasm \
     -exec echo removing stale {} \; -exec rm -rf {} +
   find ~/.local/lib/pen-runtime/web -mindepth 1 -maxdepth 1 ! -name pen_web.js ! -name pen_web_bg.wasm ! -name guest.js ! -name structured.js ! -name kernels.js ! -name kernel_worker.js ! -name index.html ! -name shaders \
     -exec echo removing stale {} \; -exec rm -rf {} +
@@ -137,10 +137,10 @@ rust-guest *args:
 
 # Compile times of the release and development engines, first and again.
 compile-time: export
-  cargo run --release -q -p blot-host --example compile_time dist/gdev/game.wasm dist/gdev/game.wasm
+  cargo run --release -q -p squid-host --example compile_time dist/gdev/game.wasm dist/gdev/game.wasm
 
-blot-tests *args:
-  {{pen}} test-blot --project {{gdev}} {{args}}
+squid-tests *args:
+  {{pen}} test-squid --project {{gdev}} {{args}}
 
 # Random input against the game's invariants; failures are cut down to
 # scripts in ../gdev/.pen/fuzz (docs/testing.md).
@@ -265,8 +265,8 @@ packets: export
 sync-protocol:
   cargo run --release -q -p pen-codegen -- --project {{gdev}} --rust crates/pen-protocol/src/packets.rs
 
-# Includes the full Blot suite, not only smoke fixtures.
-test: check visual determinism blot-tests conformance
+# Includes the full Squid suite, not only smoke fixtures.
+test: check visual determinism squid-tests conformance
 
 # Clippy lints pen in every combination of its features (the default one
 # and the player runtime's among them) through cargo-hack.
@@ -278,7 +278,7 @@ check: plugins plugin-tests packets
   cd plugins && cargo fmt --all --check
   cd plugins && cargo clippy --workspace --target wasm32-wasip2 -- -D warnings
   cargo clippy --workspace --all-targets --features pen/steam -- -D warnings
-  cargo clippy -p blot-host --no-default-features --all-targets -- -D warnings
+  cargo clippy -p squid-host --no-default-features --all-targets -- -D warnings
   cargo hack clippy -p pen --feature-powerset --exclude-features default --all-targets -- -D warnings
   cargo test --workspace -- --test-threads=1
   cargo test --release -p pen-render -- --test-threads=1
@@ -442,10 +442,10 @@ determinism: export
   echo "its recording replayed: the packets of its final timeline"
 
 # The example games and a game `pen new` makes, compiled and run headless:
-# each example's bindings fresh, its Blot tests and its golden images; a
+# each example's bindings fresh, its Squid tests and its golden images; a
 # run of bounce through `pen packets`, its Kick event sent and its Score
 # sections read back by name; and the new game's tests and a frame of it.
-# Needs blot2 beside this checkout.
+# Needs squid-lang beside this checkout.
 # The examples and a new game, tested and run headless.
 examples:
   #!/usr/bin/env bash
@@ -454,14 +454,14 @@ examples:
     # rust-guest is a Rust game, not a checkout (`just rust-guest`).
     [ -f "$example/pen.json" ] || continue
     {{pen}} codegen --check --project "$example"
-    {{pen}} test-blot --project "$example"
+    {{pen}} test-squid --project "$example"
     {{pen}} test --project "$example" "$example/tests/visual/scenarios.json"
   done
   {{pen}} packets target/examples/bounce --project examples/bounce --script "wait=5 game=Kick,9,4 wait=60"
   grep -q '"bounces":1' target/examples/bounce/extensions.jsonl
   rm -rf target/examples/new
-  {{pen}} new target/examples/new --blot ../blot2
-  {{pen}} test-blot --project target/examples/new
+  {{pen}} new target/examples/new --squid ../squid-lang
+  {{pen}} test-squid --project target/examples/new
   {{pen}} run --project target/examples/new --headless --frames 30 --screenshot target/examples/new.png
 
 # Needs mdbook (0.5); the book is docs/, its contents docs/SUMMARY.md.

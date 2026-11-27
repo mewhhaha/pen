@@ -55,7 +55,7 @@ encoded as one integer float32 lane from 0 through 255:
     "end": 164,
     "object": "building:7:42",
     "system": "construction",
-    "source": { "file": "src/buildings.blot", "start": 120, "end": 164 }
+    "source": { "file": "src/buildings.sq", "start": 120, "end": 164 }
   }]
 }
 ```
@@ -76,7 +76,7 @@ marker-like numbers in arbitrary payloads.
 Rust guests and adapters can construct `Provenance` and call
 `Provenance::extension(packet_end)` to validate and encode it. Other languages
 can append this reserved extension to their encoded development packets.
-In Blot, append `protocol.provenance_tag`, the JSON byte count, and one numeric
+In Squid, append `protocol.provenance_tag`, the JSON byte count, and one numeric
 lane per UTF-8 byte to a named extension packet owner. The packet starts with
 `protocol.extensions_marker` and the total number of provenance and application
 sections ([extension framing](extensions.md)). Older hosts reject tag 0; omit it when targeting

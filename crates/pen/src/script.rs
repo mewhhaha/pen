@@ -22,7 +22,7 @@
 //! `report[=FILE]` writes a bug report (`bugreport`), as Ctrl+Shift+B does.
 //!
 //! `console=CODE[,ARGUMENT]` sends the game a console command by its number
-//! (the checkout's `src/commands.blot`), as the console's `/command N [ARG]` does:
+//! (the checkout's `src/commands.sq`), as the console's `/command N [ARG]` does:
 //! `console=3,10` hires ten gnorps in gdev.
 //!
 //! `game=EVENT[,VALUE...]` sends one of the game's own events (its

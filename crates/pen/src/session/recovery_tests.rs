@@ -1,6 +1,6 @@
 use super::transport::Run;
 use super::*;
-use crate::blot_test::tests::{program, signed_leb};
+use crate::squid_test::tests::{program, signed_leb};
 use pen_protocol::boundary::{PACKET_HEADER_FLOATS, PACKET_MAGIC, decode_frame};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -226,7 +226,7 @@ fn malformed_native_frames_pause_without_rolling_back_simulation() {
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
     ));
     std::fs::create_dir_all(directory.join("assets")).unwrap();
-    let engine = blot_host::engine().unwrap();
+    let engine = squid_host::engine().unwrap();
     // A missing GPU is a failure, never a successful skipped regression.
     let mut gpu = Gpu::headless((32, 24), &directory.join("assets"), false).unwrap();
     let mut truncated = packet(1.0);

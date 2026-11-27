@@ -20,7 +20,7 @@ A runnable 3D showcase and interactive scene editor uniting **Ink** (`ink/`) and
   - `Z` / `Y` — Atomic Undo / Redo edit history
   - `S` / `L` — Request Pen Session 2 Scene Save / Load (`editor.encode_scene` / `editor.decode_scene`)
   - `P` — Play-in-Editor snapshot & Hermite sequencer animation (press `P` again to restore the exact pre-play scene)
-- **Blot 2 concurrency**: `spark` SIMD noise/foliage/water evaluation plus `#kernel` terrain chunk offload (`ink/kernel_kits` + `ink/kernel_transport`).
+- **Squid concurrency**: `spark` SIMD noise/foliage/water evaluation plus `#kernel` terrain chunk offload (`ink/kernel_kits` + `ink/kernel_transport`).
 
 ## Running
 
@@ -29,7 +29,7 @@ From this directory (`examples/showcase/`):
 ```sh
 pen codegen
 pen check
-pen test-blot
+pen test-squid
 pen test            # headless GPU golden visual regression suite
 pen build --web     # standalone WebGPU + Wasm web bundle
 pen run

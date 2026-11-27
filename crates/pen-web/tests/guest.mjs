@@ -1,6 +1,6 @@
 // guest.js, the browser's JSPI membrane, against a hand-built ABI 3 game:
 // its ownership hooks run around main and tear the instance down on close
-// (blot:ownership_leave(2)), and a trap's stack has the Wasm frames, named
+// (squid:ownership_leave(2)), and a trap's stack has the Wasm frames, named
 // from the module's name section, that pen-runtime's symbols read.
 // No GPU: `node --experimental-wasm-jspi crates/pen-web/tests/guest.mjs`.
 import assert from 'node:assert/strict';
@@ -23,8 +23,8 @@ const custom = (name, payload) => section(0, [...text(name), ...payload]);
 const f32 = value => [...new Uint8Array(new Float32Array([value]).buffer)];
 const i32 = value => [...new Uint8Array(new Int32Array([value]).buffer)];
 
-// Functions: 0 the host import, 1 main, 2 blot:allocate, 3 blot:reset,
-// 4 blot:ownership_enter, 5 blot:ownership_leave, 6 explode. Global 0 is
+// Functions: 0 the host import, 1 main, 2 squid:allocate, 3 squid:reset,
+// 4 squid:ownership_enter, 5 squid:ownership_leave, 6 explode. Global 0 is
 // the hooks' log (enter appends 1, leave 2 plus its outcome), 1 the arena's
 // bump pointer. main sends the handshake at 16, then stops at a Stop
 // request (operation lane 0) and calls explode at any other.
@@ -36,17 +36,17 @@ function game(names) {
     [0x60, 0, 0],
     [0x60, 1, 0x7f, 0],
   ]);
-  const imports = vector([[...text('blot:host/1'), ...text('call_array_f32_array_f32'), 0, 0]]);
+  const imports = vector([[...text('squid:host/1'), ...text('call_array_f32_array_f32'), 0, 0]]);
   const functions = vector([[1], [2], [2], [3], [4], [3]]);
   const memory = vector([[0, 1]]);
   const globals = vector([[0x7f, 1, 0x41, 0, 0x0b], [0x7f, 1, 0x41, ...leb(1024), 0x0b]]);
   const exports = vector([
     [...text('main'), 0, 1],
-    [...text('blot:memory'), 2, 0],
-    [...text('blot:allocate'), 0, 2],
-    [...text('blot:reset'), 0, 3],
-    [...text('blot:ownership_enter'), 0, 4],
-    [...text('blot:ownership_leave'), 0, 5],
+    [...text('squid:memory'), 2, 0],
+    [...text('squid:allocate'), 0, 2],
+    [...text('squid:reset'), 0, 3],
+    [...text('squid:ownership_enter'), 0, 4],
+    [...text('squid:ownership_leave'), 0, 5],
     [...text('log'), 3, 0],
   ]);
   const body = (code, locals = []) => {
@@ -69,7 +69,7 @@ function game(names) {
   const data = vector([[0, 0x41, 16, 0x0b, ...leb(handshake.length), ...handshake]]);
   const manifest = [3, 1, ...text('main'), 4, 6, 6, 0, 0];
   const sections = [
-    ...custom('blot:abi', manifest),
+    ...custom('squid:abi', manifest),
     ...section(1, types),
     ...section(2, imports),
     ...section(3, functions),
@@ -129,7 +129,7 @@ const log = () => instances.at(-1).exports.log.value;
 
 // A language-agnostic, externref-free `pen:guest/1` game: imports
 // `pen:guest/1::exchange(i32) -> i32`, exports `pen:main() -> ()`,
-// `pen:allocate(i32) -> i32`, and standard `memory`, with no `blot:abi`
+// `pen:allocate(i32) -> i32`, and standard `memory`, with no `squid:abi`
 // custom section and no `reset` hook.
 function simpleGame() {
   const types = vector([

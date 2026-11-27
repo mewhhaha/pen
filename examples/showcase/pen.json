@@ -4,20 +4,20 @@
     "title": "Ink + Pen High-Fidelity Showcase & Scene Editor"
   },
   "plugins": {
-    "blot": {
+    "squid": {
       "read": [
-        "../../../blot2/std",
+        "../../../squid-lang/std",
         "../../../ink/lib"
       ],
       "run": {
-        "blotc": "../../../blot2/compiler-goose/build/blotc-goose"
+        "squidc": "../../../squid-lang/compiler-goose/build/squidc-goose"
       }
     }
   },
   "compiler": {
-    "plugin": "blot",
+    "plugin": "squid",
     "settings": {
-      "std": "../../../blot2/std",
+      "std": "../../../squid-lang/std",
       "imports": {
         "pen/": "pen/",
         "ink/": "../../../ink/lib/"

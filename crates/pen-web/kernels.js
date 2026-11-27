@@ -181,13 +181,13 @@ export function readMemoryShape(bytes) {
 }
 
 function parseKernelsSection(module) {
-  const secs = WebAssembly.Module.customSections(module, "blot:kernels");
+  const secs = WebAssembly.Module.customSections(module, "squid:kernels");
   if (secs.length !== 1) return { transportBudget: DEFAULT_TRANSPORT_BUDGET, kernels: [] };
   const bytes = new Uint8Array(secs[0]);
   const st = { at: 0 };
   const decoder = new TextDecoder("utf-8", { fatal: true });
   const byte = () => {
-    if (st.at >= bytes.length) throw new BrowserKernelError("invalid_abi", "Truncated blot:kernels");
+    if (st.at >= bytes.length) throw new BrowserKernelError("invalid_abi", "Truncated squid:kernels");
     return bytes[st.at++];
   };
   const name = () => {
@@ -219,7 +219,7 @@ function parseKernelsSection(module) {
     });
   };
   const version = readUleb(bytes, st);
-  if (version !== 1) throw new BrowserKernelError("invalid_abi", "Unsupported blot:kernels version");
+  if (version !== 1) throw new BrowserKernelError("invalid_abi", "Unsupported squid:kernels version");
   const transportBudget = readUleb(bytes, st);
   const count = readUleb(bytes, st);
   const kernels = [];
@@ -816,9 +816,9 @@ export class BrowserKernelPool {
           }
           const inst = new WebAssembly.Instance(this.#meta.module, stubImports);
           const exp = inst.exports;
-          const mem = exp["blot:memory"];
-          const alloc = exp["blot:allocate"];
-          const reset = exp["blot:reset"];
+          const mem = exp["squid:memory"];
+          const alloc = exp["squid:allocate"];
+          const reset = exp["squid:reset"];
           const ctxFn = exp[this.manifest.ctxExport];
           reset(0);
           let arg;
@@ -834,7 +834,7 @@ export class BrowserKernelPool {
             arg = ptr;
           }
           ctxFn(arg);
-          exp["blot:finish_invocation"]?.();
+          exp["squid:finish_invocation"]?.();
           reset(0);
           if (this.#hooks?.onBeforeContextPublish) {
             await this.#hooks.onBeforeContextPublish();

@@ -9,7 +9,7 @@ pub mod types {
     /// A column-major 4x4 matrix, as WGSL and the packet lay it out.
     pub type Matrix = [f32; 16];
     /// Version-1 native session test commands. Available only to a separate test guest in pen
-    /// test-blot --session.
+    /// test-squid --session.
     pub mod test_driver_op {
         pub const LAUNCH: u32 = 0;
         pub const STEP: u32 = 1;
@@ -893,7 +893,7 @@ pub mod types {
         RendererReady,
         /// One of the game's own events, which its pen.json `protocol` declares: its tag there,
         /// and up to three values. Hosts send them only to a game that declares them, whose
-        /// generated pen/extensions.blot decodes them; pen's own bindings leave them out.
+        /// generated pen/extensions.sq decodes them; pen's own bindings leave them out.
         Game { event: u32, a: f32, b: f32, c: f32 },
     }
     #[derive(Clone, Debug, PartialEq)]
@@ -5433,7 +5433,7 @@ pub mod codec {
     }
 
     /// The walk of an input packet's values that pen's tests compare with the game's
-    /// (`pen/protocol_canonical.blot`): elapsed, the viewport's width and height, the events'
+    /// (`pen/protocol_canonical.sq`): elapsed, the viewport's width and height, the events'
     /// count, each event's tag and then its fields in the schema's order (a key as its code),
     /// then the state's count and lanes. It lays nothing out as the packet does.
     pub fn canonical_input(frame: &Frame, elapsed: f64, state: &[f32]) -> Vec<f32> {
@@ -5532,7 +5532,7 @@ pub mod codec {
     }
 
     /// The walk of a render packet's values that pen's tests compare with the game's
-    /// (`pen/protocol_canonical.blot`): the header's values and then the sections, each in the
+    /// (`pen/protocol_canonical.sq`): the header's values and then the sections, each in the
     /// schema's order, as described in pen-codegen's canonical.rs. It takes the schema and
     /// the state, which the frame does not hold, where the packet has them.
     pub fn canonical_render(frame: &RenderFrame, schema: u32, state: &[f32]) -> Vec<f32> {

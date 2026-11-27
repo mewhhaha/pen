@@ -92,11 +92,11 @@ mod tests {
         service.call(&Request { id: 1, operation, numbers, values }).unwrap()
     }
 
-    /// gdev's tests/simulation.blot makes these requests through its Blot
-    /// binding (src/simulation.blot), checking each lane it sends, and
+    /// gdev's tests/simulation.sq makes these requests through its Squid
+    /// binding (src/simulation.sq), checking each lane it sends, and
     /// reads these answers back into records.
     #[test]
-    fn the_answers_gdevs_blot_test_reads() {
+    fn the_answers_gdevs_squid_test_reads() {
         // Five octaves of hills, seed 7, at one point.
         let hills = [0.1, 8.0, 2.0, 0.5, 0.0, -0.5, 6.0];
         let answer = ask(&mut crate::Noise, noise_op::SAMPLE, [0.0, 0.0, 7.0, 5.0], &hills);

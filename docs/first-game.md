@@ -2,9 +2,9 @@
 
 This makes a game, plays it, changes it, tests it and packages it. It takes
 pen built from this repository (`just install` puts it on your `PATH` as
-`pen`) and a Blot checkout, blot2, with its compiler built
-(`generated/compiler/blotc.gz`); games are written in Blot, and pen compiles
-them through its Blot plugin. Nothing here needs gdev or Ink.
+`pen`) and a Squid checkout, squid-lang, with its compiler built
+(`generated/compiler/squidc.gz`); games are written in Squid, and pen compiles
+them through its Squid plugin. Nothing here needs gdev or Ink.
 
 ## Make it
 
@@ -13,22 +13,22 @@ pen new marble
 ```
 
 ```
-made marble in /home/you/games/marble: `pen dev` there plays it as you edit it, `pen test-blot` runs its tests
+made marble in /home/you/games/marble: `pen dev` there plays it as you edit it, `pen test-squid` runs its tests
 ```
 
 `pen new DIR` makes a new directory, and the game is named after it. It
-looks for blot2 beside the new directory, beside one of the directories above
-it, or beside the pen checkout it was built from; `--blot DIR` (or
-`PEN_BLOT`) names it instead, and `pen.json` refers to it by a relative path.
+looks for squid-lang beside the new directory, beside one of the directories above
+it, or beside the pen checkout it was built from; `--squid DIR` (or
+`PEN_SQUID`) names it instead, and `pen.json` refers to it by a relative path.
 What it makes:
 
 ```
 marble/
-├─ pen.json            the game's name, and the Blot compiler and library it builds with
-├─ src/main.blot       the entry: hands the game to pen
-├─ src/game.blot       the game
+├─ pen.json            the game's name, and the Squid compiler and library it builds with
+├─ src/main.sq       the entry: hands the game to pen
+├─ src/game.sq       the game
 ├─ src/assets/         catalog.json, a cube mesh, its material and the material's shader
-├─ tests/game.blot     its tests
+├─ tests/game.sq     its tests
 ├─ pen/                bindings `pen codegen` generates: never edit them
 └─ README.md, .gitignore
 ```
@@ -57,9 +57,9 @@ same script gives the same pixels every time.
 
 ## Read it
 
-`src/main.blot` calls the game's invocation-scoped adapter:
+`src/main.sq` calls the game's invocation-scoped adapter:
 
-```blot
+```squid
 import { run } from "./game"
 
 io const main = func host => return run host
@@ -86,7 +86,7 @@ request.
 
 The cube's step reads the arrows from the events:
 
-```blot
+```squid
 const step = func (world: World) -> (input: protocol.Input) => return do:
   let speed = world.speed
   for event in input.events:
@@ -101,14 +101,14 @@ const step = func (world: World) -> (input: protocol.Input) => return do:
 `view` starts from `frame.header schema`, sets the camera and light, clears its
 `ResizeArray codec.MeshDraw` parameter, and appends the cube's mesh draw:
 
-```blot
+```squid
   @storage.truncate draws 0
   @storage.push draws { mesh: meshes.cube, material: materials.cube, transform: turned world.angle }
 ```
 
 Matrices are column-major (`x`, `y`, `z`, `w` are columns), as WGSL reads
 them; the projection maps depth into WebGPU's 0 to 1. `meshes.cube` and
-`materials.cube` are IDs: Blot imports `src/assets/catalog.json`, and each
+`materials.cube` are IDs: Squid imports `src/assets/catalog.json`, and each
 file it lists becomes a name for its index.
 
 ## Change it
@@ -116,7 +116,7 @@ file it lists becomes a name for its index.
 Put a second cube beside the first, standing still: append another draw in
 `view`, after the existing cube, and save.
 
-```blot
+```squid
   @storage.push draws { mesh: meshes.cube, material: materials.cube, transform: moved 2.6 0.0 (-3.0) }
 ```
 
@@ -135,11 +135,11 @@ what pen binds for it.
 ## Test it
 
 ```sh
-pen test-blot
+pen test-squid
 ```
 
 ```
-tests/game.blot (checks)
+tests/game.sq (checks)
   ok      test_the_cube_turns_at_its_speed
   ok      test_the_right_arrow_turns_it_faster
   ok      test_a_saved_world_comes_back
@@ -148,7 +148,7 @@ tests/game.blot (checks)
 A test is an `io const test_...` that returns `check.report` of its
 checks (`pen/check`: `equal`, `near`, `holds`). Tests call the game's
 functions directly; a test module compiles as if it were
-`src/test_fixture.blot`, so it imports the game as `./game`.
+`src/test_fixture.sq`, so it imports the game as `./game`.
 
 Golden images catch what tests of numbers miss. Write
 `tests/visual/scenarios.json`:

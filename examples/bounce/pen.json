@@ -1,15 +1,15 @@
 {
   "game": { "name": "bounce", "title": "Bounce" },
   "plugins": {
-    "blot": {
-      "read": ["../../../blot2/std"],
-      "run": { "blotc": "../../../blot2/generated/compiler/blotc.gz" }
+    "squid": {
+      "read": ["../../../squid-lang/std"],
+      "run": { "squidc": "../../../squid-lang/generated/compiler/squidc.gz" }
     }
   },
   "compiler": {
-    "plugin": "blot",
+    "plugin": "squid",
     "settings": {
-      "std": "../../../blot2/std",
+      "std": "../../../squid-lang/std",
       "imports": { "pen/": "pen/" },
       "nativeAssets": { "roots": ["src"] }
     }

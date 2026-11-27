@@ -1,5 +1,5 @@
 //! The game's interface for assistive technology: the nodes each frame
-//! declares (`RenderFrame::ui`, gdev's packages/ui.blot) as an AccessKit
+//! declares (`RenderFrame::ui`, gdev's packages/ui.sq) as an AccessKit
 //! tree for the window's platform adapter (AT-SPI on Linux, UI Automation on
 //! Windows, NSAccessibility on macOS), and what assistive technology asks of
 //! them back to the game as `UiAction` input events.

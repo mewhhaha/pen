@@ -12,7 +12,7 @@ was built for in every interface it imports from pen or exports to it
   (`0.2.0` runs on `0.2.3`), from 1.0 the same major one. wasmtime links
   semver-compatible names the same way.
 - Anything else is refused before linking, with the versions named:
-  `plugin blot was built for pen:plugin@0.1.0, and this pen hosts 0.2.0:
+  `plugin squid was built for pen:plugin@0.1.0, and this pen hosts 0.2.0:
   rebuild it against wit/pen-plugin.wit`. One built for a newer version is
   told to update pen.
 - Below 1.0, any change to an interface's shape (a function, type, field or
@@ -34,27 +34,27 @@ Shape: `05ea20cd01a286a1d8e1393bbcf146aced4f6333d3944bc83724ba96e0cae4e4`
   `protocol/schema.json` and `pen.json`'s `protocol` extensions.
 - Added optional `fix` and `doc` fields to `types.diagnostic` so language
   plugins can provide their own fix hints and documentation links instead of
-  hardcoded Blot messages.
+  hardcoded Squid messages.
 
 ## 0.3.0 (2026-11-26)
 
 Shape: `bc736c564b5563bb4afd06d1f37ad4790004dd70ceba4e188c27068788be3484`
 
 - Added the `guest` interface to `compiler-plugin` (`run-u32-packet`, `trap-info`,
-  `call-error`) so compiler plugins can execute pure, zero-import Blot ABI 8
+  `call-error`) so compiler plugins can execute pure, zero-import Squid ABI 8
   Wasm modules (Stage-0 generators) in fresh sandboxed instances with host-cached
-  compilation, bounded memory, deadline enforcement, and `blot:traps` v1 decoding.
+  compilation, bounded memory, deadline enforcement, and `squid:traps` v1 decoding.
 
 ## 0.2.0 (2026-10-16, 52a55af)
 
 Shape: `1e7ba4e0252d7a27e5cc83720c87e6d6cedb2363f6fb2fd21a8776fa9b0e7625`
 
 - Removed the `assets` interface and the `assets-plugin` world: pen makes a
-  game's asset modules itself (Blot's native typed imports).
+  game's asset modules itself (Squid's native typed imports).
 - Added the `tests` interface to the `compiler-plugin` world: `find` lays out
   a checkout's test modules (`test-module`: its path, the entry it builds as,
   its overlays, its tests' prefix and its `expectation`: `checks`, `traps` or
-  `rejected`), which `pen test-blot` builds and runs.
+  `rejected`), which `pen test-squid` builds and runs.
 - Each call into a plugin has a deadline (pen.json's `timeout`): a wait
   without a timeout of its own (`child.read`, `child.wait`) ends there with
   `read-error::timeout`.

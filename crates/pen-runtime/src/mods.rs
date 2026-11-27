@@ -1,7 +1,7 @@
 //! Mods: extra guest programs that run beside the game, each in a sandbox
 //! of its own and with only the capabilities its manifest asks for
 //! (docs/mods.md). A mod is a directory holding `mod.json`, its manifest,
-//! and `mod.wasm`, a module of the guest ABI (blot2's
+//! and `mod.wasm`, a module of the guest ABI (squid-lang's
 //! `docs/host/guest-abi.md`) exporting `frame: Array F32 -> Array F32` and
 //! importing nothing: it reaches nothing but what each call hands it.
 //!

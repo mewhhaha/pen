@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Isolate Wasmtime compilation/loading, without assets or a running game.
 
-Build with `cargo build --release -p blot-host --example compile_time`, then run
+Build with `cargo build --release -p squid-host --example compile_time`, then run
 `scripts/profile-compile.py game.wasm --out target/compile-profile` on Linux.
 Each sample has a new process; only the named disk-cache sample shares a cache.
 OS file caches are not flushed. getrusage's maximum RSS is the child's peak,
@@ -66,7 +66,7 @@ def main():
         if cache is not None:
             command += ["--cache", str(cache)]
         command += [str(wasm)]
-        env = dict(os.environ, BLOT_INLINING=str(inlining))
+        env = dict(os.environ, SQUID_INLINING=str(inlining))
         started = time.monotonic()
         with (out / f"{label}.stdout").open("wb") as stdout, (out / f"{label}.stderr").open("wb") as stderr:
             child = subprocess.Popen(command, env=env, stdout=stdout, stderr=stderr)

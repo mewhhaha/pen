@@ -26,14 +26,14 @@ use std::sync::Mutex;
 #[cfg(feature = "compiler")]
 use anyhow::{Context, Result};
 #[cfg(feature = "compiler")]
-use blot_host::GuestModule;
-#[cfg(feature = "compiler")]
 use pen_protocol::boundary::{decode_frame, encode_frame, read_catalog};
 #[cfg(any(feature = "compiler", test))]
 use pen_protocol::{Catalog, Draw, RenderFrame};
 #[cfg(feature = "compiler")]
 use pen_protocol::{Frame, Viewport};
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "compiler")]
+use squid_host::GuestModule;
 
 #[cfg(feature = "compiler")]
 use crate::program::{Operation, Program};
@@ -163,7 +163,7 @@ impl Needs<'_> {
 #[cfg(feature = "compiler")]
 pub fn compute(wasm: &[u8], assets: &Path, scene: &Path, frames: usize) -> Result<SceneAssets> {
     let catalog = read_catalog(assets)?;
-    let engine = blot_host::engine()?;
+    let engine = squid_host::engine()?;
     let cache = crate::cache_dir().map(|directory| directory.join("wasm"));
     let module =
         GuestModule::new(&engine, wasm, cache.as_deref()).context("compiling the game to see what it draws first")?;

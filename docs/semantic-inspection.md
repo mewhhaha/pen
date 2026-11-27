@@ -6,7 +6,7 @@ game state or infer a reason from a changed number. Native and browser hosts use
 the same transport, retention, diff and watch implementation.
 
 This is an opt-in development interface. The game publishes observations; its
-Blot/Ink devtools program requests them through `DEVTOOLS_OP.semantic`. The
+Squid/Ink devtools program requests them through `DEVTOOLS_OP.semantic`. The
 application owns selection, layout, source navigation and game-specific controls.
 Pen owns bounded transport and the existing pause, step and history services.
 
@@ -16,7 +16,7 @@ Declare an application extension tag in `pen.json` (for example 42). In a
 development build, put one version-1 observation in that extension's `values`:
 UTF-8 JSON bytes, each represented exactly as one float32 lane. No reserved tag
 or game-specific Rust code is needed. `semantic::Observation::extension` is a
-Rust producer helper. In Blot, declare a section with an integer `byte` field
+Rust producer helper. In Squid, declare a section with an integer `byte` field
 and call its generated `append_<section>` writer with the byte rows and a named
 numeric destination. Write the extension marker and total section count once
 after the render packet, then append each section
@@ -50,7 +50,7 @@ after the render packet, then append each section
   "decisions": [{
     "tick": "51",
     "object": { "kind": "Hauler", "words": [7, 10, 2, 3] },
-    "system": "routing", "source": { "file": "src/hauler.blot", "start": 120, "end": 164 },
+    "system": "routing", "source": { "file": "src/hauler.sq", "start": 120, "end": 164 },
     "reason": "destination full"
   }],
   "omitted_objects": 0,

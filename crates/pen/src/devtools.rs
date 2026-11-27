@@ -1,7 +1,7 @@
 //! The dev tools: the checkout's own program for them (gdev's
-//! `devtools/main.blot`: its console and diagnostics), which the runtime runs
+//! `devtools/main.sq`: its console and diagnostics), which the runtime runs
 //! beside the game in `pen dev` and `pen run`, drawing its sprites over the
-//! game's frame. It is a second Blot program with its own state, outside the
+//! game's frame. It is a second Squid program with its own state, outside the
 //! game's saves, recordings and timeline, so it keeps running while the game
 //! is paused, rewinding, failing to build or stopped on an error, and what
 //! the runtime tells it (frame timings, the log) never reaches the game.
@@ -26,7 +26,7 @@
 //! The host draws pictures of the game's frames and previews of its assets
 //! into an atlas texture of the dev tools' (`pictures`), samples the game's
 //! guest for their profiler and reads its memory and ownership counters
-//! (`blot_host::Probe`), keeps its packets and states for their inspectors
+//! (`squid_host::Probe`), keeps its packets and states for their inspectors
 //! (`pen_runtime::inspect`), and edits tunable presets and materials in the
 //! checkout for them (`tunables`, `materials`).
 mod pictures;
@@ -40,13 +40,13 @@ use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use blot_host::GuestModule;
 use pen_protocol::{Catalog, Frame, GameEvent, RenderFrame, UiNode, Viewport, devtools_asset, service};
 use pen_runtime::devtools::{
     self as tools, FrameReport, LogLine, Routing, TimelineStatus, button_bit, inside_dialog, log_answer,
 };
 use pen_runtime::inspect::{self, Packets};
 use pen_runtime::mix::AudioReport;
+use squid_host::GuestModule;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::Window;
@@ -273,7 +273,7 @@ impl Devtools {
             devlog::error(Source::Reload, format!("devtools: new builds are not picked up: {error:#}"))
         });
         let mut devtools = Devtools {
-            engine: blot_host::dev_engine()?,
+            engine: squid_host::dev_engine()?,
             catalog,
             build: settings.build.join(PROGRAM),
             project: settings.project,
@@ -791,12 +791,12 @@ impl tools::Host for Answering<'_> {
     /// only the development engine's guests can be (`pen dev`).
     fn profile(&mut self, operation: u32) -> Answer {
         let (profile, engine) = self.session.profile();
-        if !blot_host::samples(engine) {
+        if !squid_host::samples(engine) {
             return Answer::unavailable();
         }
         match operation {
             1 => {
-                let started = profile.get_or_insert_with(blot_host::Profile::new).start(engine);
+                let started = profile.get_or_insert_with(squid_host::Profile::new).start(engine);
                 if let Err(error) = started {
                     return failed("profile", error);
                 }
@@ -1157,7 +1157,7 @@ mod tests {
         let wasm = std::fs::read(std::env::var_os("PEN_DEVTOOLS_FIXTURE").unwrap()).unwrap();
         let assets = PathBuf::from(std::env::var_os("PEN_DEVTOOLS_ASSETS").unwrap());
         let catalog = pen_protocol::boundary::read_catalog(&assets).unwrap();
-        let engine = blot_host::engine().unwrap();
+        let engine = squid_host::engine().unwrap();
         let module = GuestModule::new(&engine, &wasm, None).unwrap();
         let viewport = Viewport { width: 960, height: 640 };
         let mut shell = Shell { viewport };

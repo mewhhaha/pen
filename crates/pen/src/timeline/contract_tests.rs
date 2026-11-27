@@ -133,7 +133,7 @@ impl Pass {
 /// perhaps services answering live frames' requests.
 struct Game {
     runtime: GameRuntime,
-    module: blot_host::GuestModule,
+    module: squid_host::GuestModule,
     timeline: Timeline,
     /// Quicksaves by name ("" for the game's own F6 and F9).
     saves: HashMap<PathBuf, SavedState>,
@@ -143,10 +143,10 @@ struct Game {
 
 impl Game {
     fn start(directory: &Path, start: Option<&Moment>) -> Game {
-        let engine = blot_host::engine().unwrap();
+        let engine = squid_host::engine().unwrap();
         let wasm = std::fs::read(directory.join("game.wasm")).unwrap();
         let cache = std::env::temp_dir().join("pen-test-wasm");
-        let module = blot_host::GuestModule::new(&engine, &wasm, Some(&cache)).unwrap();
+        let module = squid_host::GuestModule::new(&engine, &wasm, Some(&cache)).unwrap();
         let catalog = read_catalog(&directory.join("assets")).unwrap();
         let scene = snapshot::read(&directory.join("main.scene")).ok();
         let mut runtime = GameRuntime::new(&engine, module.clone(), catalog, &mut Null, None, scene).unwrap();

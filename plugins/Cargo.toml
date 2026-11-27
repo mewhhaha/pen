@@ -4,7 +4,7 @@
 # bindings are Wasm-only.
 [workspace]
 resolver = "3"
-members = ["blot"]
+members = ["squid"]
 
 [workspace.package]
 edition = "2024"

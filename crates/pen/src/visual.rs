@@ -29,9 +29,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
-use blot_host::GuestModule;
 use pen_protocol::Catalog;
 use serde::Deserialize;
+use squid_host::GuestModule;
 
 use crate::review;
 use crate::script;

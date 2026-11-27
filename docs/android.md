@@ -11,8 +11,8 @@ job runs the same with the runner image's NDK.
 | pen-protocol | Clean |
 | pen-runtime | Clean |
 | pen-render | Clean: wgpu on Vulkan (Android 7 and later) or GLES |
-| blot-host, without its compiler (the player's) | Clean |
-| blot-host, with its compiler | Clean: Cranelift has an aarch64 backend, so a development build could compile on the device |
+| squid-host, without its compiler (the player's) | Clean |
+| squid-host, with its compiler | Clean: Cranelift has an aarch64 backend, so a development build could compile on the device |
 | pen | Not ported (below) |
 
 Nothing needed fixing in the portable crates. wasmtime's build script
@@ -24,8 +24,8 @@ NDK the runner image ships:
 rustup target add aarch64-linux-android
 ndk=$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin
 export CC_aarch64_linux_android=$ndk/aarch64-linux-android24-clang AR_aarch64_linux_android=$ndk/llvm-ar
-cargo clippy --target aarch64-linux-android -p pen-protocol -p pen-runtime -p pen-render -p blot-host -- -D warnings
-cargo clippy --target aarch64-linux-android -p blot-host --no-default-features -- -D warnings
+cargo clippy --target aarch64-linux-android -p pen-protocol -p pen-runtime -p pen-render -p squid-host -- -D warnings
+cargo clippy --target aarch64-linux-android -p squid-host --no-default-features -- -D warnings
 ```
 
 This machine has no NDK (installing one means accepting Google's NDK

@@ -17,9 +17,9 @@ native players or static browser builds.
 
 ```
 pen (the runtime)                           game/ (a package's bundle)
-├─ winit window, input, pointer lock        ├─ game.cwasm  the Blot program, compiled ahead of time
+├─ winit window, input, pointer lock        ├─ game.cwasm  the Squid program, compiled ahead of time
 ├─ wgpu renderer     (pen-render)           ├─ game.wasm   its Wasm, for the guest ABI manifest
-├─ wasmtime guest    (blot-host)            ├─ assets/     meshes, materials, WGSL, textures, sounds
+├─ wasmtime guest    (squid-host)            ├─ assets/     meshes, materials, WGSL, textures, sounds
 ├─ packets           (pen-protocol)         └─ main.scene  the starting level
 ├─ audio: gdev's WebAudio mix on cpal's output (WAV via symphonia, Opus via libopus)
 ├─ AccessKit, and services: Steam, clipboard, url, platform,
@@ -29,7 +29,7 @@ pen (the runtime)                           game/ (a package's bundle)
 
 The crates:
 
-- **blot-host** runs Blot's guest ABI on wasmtime, with incremental and portable
+- **squid-host** runs Squid's guest ABI on wasmtime, with incremental and portable
   compilation engines.
 - **pen-runtime** shares program lifecycle, the guest ABI manifest,
   transactional reload, snapshots, time travel (timeline, transport and the game
@@ -60,18 +60,18 @@ In a gdev checkout (or with `--project DIR`):
 
 |                                                        |                                                                                                                                                                                                            |
 | ------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `pen dev`                                              | Compile the Blot program and play, reloading the program, shaders and assets as they change, with the game's state kept, and rerunning the asset recipes whose sources change                              |
-| `pen web`                                              | Rust browser host with hot reload and the same Blot dev tools                                                                                                                                              |
+| `pen dev`                                              | Compile the Squid program and play, reloading the program, shaders and assets as they change, with the game's state kept, and rerunning the asset recipes whose sources change                              |
+| `pen web`                                              | Rust browser host with hot reload and the same Squid dev tools                                                                                                                                              |
 | `pen run`                                              | Compile once and play                                                                                                                                                                                      |
 | `pen build [--out DIR]`                                | A shippable folder: the player runtime, its Steam library and the game, precompiled (default `.pen/package`)                                                                                               |
 | `pen build --web [--out DIR] [--zip FILE]`             | The browser build as static files for any web host (default `.pen/web-export`), precompressed, with a service worker for offline play; `--zip` also packs it to upload to itch.io                          |
 | `pen build --game DIR --out DIR`                       | The same shippable folder for a game bundle built elsewhere, in any language (`examples/rust-guest`)                                                                                                       |
 | `pen test [FILE]`                                      | Golden-image tests (default `tests/visual/scenarios.json`)                                                                                                                                                 |
-| `pen test-blot [FILE...]`                              | The checkout's Blot tests (default `tests/*.blot`; `--filter TEXT` runs the tests whose names hold it)                                                                                                     |
+| `pen test-squid [FILE...]`                              | The checkout's Squid tests (default `tests/*.sq`; `--filter TEXT` runs the tests whose names hold it)                                                                                                     |
 | `pen check`                                            | Compile the game and dev tools, and lint the assets (missing, unused, oversized, unreadable)                                                                                                               |
 | `pen assets [--check]`                                 | Bring the assets `pipeline.json`'s steps build up to date with their sources, through the asset cache                                                                                                      |
 | `pen patch OLD NEW --out FILE`, `pen apply FILE [DIR]` | A patch between two package versions, and applying one to a package                                                                                                                                        |
-| `pen codegen [--check]`                                | Generate or check the Blot protocol                                                                                                                                                                        |
+| `pen codegen [--check]`                                | Generate or check the Squid protocol                                                                                                                                                                        |
 | `pen bench`                                            | Guest time per frame, without rendering                                                                                                                                                                    |
 | `pen packets DIR`                                      | Each frame's input and render packet, without rendering                                                                                                                                                    |
 | `pen gltf FILE`                                        | Import a glTF model as assets: meshes, materials, images, skins and clips, and vertex-animation textures with `--vat FPS` ([docs/animation.md](animation.md))                                              |
@@ -82,7 +82,7 @@ In a gdev checkout (or with `--project DIR`):
 | `pen font FONT`                                        | A font's multi-channel signed distance field atlas (KTX2) and its glyphs' metrics (JSON), for text sharp at any size                                                                                       |
 | `pen loudness FILE...`                                 | Each sound clip's loudness (EBU R128) and true peak; `--normalize` brings them to a target ([docs/audio.md](audio.md))                                                                                     |
 | `pen clean`                                            | Delete pen's caches (compiled games, plugins and GPU pipelines) in the platform cache directory                                                                                                            |
-| `pen new DIR`                                          | A new game to start from, named after DIR, which compiles and runs as it is (`--blot DIR` names the Blot checkout it builds with)                                                                          |
+| `pen new DIR`                                          | A new game to start from, named after DIR, which compiles and runs as it is (`--squid DIR` names the Squid checkout it builds with)                                                                          |
 | `pen serve`, `pen push ADDRESS`                        | Receive packages pushed over the network (a Steam Deck's end), and push one there ("Pushing to another machine")                                                                                           |
 | `pen remote ADDRESS [REQUEST...]`                      | Ask a game run with `--devtools-listen` one dev tools request ("Remote dev tools")                                                                                                                         |
 
@@ -96,13 +96,13 @@ mistyped command or option is refused, with the nearest name.
 
 A checkout's `pen.json` can name its game:
 `"game": {"name": "gdev", "title":
-"gdev — Blot 3D"}`. The name is used for the
+"gdev — Squid 3D"}`. The name is used for the
 data directory and the shipped executable, and the title for the window and
 assistive technology. Without it, both are the checkout directory's name. A
 package carries them in `game/game.json`.
 
 A checkout supplies `pen.json`, its compiler component settings,
-`src/main.blot`, assets and a scene. Blot's native typed imports provide
+`src/main.sq`, assets and a scene. Squid's native typed imports provide
 catalog, JSON, text, tunables and shader declarations. No Deno is needed.
 Compiler temporaries live in the platform cache directory; outputs are staged
 before replacing a package.
@@ -115,7 +115,7 @@ This repository's Justfile runs the same commands on `../gdev`
 | `just dev`, `just run`, `just headless ARGS`                      | Play the checkout (`just dev --mute`, `just headless --frames 300 --record out.mp4`)                    |
 | `just web`                                                        | Browser development server                                                                              |
 | `just itch`                                                       | `pen build --web` into `dist/web` and `dist/web.zip`, for itch.io ([docs/web-export.md](web-export.md)) |
-| `just test`                                                       | Everything in "Testing": `check`, `visual`, `determinism` and the full `blot-tests` suite               |
+| `just test`                                                       | Everything in "Testing": `check`, `visual`, `determinism` and the full `squid-tests` suite               |
 | `just bench`                                                      | Guest time on wasmtime                                                                                  |
 | `just export`, `just packets`                                     | The bundle `dist/gdev` and the packets `dist/packets` that some tests and examples read                 |
 | `just sync-protocol`                                              | Regenerate pen-protocol's `packets.rs` from the checkout's schema                                       |
@@ -133,7 +133,7 @@ Saves, preferences and crash reports live in the platform data directory
 
 ### Hot reload
 
-`pen dev` keeps the checkout's Blot compiler open, and it writes each new build
+`pen dev` keeps the checkout's Squid compiler open, and it writes each new build
 to `.pen/runtime/game.wasm` in one rename. It watches files through one watcher:
 the plugin builds' sources, `.pen/runtime`, `src/assets` and `pipeline.json`'s
 sources share it. The runtime compiles the new build on a background thread,
@@ -168,25 +168,25 @@ With gdev's explicit Ink state adapter, the runtime reports what it did not
 simply keep:
 
 ```
-Blot reloaded; kept 1 of 2 saved sections; migrated section 100 from version 1 to 2; dropped section 104 (no longer saved)
+Squid reloaded; kept 1 of 2 saved sections; migrated section 100 from version 1 to 2; dropped section 104 (no longer saved)
 ```
 
 Starting from a saved state, loading a quicksave and loading the editor's scene
 go through the same restore and report the same way. Only a build with another
 `state_schema`, the save format's own version, is refused until a restart.
 
-Hot reload compiles with blot-host's development engine: Cranelift without
+Hot reload compiles with squid-host's development engine: Cranelift without
 inlining, and an in-memory incremental cache that reuses each unchanged
 function's machine code, so a small edit recompiles only what it touched.
 Without inlining, gdev's first compile drops from about 360 to 105 ms and a
 reload's from about 100 to 50 ms, for slower guest code ("Performance"); every
-other command compiles with inlining. `BLOT_INLINING=1` or `0` turns it on or
+other command compiles with inlining. `SQUID_INLINING=1` or `0` turns it on or
 off for every command, to compare (`just compile-time` times both engines). The
 game and the dev tools share the development engine and its cache, which keeps
 at most 64 MB of compiled functions. From a new `game.wasm` to the new build
-running, the runtime's side of a reload takes about 90 ms. The Blot compiler's
+running, the runtime's side of a reload takes about 90 ms. The Squid compiler's
 build comes before that and prints its own time
-(`blot: Game compiled (1.05 s)`); an earlier Gdev candidate measured a build at
+(`squid: Game compiled (1.05 s)`); an earlier Gdev candidate measured a build at
 1 to 2 s. These are historical measurements.
 
 Asset files reload in the renderer and audio once they have been quiet for 15
@@ -205,7 +205,7 @@ test holds the WIT to. Compiler sessions build Wasm or diagnostics, report
 watched paths and close explicitly; diagnostics include optional details, and
 file queries use portable `/` paths. The same component lays out the checkout's
 tests for `pen
-test-blot`: which modules there are, the entry each builds as,
+test-squid`: which modules there are, the entry each builds as,
 and what its tests must do (return passing check reports, trap at `unreachable`,
 or fail to compile with given diagnostics). pen only builds and runs them as
 Wasm.
@@ -215,52 +215,52 @@ A checkout selects its compiler in `pen.json`:
 ```json
 {
   "plugins": {
-    "blot": {
-      "read": ["../blot2/std"],
-      "run": { "blotc": "../blot2/generated/compiler/blotc.gz" },
+    "squid": {
+      "read": ["../squid-lang/std"],
+      "run": { "squidc": "../squid-lang/generated/compiler/squidc.gz" },
       "timeout": 300
     }
   },
   "compiler": {
-    "plugin": "blot",
+    "plugin": "squid",
     "settings": {
-      "std": "../blot2/std",
+      "std": "../squid-lang/std",
       "imports": { "game/": "src/", "pen/": "pen/" },
       "nativeAssets": { "roots": ["src", "devtools"] },
       "generators": [
-        { "match": "src/assets/*.wgsl", "generator": "tools/wgsl_gen.blot", "inputMode": "text" },
-        { "module": "src/units.csv", "input": "data/units.csv", "generator": "tools/csv_gen.blot", "inputMode": "text" }
+        { "match": "src/assets/*.wgsl", "generator": "tools/wgsl_gen.sq", "inputMode": "text" },
+        { "module": "src/units.csv", "input": "data/units.csv", "generator": "tools/csv_gen.sq", "inputMode": "text" }
       ]
     }
   }
 }
 ```
 
-Stage-0 `generators` compile pure `.blot` modules with an `io` entry named
+Stage-0 `generators` compile pure `.sq` modules with an `io` entry named
 `generate` (or `exportName`) to zero-import ABI 8 Wasm, cache both the compiled
-generator per source graph and the generated virtual `.blot` module per input
-digest, and inject the virtual modules into Stage 1 builds and `pen test-blot`
+generator per source graph and the generated virtual `.sq` module per input
+digest, and inject the virtual modules into Stage 1 builds and `pen test-squid`
 (as well as `pen dev` hot-reload watching). Rules accept `module` + `input` or
 a single-star `match` pattern (`dir/*.ext`) with `inputMode` `"bytes"` (default)
 or `"text"`.
 
-Ordinary `pen test-blot` also accepts a library with only `pen.json`, without
-`src/main.blot`, assets or a renderer. The Blot plugin's compiler settings can
+Ordinary `pen test-squid` also accepts a library with only `pen.json`, without
+`src/main.sq`, assets or a renderer. The Squid plugin's compiler settings can
 supply a test layout:
 
 ```json
 "tests": {
-  "entry": "tests/test_fixture.blot",
-  "files": ["tests/math.blot", "tests/ui.blot"]
+  "entry": "tests/test_fixture.sq",
+  "files": ["tests/math.sq", "tests/ui.sq"]
 }
 ```
 
 `entry` is a shared virtual file, not a file to create: each test module's
-source stands there, so `./check` resolves to `tests/check.blot`. Keeping one
+source stands there, so `./check` resolves to `tests/check.sq`. Keeping one
 entry lets workers reuse compiler sessions across modules. `files` is the
 ordered default suite; explicit CLI files override it and `--filter` still
 applies. Omit either field to retain its game default: an entry beside
-`src/main.blot`, and discovery in `tests/`, `tests/traps/` and
+`src/main.sq`, and discovery in `tests/`, `tests/traps/` and
 `tests/rejected/`. `--session` scenarios still require a game checkout.
 
 Plugins receive clocks, randomness and log lines (their stdout and stderr)
@@ -344,7 +344,7 @@ written off the frame's path.
 `PEN_TRACE_SYSTEMS=/tmp/systems.json pen dev` records a native game's
 `main_trace` entrypoint. Ink's `ink/pen/host.run_traced` provides this
 entrypoint's observer protocol; it takes the same host capability as `main`.
-Rebuild Blot and the game with the optional `blot:allocation` export before
+Rebuild Squid and the game with the optional `squid:allocation` export before
 capturing. Normal runs retain the original module and entrypoint.
 
 Exit normally to finish the Chrome/Perfetto JSON and its adjacent
@@ -369,12 +369,12 @@ inside them. This capture is supported by the native host.
 
 After `just export`, compare every packet and the final saved world with and
 without tracing using
-`PEN_TRACE_FIXTURE=dist/gdev/game.wasm cargo test -p blot-host --test system_trace -- --ignored`.
+`PEN_TRACE_FIXTURE=dist/gdev/game.wasm cargo test -p squid-host --test system_trace -- --ignored`.
 
 ### The dev tools
 
-The dev tools are the checkout's own: a second Blot program beside the game
-(gdev's `devtools/main.blot`, its console and diagnostics, written with the
+The dev tools are the checkout's own: a second Squid program beside the game
+(gdev's `devtools/main.sq`, its console and diagnostics, written with the
 game's interface packages), which `pen dev` and `pen run` build and run while
 the game runs, drawing its sprites over the game's frame. pen hosts it and draws
 nothing of its own; [Gdev's dev tools](../../gdev/docs/reference.md#dev-tools)
@@ -393,7 +393,7 @@ frame (`crates/pen/src/devtools.rs`):
   held keys let go), and the pointer and wheel over its dialogs. A drag the game
   started stays the game's.
 - **What it asks.** The `devtools` service (`protocol/schema.json`,
-  DevtoolsOperation): the log (the game's reports, the Blot compiler's output,
+  DevtoolsOperation): the log (the game's reports, the Squid compiler's output,
   reloads, assets, recipes, time travel), the last frame's numbers
   (DevtoolsFrame: frame interval, the frame's phases when it asks for timing,
   draws, meshes, memory, size, the timeline's state, what culling left out,
@@ -427,7 +427,7 @@ shows the diagnostics without a window; a headless run keeps no state. They are
 the `devtools` cargo feature, on by default; the player runtime leaves them out.
 
 Beside the console, `/timeline`, `/tunables` and `/builds` open its panels
-(gdev's `devtools/panels.blot`): time travel and recordings, the live tunables
+(gdev's `devtools/panels.sq`): time travel and recordings, the live tunables
 with reset and Bake, and the build and reload output. Time travel also works
 from the console (`/pause`, `/play`, `/step`, `/rewind`, `/replay`, `/history`,
 `/record`) and its keys ("Recording, replay and time travel").
@@ -438,7 +438,7 @@ decision reasons through the opt-in
 diffs and transition watches on the existing timeline; the application supplies
 its inspector UI.
 
-The same dialog has the inspectors (gdev's `devtools/pages.blot`), whose numbers
+The same dialog has the inspectors (gdev's `devtools/pages.sq`), whose numbers
 the host works out alike for every host (`pen_runtime::inspect`):
 
 - **Timeline:** pictures of the game's frames every 30 frames, which the host
@@ -456,11 +456,11 @@ the host works out alike for every host (`pen_runtime::inspect`):
 - **Profile** (`/profile`): samples the game's guest about every millisecond of
   its running time (`pen dev`: the development engine's epoch ticks faster while
   it samples, its deadline counting time) and shows a flame graph and the
-  functions found running most. Functions show by index until Blot emits a name
-  section (`blot_host::function_name` is the one lookup).
+  functions found running most. Functions show by index until Squid emits a name
+  section (`squid_host::function_name` is the one lookup).
 - **Memory** (`/memory`): the guest's committed memory and the ownership
-  counters guest ABI 3 exports (`blot:rc_*`, `blot:cycle_*`), with rates, and
-  the host's calls (`blot_host::Probe`).
+  counters guest ABI 3 exports (`squid:rc_*`, `squid:cycle_*`), with rates, and
+  the host's calls (`squid_host::Probe`).
 - **Assets** (`/assets`) and **Material** (`/material`): the catalog's meshes,
   materials and sounds and where each stands in the renderer, a preview the dev
   tools' renderer draws into their atlas, hot swaps (an entry drawn from another
@@ -556,7 +556,7 @@ pen run --size 1920x1080 --record clip.mp4 --frames 600
 
 `just test` runs protocol freshness, strict Clippy (pen in every combination of
 its features, through `cargo install cargo-hack`), compiler-component tests,
-workspace and release GPU tests, golden images, determinism, the full Blot suite
+workspace and release GPU tests, golden images, determinism, the full Squid suite
 and browser conformance. `just check` exports the game and packet fixtures
 before running tests. For direct Cargo tests, prepare those fixtures with
 `just packets`; `PEN_REQUIRE_FIXTURES=1` makes a missing fixture fail instead of
@@ -571,18 +571,18 @@ sources of all three lockfiles against `deny.toml` (`cargo install cargo-deny`).
   with a button that accepts a shot as its golden image.
   [docs/testing.md](testing.md) has this and the other testing tools: replays
   across builds, fuzzing, codec round trips, bug reports, benchmarks per commit
-  and the Blot suite's speed.
+  and the Squid suite's speed.
 - **Determinism:** `just determinism` checks repeated scripts, overlapped
   frames, recording replay and time travel for identical input and packets.
-- **Blot:** `pen test-blot` runs the tests the checkout's compiler plugin lays
-  out (for Blot: ordinary tests, expected traps and rejected programs) through
+- **Squid:** `pen test-squid` runs the tests the checkout's compiler plugin lays
+  out (for Squid: ordinary tests, expected traps and rejected programs) through
   real compiler sessions. The migration run passed 482 tests across 55 modules,
   including the new dev tools panels.
-- **Blot session scenarios:** `pen test-blot --session FILE.blot` gives a
+- **Squid session scenarios:** `pen test-squid --session FILE.sq` gives a
   separate test guest control of a real native headless session: initial saves,
   UI selectors and pointer input, fixed steps, state assertions and screenshot
   comparisons. Runs retain saves, input replays and action traces. See
-  [the scenario API](testing.md#blot-scenarios-driving-native-sessions).
+  [the scenario API](testing.md#squid-scenarios-driving-native-sessions).
 - **Browser:** the harnesses in `crates/pen-web/tests/` exercise the real JSPI
   host and WebGPU shaders in headless Chromium. FXAA witnesses agree with native
   output within one 8-bit channel step. See the browser README for commands.
@@ -622,12 +622,12 @@ CI cancels a run when a newer push to the same branch or pull request arrives;
 [docs/ci.md](ci.md) has each job and what the owner sets for it. It runs Clippy
 (pen in every feature combination), unit and GPU tests, browser builds optimized
 with wasm-opt, cargo-deny, and cross-built Linux/Windows players. The optional
-game job requires the `GDEV_REPOSITORY`, `BLOT2_REPOSITORY` and `INK_REPOSITORY`
-variables, their revision variables `GDEV_REF`, `BLOT2_REF` and `INK_REF`
+game job requires the `GDEV_REPOSITORY`, `SQUID_REPOSITORY` and `INK_REPOSITORY`
+variables, their revision variables `GDEV_REF`, `SQUID_REF` and `INK_REF`
 (commit SHAs), and a `CHECKOUTS_TOKEN` secret that can read them. Without them
 it is skipped and the Linux job warns "Game tests skipped"; pull requests from
 forks skip it too. It sets `PEN_REQUIRE_FIXTURES=1`, so a missing fixture fails
-instead of skipping. It checks the protocol, full Blot tests, golden images,
+instead of skipping. It checks the protocol, full Squid tests, golden images,
 browser engine conformance, small WebGPU image witnesses and determinism.
 Full-scene browser screenshots use hardware here; the software runner uses
 bounded shader witnesses. GPU consumers run sequentially.
@@ -673,7 +673,7 @@ Scripts have the same as steps: `pause`, `resume`, `step[=N]`, `rewind=N`
 `/record [FILE]` starts or stops an input recording in the middle of a session.
 
 **Edit and replay.** In `pen dev`, pause when something goes wrong
-(Ctrl+Shift+P), so the moment stays in the history while you edit. Save the Blot
+(Ctrl+Shift+P), so the moment stays in the history while you edit. Save the Squid
 fix. When the reload is in, press Ctrl+Shift+R: the last 5 s of input play again
 on the new build, starting from the state before them, and then the game plays
 on live.
@@ -713,7 +713,7 @@ the interface's nodes, service requests, and requests to checkpoint, undo, redo,
 save, load or exit. A game's own events and render sections, which its
 `pen.json` declares, travel in both without a change to the protocol
 ([docs/extensions.md](extensions.md)). pen-protocol's `packets.rs` is generated
-from `protocol/schema.json`, which also generates the game's Blot encoders and
+from `protocol/schema.json`, which also generates the game's Squid encoders and
 decoders. After a schema change, `just sync-protocol` regenerates it, and
 `just check` fails while it is stale.
 
@@ -734,7 +734,7 @@ Downstream renderers and frame inspection receive complete ordinary draw lists.
 ### Services
 
 The game reaches the platform and native libraries through one boundary, gdev's
-`packages/services.blot`: it asks in its render packet's `services` section (a
+`packages/services.sq`: it asks in its render packet's `services` section (a
 request id, a service and operation code, four numbers and values, text as code
 points), and each request is answered once, as ServiceAnswer and ServiceData
 events in a later frame's input. Answers are input, so an input recording holds
@@ -755,7 +755,7 @@ native library becomes a service by implementing the `Service` trait (its code,
 and an answer for each request, now or later through `poll`) and registering it
 in the session's `Services`; the service and its operations get codes in
 `protocol/schema.json` (`just sync-protocol`), and the game asks through
-`services.blot`. `pen_simulation::Noise` is one example.
+`services.sq`. `pen_simulation::Noise` is one example.
 
 The simulation services (`crates/pen-simulation`) keep nothing between requests:
 each carries its noise settings, as the schema's `NoiseOperation` lays them out,
@@ -770,7 +770,7 @@ pathfinding, navmesh and collider-query service IDs remain reserved and answer
 
 ### Other guests
 
-The boundary is the guest ABI and the packets, not Blot: `examples/rust-guest`
+The boundary is the guest ABI and the packets, not Squid: `examples/rust-guest`
 is a small game in Rust that pen plays, packages (`pen build --game`) and
 rewinds unchanged. A trap names its frames and, given a source map, their files
 and lines ([docs/source-maps.md](source-maps.md)). Mods are extra guests beside
@@ -779,7 +779,7 @@ to the player's input (`--mod DIR`, [docs/mods.md](mods.md)). State is opaque by
 default. An explicit [state adapter](state-adapters.md) adds format-specific
 tooling. Ink applications can declare saved types in `saved.json` beside the
 catalog for migration fallback ([docs/saved-types.md](saved-types.md)).
-[docs/guest-abi-next.md](guest-abi-next.md) says which of blot2's guest ABI pen
+[docs/guest-abi-next.md](guest-abi-next.md) says which of squid-lang's guest ABI pen
 hosts and what it needs next.
 
 ### Sound
@@ -876,7 +876,7 @@ machine's CPU.
 shaders and textures its materials name. Mesh JSON ships in the renderer's
 binary form, with lossless byte shuffling and zlib compression when smaller.
 Both native and browser hosts restore the original mesh values at load time. It
-refuses a runtime built from another pen (different wasmtime or blot-host):
+refuses a runtime built from another pen (different wasmtime or squid-host):
 rebuild it with `just install-player`. `pen build --game DIR` packages a bundle
 compiled already (`pen export`'s) without the checkout, for another platform's
 runtime; for a macOS runtime it makes an app bundle (docs/shipping.md). The
@@ -995,9 +995,9 @@ off when the guest takes several milliseconds (docs/determinism.md, "Overlapped
 frames").
 
 **Hot reload.** The development engine compiles gdev's first build in about 105
-ms and a reload in about 50 ms (blot-host's `dev_engine`; the date was not
+ms and a reload in about 50 ms (squid-host's `dev_engine`; the date was not
 recorded). The runtime's side of a reload, from a new `game.wasm` to the new
-build running, takes about 90 ms; the Blot compiler's build before it, 1 to 2 s
+build running, takes about 90 ms; the Squid compiler's build before it, 1 to 2 s
 ([Gdev reference](../../gdev/docs/reference.md)).
 
 **Loading.** Loading compiles only the pipelines a shader's loaded materials
@@ -1054,9 +1054,9 @@ NVIDIA. These have not run, or have known gaps:
 - **Function names in traps and profiles**: both hosts name a trap's frames, and
   the dev tools' profile its functions, from the module's name section (and its
   exports), and place a trap's frames in its source from an embedded source map
-  ([docs/source-maps.md](source-maps.md)), but Blot emits neither yet: names
-  wait on a pending blot2 patch and source maps on blot2 adopting that format,
-  so a Blot game's frames show its exports' names and function indices.
+  ([docs/source-maps.md](source-maps.md)), but Squid emits neither yet: names
+  wait on a pending squid-lang patch and source maps on squid-lang adopting that format,
+  so a Squid game's frames show its exports' names and function indices.
 - **A recording is tied to its build**: it replays exactly only on the build
   that made it.
 - **No texture compression** yet; docs/texture-compression.md is the

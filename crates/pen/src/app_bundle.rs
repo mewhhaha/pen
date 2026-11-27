@@ -162,7 +162,7 @@ mod tests {
     use super::*;
 
     fn identity() -> Identity {
-        Identity { name: "gdev".into(), title: "gdev — Blot 3D & <friends>".into(), players: 1 }
+        Identity { name: "gdev".into(), title: "gdev — Squid 3D & <friends>".into(), players: 1 }
     }
 
     #[test]
@@ -183,7 +183,7 @@ mod tests {
         for line in [
             "<key>CFBundleExecutable</key>\n\t<string>gdev</string>",
             "<key>CFBundleIdentifier</key>\n\t<string>com.studio.gdev</string>",
-            "<string>gdev — Blot 3D &amp; &lt;friends&gt;</string>",
+            "<string>gdev — Squid 3D &amp; &lt;friends&gt;</string>",
             "<key>NSHighResolutionCapable</key>\n\t<true/>",
             "<key>LSMinimumSystemVersion</key>\n\t<string>11.0</string>",
         ] {

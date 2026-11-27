@@ -9,7 +9,7 @@ Hardware: Ryzen 7 3800X, RTX 2070 SUPER, Vulkan, host glibc 2.44.
 | Protocol generator | 4 tests passed, including 2,930 malformed-schema mutations; generated files fresh |
 | Native workspace | 113 tests passed; 4 existing exploratory audio/recording helpers ignored |
 | Release renderer | 14 tests passed, including required FXAA and shadow GPU witnesses |
-| Blot game and panels | 482 tests passed across 55 modules in 78.4 seconds |
+| Squid game and panels | 482 tests passed across 55 modules in 78.4 seconds |
 | Golden images | All 6 passed; largest RMSE 0.0259%, unchanged baselines |
 | Determinism | 831-frame script repeats, overlaps and recording replay match; 460 time-travel frames repeat exactly |
 | Browser engine | All 367 original conformance packets match native bit-for-bit; binary transfer completes in 1.69 seconds |

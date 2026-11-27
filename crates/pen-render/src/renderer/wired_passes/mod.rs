@@ -66,7 +66,7 @@ pub use render2d::{RadianceCascades2dLayer, Scene2d, SpriteLayer2d, TilemapLayer
 #[cfg(feature = "render-env")]
 pub(super) use sky_env::EnvPipelines;
 
-/// Built-in optional `RenderFrame::extensions` tags driving outdoor GPU environment passes from Blot.
+/// Built-in optional `RenderFrame::extensions` tags driving outdoor GPU environment passes from Squid.
 pub const ENV_TERRAIN_EXT_TAG: u32 = 65_001;
 pub const ENV_WATER_EXT_TAG: u32 = 65_002;
 pub const ENV_FOLIAGE_EXT_TAG: u32 = 65_003;

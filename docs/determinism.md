@@ -190,7 +190,7 @@ session did, rewinds within it included.
 
 **Edit and replay.** In `pen dev`, pause when something goes wrong
 (Ctrl+Shift+P), so the moment stays in the 30 s history while you edit. Save the
-Blot fix. When the reload is in, press Ctrl+Shift+R: the last 5 s of input play
+Squid fix. When the reload is in, press Ctrl+Shift+R: the last 5 s of input play
 again on the new build, starting from the state before them, and then the game
 plays on live. Moments from before the reload are still valid starting points.
 The ones after the replay's start are dropped and taken again from the new build

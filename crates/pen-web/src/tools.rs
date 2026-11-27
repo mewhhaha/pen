@@ -1,4 +1,4 @@
-//! The dev tools in the browser: the game's own Blot program for them
+//! The dev tools in the browser: the game's own Squid program for them
 //! (`devtools.wasm`), run beside the game as native pen runs it, its
 //! sprites drawn over the game's frame. Its requests are answered through
 //! pen-runtime's dev tools service, the page's frame loop (`Browser`) being

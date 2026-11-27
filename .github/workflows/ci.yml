@@ -35,8 +35,8 @@ jobs:
       - uses: actions/checkout@v7
       - name: Game tests not configured
         # The game job below needs these; without them it is skipped.
-        if: ${{ vars.GDEV_REPOSITORY == '' || vars.BLOT2_REPOSITORY == '' || vars.GDEV_REF == '' || vars.BLOT2_REF == '' || vars.INK_REPOSITORY == '' || vars.INK_REF == '' }}
-        run: echo "::warning title=Game tests skipped::Set the GDEV_REPOSITORY, GDEV_REF, BLOT2_REPOSITORY, BLOT2_REF, INK_REPOSITORY and INK_REF repository variables and the CHECKOUTS_TOKEN secret to run them."
+        if: ${{ vars.GDEV_REPOSITORY == '' || vars.SQUID_REPOSITORY == '' || vars.GDEV_REF == '' || vars.SQUID_REF == '' || vars.INK_REPOSITORY == '' || vars.INK_REF == '' }}
+        run: echo "::warning title=Game tests skipped::Set the GDEV_REPOSITORY, GDEV_REF, SQUID_REPOSITORY, SQUID_REF, INK_REPOSITORY and INK_REF repository variables and the CHECKOUTS_TOKEN secret to run them."
       - name: System libraries
         # ALSA and D-Bus for audio (cpal), udev for gamepads (gilrs), CMake
         # for libopus, lavapipe for the GPU tests, ffmpeg for the recording
@@ -238,13 +238,13 @@ jobs:
         run: |
           ndk=${ANDROID_NDK_LATEST_HOME:?the runner image has no Android NDK}/toolchains/llvm/prebuilt/linux-x86_64/bin
           export CC_aarch64_linux_android=$ndk/aarch64-linux-android24-clang AR_aarch64_linux_android=$ndk/llvm-ar
-          cargo clippy --target aarch64-linux-android -p pen-protocol -p pen-runtime -p pen-render -p blot-host -- -D warnings
-          cargo clippy --target aarch64-linux-android -p blot-host --no-default-features -- -D warnings
+          cargo clippy --target aarch64-linux-android -p pen-protocol -p pen-runtime -p pen-render -p squid-host -- -D warnings
+          cargo clippy --target aarch64-linux-android -p squid-host --no-default-features -- -D warnings
 
   game:
-    name: Game tests (needs the gdev and blot2 checkouts)
+    name: Game tests (needs the gdev and squid-lang checkouts)
     # A pull request from a fork gets no CHECKOUTS_TOKEN to read them with.
-    if: ${{ vars.GDEV_REPOSITORY != '' && vars.BLOT2_REPOSITORY != '' && vars.GDEV_REF != '' && vars.BLOT2_REF != '' && vars.INK_REPOSITORY != '' && vars.INK_REF != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    if: ${{ vars.GDEV_REPOSITORY != '' && vars.SQUID_REPOSITORY != '' && vars.GDEV_REF != '' && vars.SQUID_REF != '' && vars.INK_REPOSITORY != '' && vars.INK_REF != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ubuntu-24.04
     # A test whose game fixtures are missing fails here instead of skipping,
     # so a checkout that went wrong cannot pass.
@@ -254,7 +254,7 @@ jobs:
       run:
         working-directory: pen
     steps:
-      # The recipes expect the checkouts side by side: ../gdev, ../blot2.
+      # The recipes expect the checkouts side by side: ../gdev, ../squid-lang.
       - uses: actions/checkout@v7
         with:
           path: pen
@@ -266,10 +266,10 @@ jobs:
           path: gdev
       - uses: actions/checkout@v7
         with:
-          repository: ${{ vars.BLOT2_REPOSITORY }}
-          ref: ${{ vars.BLOT2_REF }}
+          repository: ${{ vars.SQUID_REPOSITORY }}
+          ref: ${{ vars.SQUID_REF }}
           token: ${{ secrets.CHECKOUTS_TOKEN }}
-          path: blot2
+          path: squid-lang
       - uses: actions/checkout@v7
         with:
           repository: ${{ vars.INK_REPOSITORY }}
@@ -291,10 +291,10 @@ jobs:
           workspaces: pen
       - name: Native compiler and component
         run: |
-          cd ../blot2
+          cd ../squid-lang
           sh compiler-goose/build.sh --release
           mkdir -p generated/compiler
-          gzip -c compiler-goose/build/blotc-goose > generated/compiler/blotc.gz
+          gzip -c compiler-goose/build/squidc-goose > generated/compiler/squidc.gz
           cd ../pen
           just plugins
       - name: Protocol freshness and game tests
@@ -304,7 +304,7 @@ jobs:
           cargo run --release -q -p pen -- codegen --project ../gdev --rust crates/pen-protocol/src/packets.rs --check
           just packets
           cargo test --workspace -- --test-threads=1
-          just blot-tests
+          just squid-tests
           just determinism
       - name: Example games and a new one
         # bounce's tests, golden images and own sections, and a game `pen

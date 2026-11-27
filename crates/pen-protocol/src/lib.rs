@@ -1,4 +1,4 @@
-//! What crosses between the host and a game's Blot program: frames in,
+//! What crosses between the host and a game's Squid program: frames in,
 //! render packets out, generated from protocol/schema.json into packets.rs.
 pub mod boundary;
 pub mod diagnostic;

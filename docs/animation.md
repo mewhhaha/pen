@@ -57,7 +57,7 @@ itself made by `sprout-model` from a Blender script).
   left out with a note.
 - **`NAME.import.json`** lists what was written: each mesh with its
   material, joint count and vertex-animation material, and the clips by name
-  and duration, for the game (Blot imports JSON) and for people.
+  and duration, for the game (Squid imports JSON) and for people.
 
 A file is written only when its content changes, through a rename, so an
 import that changes nothing sets nothing off, and a running game never reads
@@ -162,9 +162,9 @@ move with it), and lighting.
 
 ## Games
 
-A Blot game appends poses and emitters to Ink's named `render.FrameAccess`
+A Squid game appends poses and emitters to Ink's named `render.FrameAccess`
 pools: `poses` holds `render.Pose` and `emitters` holds `render.Emitter`
 (with `matrix` for the transform and `math.Vec4` colors). `render.finish`
-borrows these pools in a `render.RenderFrame`; `lib/pen/host.blot` encodes
+borrows these pools in a `render.RenderFrame`; `lib/pen/host.sq` encodes
 them before their owners close. gdev's sprout (`src/assets/sprout.import.json`) is imported and
 ready to draw, skinned or baked; the game does not draw it yet.

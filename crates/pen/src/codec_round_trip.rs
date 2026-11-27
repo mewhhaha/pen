@@ -1,21 +1,21 @@
-//! The Rust and Blot packet codecs, checked against each other on random
+//! The Rust and Squid packet codecs, checked against each other on random
 //! frames. Each side's encoder and decoder mirror each other, so a round
 //! trip within one side cannot show the two sides laying a packet out
 //! differently. Instead each side walks the values it holds in one order that
 //! lays nothing out (pen-codegen's canonical.rs), and the walks must agree to
 //! the bit:
 //!
-//! - input: Rust encodes a random frame (`encode_frame`), the game's Blot
+//! - input: Rust encodes a random frame (`encode_frame`), the game's Squid
 //!   decodes it into a named event pool (`decode_input_into`) and walks what it got, which must be Rust's
 //!   walk of the frame (`canonical_input`);
-//! - render: Rust walks a random frame (`canonical_render`), Blot reads the
+//! - render: Rust walks a random frame (`canonical_render`), Squid reads the
 //!   walk directly into named packet, child-draw and extra-lane pools
 //!   (`render_packet_from_canonical`), then projects those flat lanes through
 //!   the actual production `encode_render_views`. Both packets must agree to
 //!   the bit, and Rust decodes the production packet
 //!   (`decode_frame`) into the frame it walked, to the bit.
 //!
-//! The Blot side (codec_round_trip.blot) compiles through the sibling
+//! The Squid side (codec_round_trip.sq) compiles through the sibling
 //! checkout's compiler plugin, with the bindings this pen's schema generates
 //! standing in for the checkout's `pen/`: it checks this pen's codegen,
 //! whatever the checkout holds. Without a checkout it skips, as a missing
@@ -28,7 +28,6 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use blot_host::{Guest, GuestModule, Value};
 use pen_plugins::{Builder, Expectation, Level, Overlay, Plugins, TestModule};
 use pen_protocol::boundary::{
     MAX_BUSES, MAX_CASCADES, MAX_DRAW_EXTRA, MAX_DRAWS, MAX_FIELD, MAX_INSETS, MAX_SERVICE_DATA, MAX_SERVICE_ID,
@@ -42,9 +41,10 @@ use pen_protocol::{
     RenderFrame, ReverbRoom, ReverbZone, RibbonPoint, ServiceRequest, Shadow, Sky, Solid, SolidFace, Sound, Sprite,
     SynthVoice, UiNode, Vector, Viewport, Voice, service, ui_live, ui_role, ui_state,
 };
+use squid_host::{Guest, GuestModule, Value};
 
-const HARNESS: &str = include_str!("codec_round_trip.blot");
-/// The largest whole number a lane holds exactly (Blot's `lanes.max_integer`).
+const HARNESS: &str = include_str!("codec_round_trip.sq");
+/// The largest whole number a lane holds exactly (Squid's `lanes.max_integer`).
 const MAX_INTEGER: u32 = 16_777_215;
 const CASES: u64 = 2000;
 const SEED: u64 = 0x5eed_c0de_ca5e_0000;
@@ -52,11 +52,11 @@ const SEED: u64 = 0x5eed_c0de_ca5e_0000;
 const VARIANTS: usize = 30;
 /// The first of them, which pen's own bindings decode: all but Game, the
 /// game's own events, which only a checkout that declares them decodes (its
-/// pen/extensions.blot), so the random frames leave it out.
+/// pen/extensions.sq), so the random frames leave it out.
 const CORE_VARIANTS: usize = 29;
 
 #[test]
-fn input_packets_mean_the_same_to_rust_and_blot() {
+fn input_packets_mean_the_same_to_rust_and_squid() {
     let Some(wasm) = harness() else { return };
     let (cases, first) = cases();
     let started = Instant::now();
@@ -78,7 +78,7 @@ fn input_packets_mean_the_same_to_rust_and_blot() {
                 failed(format!(
                     "the game's walk of the packet differs from Rust's walk of the frame at lane {lane}, {}:\n{}\n{frame:#?}",
                     input_place(&frame, lane),
-                    around(("Rust", &expected), ("Blot", &actual), lane)
+                    around(("Rust", &expected), ("Squid", &actual), lane)
                 ));
             }
         }
@@ -95,7 +95,7 @@ fn input_packets_mean_the_same_to_rust_and_blot() {
 }
 
 #[test]
-fn render_packets_mean_the_same_to_rust_and_blot() {
+fn render_packets_mean_the_same_to_rust_and_squid() {
     let Some(wasm) = harness() else { return };
     let (cases, first) = cases();
     let started = Instant::now();
@@ -197,8 +197,8 @@ fn compile() -> Option<Vec<u8>> {
     };
     let checkout = plugins.root().to_owned();
     // Where the plugin lays a checkout's test modules out (gdev's tests/README.md).
-    let entry = checkout.join("src/test_fixture.blot").display().to_string();
-    let bindings = pen_codegen::blot_bindings().expect("pen's schema generates the game's bindings");
+    let entry = checkout.join("src/test_fixture.sq").display().to_string();
+    let bindings = pen_codegen::squid_bindings().expect("pen's schema generates the game's bindings");
     let mut overlays: Vec<Overlay> = bindings
         .into_iter()
         .map(|(name, source)| Overlay {
@@ -208,7 +208,7 @@ fn compile() -> Option<Vec<u8>> {
         .collect();
     overlays.push(Overlay { path: entry.clone(), contents: Some(HARNESS.to_owned()) });
     let harness = TestModule {
-        path: Path::new(env!("CARGO_MANIFEST_DIR")).join("src/codec_round_trip.blot").display().to_string(),
+        path: Path::new(env!("CARGO_MANIFEST_DIR")).join("src/codec_round_trip.sq").display().to_string(),
         entry: entry.clone(),
         overlays,
         prefix: String::new(),
@@ -216,7 +216,7 @@ fn compile() -> Option<Vec<u8>> {
     };
     let started = Instant::now();
     let mut builder = Builder::new(plugins, Path::new(&entry));
-    let wasm = crate::blot_test::build_test_module(&mut builder, &harness)
+    let wasm = crate::squid_test::build_test_module(&mut builder, &harness)
         .unwrap_or_else(|error| panic!("the codec harness does not compile in {}:\n{error:#}", checkout.display()));
     let _ = builder.close();
     eprintln!(
@@ -252,9 +252,9 @@ fn with_guest<T: Send>(wasm: &[u8], work: impl FnOnce(&mut Guest) -> T + Send) -
     std::thread::scope(|scope| {
         let thread = std::thread::Builder::new()
             .name("pen-codec".into())
-            .stack_size(blot_host::GUEST_STACK_BYTES + (8 << 20))
+            .stack_size(squid_host::GUEST_STACK_BYTES + (8 << 20))
             .spawn_scoped(scope, || {
-                let engine = blot_host::dev_engine().unwrap();
+                let engine = squid_host::dev_engine().unwrap();
                 let module = GuestModule::new(&engine, wasm, None).unwrap();
                 let mut guest = Guest::new(&engine, &module).unwrap();
                 // Room for a loaded machine; each call is a few milliseconds.

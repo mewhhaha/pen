@@ -39,10 +39,10 @@ try {
   await utimes(changed, stamp.atime, new Date());
   await page.waitForFunction(() => document.querySelector('canvas')?.getAttribute('data-frame') !== null);
   for (let attempt = 0; attempt < 40; attempt++) {
-    if (messages.some(message => message.text.includes('Blot reloaded'))) break;
+    if (messages.some(message => message.text.includes('Squid reloaded'))) break;
     await page.waitForTimeout(250);
   }
-  if (!messages.some(message => message.text.includes('Blot reloaded'))) throw new Error('Revision did not reload the game');
+  if (!messages.some(message => message.text.includes('Squid reloaded'))) throw new Error('Revision did not reload the game');
   const refreshed = requests.slice(start);
   for (const path of ['/catalog.json', '/game.wasm', '/devtools.wasm']) {
     if (!refreshed.includes(path)) throw new Error(`Revision did not refresh ${path}`);

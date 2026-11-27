@@ -1,5 +1,5 @@
 //! Live-tunable constants (the checkout's README, "Tunables"): numbers a
-//! designer changes in the running game without a Blot build. The checkout
+//! designer changes in the running game without a Squid build. The checkout
 //! declares them once, in `src/tunables.json` (name, default, range, and
 //! optionally a step and a doc line); the game reads that file as it
 //! compiles, and this reads it for the `tune=NAME=VALUE` script step, the
@@ -289,7 +289,7 @@ mod tests {
 
     #[test]
     fn ids_match_gdevs() {
-        // The game's tests/tunables.blot asserts the same.
+        // The game's tests/tunables.sq asserts the same.
         assert_eq!(tunable_id("camera.zoom_speed"), 11_175_412);
         assert!(tunable_id("a.much.longer.name_with_digits_123") <= 0x00ff_ffff);
     }

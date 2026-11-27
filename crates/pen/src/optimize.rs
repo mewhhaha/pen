@@ -80,7 +80,7 @@ fn optimize(path: &Path, source: &[u8], custom: &[(String, &[u8])], scratch: &Pa
     optimized = replace_custom(&optimized, MARK, None)?;
     ensure!(read_abi(source)? == read_abi(&optimized)?, "wasm-opt changed the guest ABI");
     let after = custom_sections(&optimized)?;
-    for (name, payload) in custom.iter().filter(|(name, _)| name.starts_with("blot:")) {
+    for (name, payload) in custom.iter().filter(|(name, _)| name.starts_with("squid:")) {
         ensure!(after.iter().any(|(n, p)| n == name && p == payload), "wasm-opt changed {name}");
     }
     let symbols = Symbols::read(&optimized);
@@ -91,9 +91,9 @@ fn optimize(path: &Path, source: &[u8], custom: &[(String, &[u8])], scratch: &Pa
     // Validate the final stamped bytes through the same cache used by the
     // startup-scene analysis, so it reuses this compilation. No guest code
     // runs during validation; target-specific precompilation stays separate.
-    let engine = blot_host::engine()?;
+    let engine = squid_host::engine()?;
     let cache = crate::cache_dir().map(|directory| directory.join("wasm"));
-    blot_host::GuestModule::new(&engine, &optimized, cache.as_deref())?;
+    squid_host::GuestModule::new(&engine, &optimized, cache.as_deref())?;
     std::fs::write(&output, &optimized)?;
     std::fs::rename(&output, path)?;
     eprintln!(
@@ -229,10 +229,10 @@ mod tests {
         // An unused function precedes main(i32) -> i32 (argument plus one).
         // DCE must change both main's function index and instruction offsets.
         let mut wasm = b"\0asm\x01\0\0\0\x01\x06\x01\x60\x01\x7f\x01\x7f\x03\x03\x02\0\0\x07\x08\x01\x04main\0\x01\x0a\x0e\x02\x04\0\x41\0\x0b\x07\0\x20\0\x41\x01\x6a\x0b".to_vec();
-        wasm = replace_custom(&wasm, "blot:abi", Some(b"\x02\x01\x04main\x01\x01\0")).unwrap();
+        wasm = replace_custom(&wasm, "squid:abi", Some(b"\x02\x01\x04main\x01\x01\0")).unwrap();
         wasm = replace_custom(&wasm, "name", Some(b"\x01\x0d\x01\x01\x0agame.plus1")).unwrap();
         // Byte 41 is local.get, mapped to the first source line and column.
-        let map = br#"{"version":3,"sources":["src/fixture.blot"],"names":[],"mappings":"yCAAA"}"#;
+        let map = br#"{"version":3,"sources":["src/fixture.sq"],"names":[],"mappings":"yCAAA"}"#;
         let url = format!("data:application/json;base64,{}", STANDARD.encode(map));
         let mut payload = leb(url.len()).unwrap();
         payload.extend(url.as_bytes());
@@ -241,10 +241,10 @@ mod tests {
         std::fs::write(&path, &wasm).unwrap();
         file(&path).unwrap();
         let optimized = std::fs::read(&path).unwrap();
-        let engine = blot_host::engine().unwrap();
-        let module = blot_host::GuestModule::new(&engine, &optimized, None).unwrap();
-        let mut guest = blot_host::Guest::new(&engine, &module).unwrap();
-        assert!(matches!(guest.call("main", blot_host::Value::U32(41)).unwrap(), blot_host::Value::U32(42)));
+        let engine = squid_host::engine().unwrap();
+        let module = squid_host::GuestModule::new(&engine, &optimized, None).unwrap();
+        let mut guest = squid_host::Guest::new(&engine, &module).unwrap();
+        assert!(matches!(guest.call("main", squid_host::Value::U32(41)).unwrap(), squid_host::Value::U32(42)));
         let symbols = Symbols::read(&optimized);
         assert_eq!(symbols.function(0), Some("game.plus1"));
         assert!(symbols.has_source_map());
@@ -252,7 +252,7 @@ mod tests {
         assert!(code_size(&optimized) < code_size(&wasm));
         assert!(
             (0..optimized.len())
-                .any(|offset| symbols.location(offset).is_some_and(|l| l.file == "src/fixture.blot" && l.line == 1))
+                .any(|offset| symbols.location(offset).is_some_and(|l| l.file == "src/fixture.sq" && l.line == 1))
         );
         file(&path).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), optimized, "repackaging is byte-idempotent");

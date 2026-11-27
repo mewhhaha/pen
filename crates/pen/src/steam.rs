@@ -11,7 +11,7 @@
 //! unlocked achievement at once, so its notification shows, stats at most
 //! once a minute, and anything left when the game closes). The game asks for
 //! them, and sets rich presence, through its services (`services::steam`,
-//! gdev's `packages/services.blot`), which answer unavailable without Steam.
+//! gdev's `packages/services.sq`), which answer unavailable without Steam.
 //! PEN_STEAM_DEBUG runs steps once Steam says the stats are in, or after two
 //! seconds, for testing against Spacewar:
 //!

@@ -1,0 +1,24 @@
+// The game's tests, which `pen test-squid` runs: each `test_` entry returns
+// the report of its checks (pen/check). A test module compiles as if it were
+// src/test_fixture.sq, so `./game` is src/game.sq.
+import * as check from "pen/check"
+import * as protocol from "pen/protocol"
+import { game } from "./game"
+
+const empty_state: #[F32] = #[]
+
+// Half a second of a 640 x 480 frame, with `events`.
+const input = func (events: #[protocol.Event]) =>
+  return $protocol.Input { elapsed: 0.5, width: 640.0, height: 480.0, events: &events[0..events.length], state: &empty_state[0..0] }
+
+io const test_the_cube_turns_at_its_speed = func () =>
+  let world = game.step (game.create ()) (input #[])
+  return check.report #[check.near 0.0001 #[0.5, 1.0] #[world.angle, world.speed]]
+
+io const test_the_right_arrow_turns_it_faster = func () =>
+  let world = game.step (game.create ()) (input #[$protocol.KeyDown protocol.key_arrow_right])
+  return check.report #[check.near 0.0001 #[0.75, 1.5] #[world.angle, world.speed]]
+
+io const test_a_saved_world_comes_back = func () =>
+  let world = game.step (game.create ()) (input #[$protocol.KeyDown protocol.key_arrow_left])
+  return check.report #[check.equal (game.save world) (game.save (game.restore (game.save world)))]

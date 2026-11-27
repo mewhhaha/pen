@@ -50,7 +50,7 @@ const COMMANDS: &[CommandSpec] = &[
         name: "dev",
         operands: "",
         checkout: true,
-        about: "compile the game's Blot program and play it, reloading the program, shaders and assets as they \
+        about: "compile the game's Squid program and play it, reloading the program, shaders and assets as they \
                 change with the game's state kept, and rerunning the checkout's asset recipes (pipeline.json) \
                 as their sources change",
     },
@@ -116,10 +116,10 @@ const COMMANDS: &[CommandSpec] = &[
         about: "the checkout's guest tests, compiled and laid out by its compiler plugin (pen.json)",
     },
     CommandSpec {
-        name: "test-blot",
+        name: "test-squid",
         operands: "[FILE...]",
         checkout: true,
-        about: "alias for test-guest (Blot checkouts: tests/*.blot, tests/traps/ and tests/rejected/)",
+        about: "alias for test-guest (Squid checkouts: tests/*.sq, tests/traps/ and tests/rejected/)",
     },
     CommandSpec {
         name: "gltf",
@@ -174,7 +174,7 @@ const COMMANDS: &[CommandSpec] = &[
         name: "new",
         operands: "DIR",
         checkout: false,
-        about: "a game to start from in the new directory DIR, named after it: pen.json, a Blot program that \
+        about: "a game to start from in the new directory DIR, named after it: pen.json, a Squid program that \
                 turns a cube, its assets, a test and pen's generated bindings; it compiles and runs as it is",
     },
     CommandSpec {
@@ -288,7 +288,7 @@ const CHECKOUT: &[&str] = &[
     "bench",
     "packets",
     "test-guest",
-    "test-blot",
+    "test-squid",
     "diverge",
     "fuzz",
 ];
@@ -601,17 +601,17 @@ const OPTIONS: &[OptionSpec] = &[
         about: "the shader those materials name (default vat.wgsl)",
     },
     OptionSpec {
-        name: "--blot",
+        name: "--squid",
         value: "DIR",
         commands: &["new"],
         place: Place::Command,
-        about: "the Blot checkout (blot2) it builds with (default PEN_BLOT, else a blot2 beside DIR or a \
+        about: "the Squid checkout (squid-lang) it builds with (default PEN_SQUID, else a squid-lang beside DIR or a \
                 directory above it)",
     },
     OptionSpec {
         name: "--update",
         value: "",
-        commands: &["test", "test-guest", "test-blot"],
+        commands: &["test", "test-guest", "test-squid"],
         place: Place::Command,
         about: "write the shots as the golden images",
     },
@@ -640,35 +640,35 @@ const OPTIONS: &[OptionSpec] = &[
     OptionSpec {
         name: "--golden",
         value: "DIR",
-        commands: &["test", "test-guest", "test-blot"],
+        commands: &["test", "test-guest", "test-squid"],
         place: Place::Command,
         about: "the golden images (default golden/ beside FILE; tests/scenarios/golden for --session)",
     },
     OptionSpec {
         name: "--out",
         value: "DIR",
-        commands: &["test", "test-guest", "test-blot"],
+        commands: &["test", "test-guest", "test-squid"],
         place: Place::Command,
         about: "where shots and differences go (default .pen/visual; .pen/session-tests for --session)",
     },
     OptionSpec {
         name: "--session",
         value: "",
-        commands: &["test-guest", "test-blot"],
+        commands: &["test-guest", "test-squid"],
         place: Place::Command,
         about: "run guest driver tests against isolated native headless sessions, sequentially (explicit test files required)",
     },
     OptionSpec {
         name: "--filter",
         value: "TEXT",
-        commands: &["test-guest", "test-blot"],
+        commands: &["test-guest", "test-squid"],
         place: Place::Command,
         about: "only the tests whose names hold TEXT",
     },
     OptionSpec {
         name: "--jobs",
         value: "N",
-        commands: &["test-guest", "test-blot"],
+        commands: &["test-guest", "test-squid"],
         place: Place::Command,
         about: "modules compiled at once, each worker in one compiler session, and tests run at once (default half \
                 the cores, at most 8)",
@@ -742,7 +742,7 @@ const OPTIONS: &[OptionSpec] = &[
     OptionSpec {
         name: "--deadline",
         value: "SECONDS",
-        commands: &["test-guest", "test-blot"],
+        commands: &["test-guest", "test-squid"],
         place: Place::Command,
         about: "how long one test may run before it fails as stuck (default 600; the time it waits for a core \
                 counts)",
@@ -915,7 +915,7 @@ const OPTIONS: &[OptionSpec] = &[
     OptionSpec {
         name: "--software",
         value: "",
-        commands: &["", "dev", "run", "test", "test-guest", "test-blot"],
+        commands: &["", "dev", "run", "test", "test-guest", "test-squid"],
         place: Place::Play,
         about: "draw on a software GPU adapter (lavapipe, WARP), as PEN_SOFTWARE=1 does",
     },
@@ -1136,7 +1136,7 @@ const ENVIRONMENT: [(&str, &str); 38] = [
         "a built browser host, for web and build --web (default web/ beside pen, else built from this repository)",
     ),
     (
-        "BLOT_INLINING=0, =1",
+        "SQUID_INLINING=0, =1",
         "Cranelift's inlining: =0 turns it off where it is on (run, build, a package), =1 on where it is off \
          (dev and the dev tools)",
     ),
@@ -1194,7 +1194,7 @@ pub(crate) fn usage() -> String {
         "usage: pen [COMMAND] [OPTIONS]  (pen --help: this; pen --version)\n\n\
          without a command, pen plays a packaged game: game/ beside the executable (a `pen build` package),\n\
          or --game DIR.\n\n\
-         commands, in a checkout (a directory with pen.json and src/main.blot; or --project DIR):\n",
+         commands, in a checkout (a directory with pen.json and src/main.sq; or --project DIR):\n",
     );
     let command = |text: &mut String, spec: &CommandSpec| {
         let head = format!("  {} {}", spec.name, spec.operands);
@@ -1232,7 +1232,7 @@ pub(crate) fn usage() -> String {
          pause resume step[=N] rewind=N replay=SECONDS.\n\n\
          bug reports: Ctrl+Shift+B in a window (a script's report[=FILE]) writes the last 30 s of input,\n\
          the state, the log and the system to a .penbug in reports/ of the data directory (pen report).\n\n\
-         dev tools (dev and run): the checkout's own program for them (devtools/main.blot) runs beside the\n\
+         dev tools (dev and run): the checkout's own program for them (devtools/main.sq) runs beside the\n\
          game and draws over it: its console on the backquote key (/help lists what it does), and its\n\
          diagnostics; a checkout without one runs without dev tools.\n\n\
          environment:\n",
@@ -1479,7 +1479,7 @@ mod tests {
         assert_eq!((args.command, args.path("--game")), ("", Some(PathBuf::from("dist/gdev"))));
         assert!(args.flag("--help"));
         assert_eq!(parse("test scenarios.json --only rock --only menu").unwrap().values("--only"), ["rock", "menu"]);
-        assert_eq!(parse("test-blot a.blot b.blot --jobs 2").unwrap().operands, ["a.blot", "b.blot"]);
+        assert_eq!(parse("test-squid a.sq b.sq --jobs 2").unwrap().operands, ["a.sq", "b.sq"]);
         assert_eq!(parse("packets out --frames 5").unwrap().operands, ["out"]);
         let args = parse("gltf models/a.glb --vat 30 --out assets").unwrap();
         assert_eq!(
@@ -1506,7 +1506,7 @@ mod tests {
     fn mistakes_are_refused_with_what_was_meant() {
         assert_eq!(
             error("tset"),
-            "unknown command tset (did you mean test?); the commands are tool, dev, web, run, build, check, assets, codegen, export, test, bench, packets, test-guest, test-blot, gltf, import-scene, bake-lightmaps, diverge, fuzz, report, new, texture, font, patch, apply, loudness, clean, serve, relay, push, remote and check-workers (pen --help)"
+            "unknown command tset (did you mean test?); the commands are tool, dev, web, run, build, check, assets, codegen, export, test, bench, packets, test-guest, test-squid, gltf, import-scene, bake-lightmaps, diverge, fuzz, report, new, texture, font, patch, apply, loudness, clean, serve, relay, push, remote and check-workers (pen --help)"
         );
         assert_eq!(error("run --frame 300"), "pen run has no option --frame (did you mean --frames?) (pen --help)");
         assert_eq!(error("run --port 8000"), "--port is for pen web and pen test, not pen run");
@@ -1566,7 +1566,7 @@ mod tests {
             "PEN_WEB_HOST",
             "PEN_STEAM_APP_ID",
             "PEN_CRASH_TEST",
-            "BLOT_INLINING",
+            "SQUID_INLINING",
             "STEAM_BUILD_USER",
             "PEN_STEAMCMD",
             "PEN_BUTLER",

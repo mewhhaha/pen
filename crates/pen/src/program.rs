@@ -10,15 +10,15 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use blot_host::{Argument, Guest, GuestModule, Overrun, Value};
 use pen_runtime::program::{Response, Unresponsive};
+use squid_host::{Argument, Guest, GuestModule, Overrun, Value};
 use wasmtime::Engine;
 
 pub use pen_runtime::program::Operation;
 
 /// How long the host waits for the guest's reply before it gives the game
 /// up. A guest of the development engine traps at its deadline long before
-/// ([`blot_host::DEADLINE`]); one of another engine, whose code spends
+/// ([`squid_host::DEADLINE`]); one of another engine, whose code spends
 /// nothing checking the time, may loop until this ends the game.
 const REPLY_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -54,7 +54,7 @@ pub struct Program {
     /// What the dev tools see of the guest: its memory, its ownership
     /// counters, and samples of it while profiled.
     #[cfg(feature = "devtools")]
-    probe: Arc<blot_host::Probe>,
+    probe: Arc<squid_host::Probe>,
 }
 
 impl Program {
@@ -70,12 +70,12 @@ impl Program {
         #[cfg(feature = "devtools")]
         let gauge = memory.clone();
         #[cfg(feature = "devtools")]
-        let probe = blot_host::Probe::new_lazy();
+        let probe = squid_host::Probe::new_lazy();
         #[cfg(feature = "devtools")]
         let probing = probe.clone();
         let thread = std::thread::Builder::new()
             .name("pen-guest".into())
-            .stack_size(blot_host::GUEST_STACK_BYTES + (8 << 20))
+            .stack_size(squid_host::GUEST_STACK_BYTES + (8 << 20))
             .spawn(move || {
                 let finished_tx = reply_tx.clone();
                 let result = (|| -> Result<()> {
@@ -93,7 +93,7 @@ impl Program {
                         Ok(Value::ArrayF32(request))
                     });
                     guest.call(module.main_entry(), Argument::Callback(callback))?;
-                    // Torn down as Blot's adapter disposes of an instance.
+                    // Torn down as Squid's adapter disposes of an instance.
                     guest.dispose()
                 })();
                 let _ = finished_tx.send(Reply::Finished(result));
@@ -209,7 +209,7 @@ impl Program {
 
     /// What the dev tools see of the guest.
     #[cfg(feature = "devtools")]
-    pub fn probe(&self) -> &Arc<blot_host::Probe> {
+    pub fn probe(&self) -> &Arc<squid_host::Probe> {
         &self.probe
     }
 

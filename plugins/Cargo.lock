@@ -199,7 +199,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "pen-plugin-blot"
+name = "pen-plugin-squid"
 version = "0.1.0"
 dependencies = [
  "flate2",

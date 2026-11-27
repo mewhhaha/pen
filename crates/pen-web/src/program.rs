@@ -1,6 +1,6 @@
 //! The browser's WebAssembly backend: a guest's long-lived `main(host)`
 //! runs under JSPI (`guest.js`), suspended at each host call until the next
-//! request. Rust checks the module's `blot:abi` manifest before it runs, and
+//! request. Rust checks the module's `squid:abi` manifest before it runs, and
 //! describes a trap's Wasm frames with the module's symbols, as native pen
 //! does.
 use std::rc::Rc;

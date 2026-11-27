@@ -16,18 +16,18 @@ declares under `protocol` and pen carries without a protocol change:
 
 | File | What it is |
 |---|---|
-| `src/main.blot` | The entry: `pen/extensions`' `run` serves the game |
-| `src/game.blot` | The world, its events, physics, frame and Score |
+| `src/main.sq` | The entry: `pen/extensions`' `run` serves the game |
+| `src/game.sq` | The world, its events, physics, frame and Score |
 | `src/assets/` | The catalog, a box and a ball, four materials, their shader and the blip |
-| `tests/bounce.blot` | Its rules, for `pen test-blot` |
+| `tests/bounce.sq` | Its rules, for `pen test-squid` |
 | `tests/visual/` | Golden images, for `pen test` |
 | `make_assets.py` | Writes the meshes and the sound |
 
-From pen's checkout, with blot2 beside it (`../blot2`):
+From pen's checkout, with squid-lang beside it (`../squid-lang`):
 
 ```sh
 cargo run --release -p pen -- run --project examples/bounce
-cargo run --release -p pen -- test-blot --project examples/bounce
+cargo run --release -p pen -- test-squid --project examples/bounce
 cargo run --release -p pen -- test --project examples/bounce examples/bounce/tests/visual/scenarios.json
 cargo run --release -p pen -- packets target/bounce --project examples/bounce --script "wait=5 game=Kick,9,4 wait=60"
 ```

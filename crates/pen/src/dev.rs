@@ -1,6 +1,6 @@
 //! Development reloads: watches the game's compiled program and its asset
 //! directory (through `watch`, the session's one file watcher). A new
-//! `game.wasm` produced after each Blot change compiles on a background
+//! `game.wasm` produced after each Squid change compiles on a background
 //! thread and then replaces the running build with its state carried over;
 //! changed assets reload in the renderer and audio.
 pub mod watch;
@@ -11,10 +11,10 @@ use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use blot_host::GuestModule;
 use notify::EventKind;
 use pen_protocol::Catalog;
 use pen_protocol::boundary::read_catalog;
+use squid_host::GuestModule;
 
 use crate::devlog::{self, Source};
 
@@ -41,7 +41,7 @@ pub struct Dev {
     compiling: Option<Receiver<Result<(GuestModule, Catalog)>>>,
     /// Another change arrived while compiling.
     again: bool,
-    trace: Option<std::sync::Arc<blot_host::SystemTrace>>,
+    trace: Option<std::sync::Arc<squid_host::SystemTrace>>,
 }
 
 /// An asset key for a changed file, or None for files that are not assets.
@@ -59,7 +59,7 @@ fn asset_key(assets: &Path, path: &Path) -> Option<String> {
 }
 
 impl Dev {
-    pub fn new(game: &Path, assets: &Path, trace: Option<std::sync::Arc<blot_host::SystemTrace>>) -> Result<Dev> {
+    pub fn new(game: &Path, assets: &Path, trace: Option<std::sync::Arc<squid_host::SystemTrace>>) -> Result<Dev> {
         let (sender, events) = channel();
         let watch = watch::subscribe(&[(game, false), (assets, true)], move |event| {
             let _ = sender.send(event);

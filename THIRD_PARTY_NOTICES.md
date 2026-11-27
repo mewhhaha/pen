@@ -78,7 +78,7 @@ https://datatracker.ietf.org/ipr/1526/
 
 ---
 
-Blot structured task guest adapter, bundled in structured.js from https://github.com/mewhhaha/blot2
+Squid structured task guest adapter, bundled in structured.js from https://github.com/mewhhaha/squid-lang
 
 MIT License
 

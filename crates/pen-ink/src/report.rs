@@ -1,6 +1,6 @@
 use pen_protocol::boundary::whole;
 
-/// What Ink reports for one saved section (persist.blot Fate): 0 kept as saved, 1 migrated from
+/// What Ink reports for one saved section (persist.sq Fate): 0 kept as saved, 1 migrated from
 /// another version, 2 reset for want of a migration, 3 started afresh because
 /// the state lacked it, 4 dropped because the build no longer saves it; and
 /// the host's own, [`DECLARED`]: migrated by the game's declared saved

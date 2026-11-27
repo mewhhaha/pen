@@ -3,7 +3,7 @@
 pen's protocol (`protocol/schema.json`) is shared by every game. A game that
 needs to tell the host something pen has no section for, or to be told
 something pen has no event for, declares it in its own `pen.json`. pen
-carries it without a change to its protocol, `pen codegen` writes typed Blot
+carries it without a change to its protocol, `pen codegen` writes typed Squid
 for it, and pen's tools name it.
 
 ```json
@@ -29,7 +29,7 @@ for it, and pen's tools name it.
   lowercase. Tags run from 1 to 65535, each once among the events and once
   among the sections.
 - A field is `f32` (any finite number), `integer` (a whole number to
-  16777215, a `U32` in Blot) or `flag` (a `Bool`).
+  16777215, a `U32` in Squid) or `flag` (a `Bool`).
 - An event has at most three fields. A section has at least one; a frame
   sends a list of its records, none or many.
 
@@ -39,7 +39,7 @@ Both travel in generic carriers that are part of pen's protocol:
 
 - An event is pen's `Game` input event (tag 100): its own tag in the code
   lane, its fields in the three lanes after. Hosts send it only to a game
-  that declares it; pen's own Blot bindings leave it out, so a game without
+  that declares it; pen's own Squid bindings leave it out, so a game without
   declarations never sees one.
 - A frame's sections follow the whole render packet, after the draws' extra
   lanes: a marker (0x504558), their count, then each one's tag, length and
@@ -55,9 +55,9 @@ Nothing in pen's types or decoders depends on a game's declarations, so a
 game adds, renames or drops them without pen changing, and gdev and Ink,
 which declare none, build as they did.
 
-## In Blot
+## In Squid
 
-With declarations, `pen codegen` writes `pen/extensions.blot` (and removes it
+With declarations, `pen codegen` writes `pen/extensions.sq` (and removes it
 once there are none):
 
 - `Event`, pen's events (`#Pen protocol.Event`) and the game's (`#Kick { x,
@@ -70,10 +70,10 @@ The game supplies its own `execute` to `pen/program.run`, which owns the game's
 world and hands it to `execute` and back. During a frame it decodes the borrowed
 request, updates its world, fills draw/sound pools and writes the render packet
 before appending extension framing and lanes.
-`examples/bounce/src/game.blot` is a complete implementation. It computes a Score
+`examples/bounce/src/game.sq` is a complete implementation. It computes a Score
 section directly as flat numeric lanes:
 
-```blot
+```squid
 const score = func (world: World) => return do:
   let packet: ResizeArray F32 = #[protocol.extensions_marker, 1.0]
   extensions.append_score #[$extensions.Score {

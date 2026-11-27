@@ -140,8 +140,8 @@ pub fn describe(diagnostic: &Diagnostic, standing_in: Option<(&str, &str)>) -> S
     let doc_text = diagnostic.doc.clone().or_else(|| {
         diagnostic
             .file
-            .ends_with(".blot")
-            .then(|| format!("blot explain {canonical} (skills/blot-diagnostics/SKILL.md#{canonical})"))
+            .ends_with(".sq")
+            .then(|| format!("squid explain {canonical} (skills/squid-diagnostics/SKILL.md#{canonical})"))
     });
     if let Some(doc_text) = doc_text {
         out.push(format!("doc: {doc_text}"));
@@ -406,7 +406,7 @@ fn build_headline_and_fix(
     match canonical {
         "SYNTAX_ERROR" | "UNMATCHED_DELIMITER" => {
             let fix = if trimmed_line.starts_with("fn ") || snippet == "fn" {
-                "Blot uses `func`, not `fn` (e.g. `func add (a: U32) -> (b: U32): U32 => return a + b`).".to_owned()
+                "Squid uses `func`, not `fn` (e.g. `func add (a: U32) -> (b: U32): U32 => return a + b`).".to_owned()
             } else if trimmed_line.starts_with("type ")
                 && trimmed_line.contains('|')
                 && !trimmed_line.contains("is data")
@@ -414,12 +414,12 @@ fn build_headline_and_fix(
                 "Sum types require `is data` and `$`-prefixed constructors: `type Opt is data = $Some U32 | $Nothing`."
                     .to_owned()
             } else if trimmed_line.contains("&&") || trimmed_line.contains("||") {
-                "Blot uses `and`, `or`, and `not` (not `&&`, `||`, `!`) for boolean operators.".to_owned()
+                "Squid uses `and`, `or`, and `not` (not `&&`, `||`, `!`) for boolean operators.".to_owned()
             } else if trimmed_line.starts_with("mut ") || trimmed_line.starts_with("var ") {
-                "Blot declares locals with `let x = ...` and updates with `x := ...` (no `mut`/`var` keyword)."
+                "Squid declares locals with `let x = ...` and updates with `x := ...` (no `mut`/`var` keyword)."
                     .to_owned()
             } else {
-                "Check Blot declaration and indented suite syntax (`blot guide --cheatsheet`).".to_owned()
+                "Check Squid declaration and indented suite syntax (`squid guide --cheatsheet`).".to_owned()
             };
             (diagnostic.message.clone(), "syntax error here".to_owned(), Some(fix))
         }
@@ -427,9 +427,9 @@ fn build_headline_and_fix(
             let is_bare_list =
                 diagnostic.message.contains("`[...]`") || (snippet.starts_with('[') && !snippet.starts_with("#["));
             let fix = if is_bare_list {
-                "Replace bare `[...]` with `#[...]` for Blot array literals (e.g. `#[1, 2, 3]`).".to_owned()
+                "Replace bare `[...]` with `#[...]` for Squid array literals (e.g. `#[1, 2, 3]`).".to_owned()
             } else {
-                "Replace with a supported Blot vNext expression (`blot guide --cheatsheet`).".to_owned()
+                "Replace with a supported Squid vNext expression (`squid guide --cheatsheet`).".to_owned()
             };
             let label = if is_bare_list { "use `#[...]` here" } else { "unsupported expression" };
             (diagnostic.message.clone(), label.to_owned(), Some(fix))
@@ -451,8 +451,8 @@ fn build_headline_and_fix(
                 return (diagnostic.message.clone(), label, Some(fix));
             }
             let fix = match snippet {
-                "None" => "Blot's prelude option uses `$Nothing` and `$Some x` (not `None`/`Some`).",
-                "String" | "str" => "Blot represents strings as byte arrays (`#[U8]` / `Array U8`).",
+                "None" => "Squid's prelude option uses `$Nothing` and `$Some x` (not `None`/`Some`).",
+                "String" | "str" => "Squid represents strings as byte arrays (`#[U8]` / `Array U8`).",
                 _ => "Check spelling, prefix data constructors with `$`, or import the defining module.",
             };
             (diagnostic.message.clone(), "not in scope".to_owned(), Some(fix.to_owned()))
@@ -476,7 +476,7 @@ fn build_headline_and_fix(
                 diagnostic.message.clone()
             };
             let fix = if member == "len" {
-                "Blot arrays use `.length` (not `.len`).".to_owned()
+                "Squid arrays use `.length` (not `.len`).".to_owned()
             } else if let Some(inner) = operand.trim().strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
                 let fields: Vec<String> = inner
                     .split(',')
@@ -589,7 +589,7 @@ fn build_headline_and_fix(
         }
         "TYPE_MISMATCH" => {
             let fix = if diagnostic.message.contains("F32") && diagnostic.message.contains("U32") {
-                "Blot has no implicit numeric conversions; match the literal (`1` vs `1.0`) or convert explicitly with `@u32.to_f32` / `@f32.to_u32`."
+                "Squid has no implicit numeric conversions; match the literal (`1` vs `1.0`) or convert explicitly with `@u32.to_f32` / `@f32.to_u32`."
             } else {
                 "Align the expression type with the declared annotation or expected parameter type."
             };
@@ -700,9 +700,9 @@ mod tests {
         std::fs::create_dir_all(directory.join("src/lib")).unwrap();
         let sources: BTreeSet<PathBuf> = [
             directory.join("src/lib"),
-            directory.join("src/main.blot"),
-            directory.join("src/later.blot"),
-            directory.join("gone/away.blot"),
+            directory.join("src/main.sq"),
+            directory.join("src/later.sq"),
+            directory.join("gone/away.sq"),
         ]
         .into();
         let src = directory.join("src");
@@ -736,7 +736,7 @@ mod tests {
         let use_start = u32::try_from(source.find("a.length").unwrap()).unwrap();
         let use_end = use_start + u32::try_from("a.length".len()).unwrap();
         let diagnostic = Diagnostic {
-            file: "/tmp/spent.blot".to_owned(),
+            file: "/tmp/spent.sq".to_owned(),
             stage: "lower".to_owned(),
             code: "spent_value".to_owned(),
             start: use_start,
@@ -748,17 +748,17 @@ mod tests {
             fix: None,
             doc: None,
         };
-        let rendered = describe(&diagnostic, Some(("/tmp/spent.blot", source)));
-        assert!(rendered.starts_with("/tmp/spent.blot:5:14: [SPENT_VALUE] (spent_value)"), "{rendered}");
-        assert!(rendered.lines().any(|line| line.trim() == "in spent.blot › io main"), "{rendered}");
+        let rendered = describe(&diagnostic, Some(("/tmp/spent.sq", source)));
+        assert!(rendered.starts_with("/tmp/spent.sq:5:14: [SPENT_VALUE] (spent_value)"), "{rendered}");
+        assert!(rendered.lines().any(|line| line.trim() == "in spent.sq › io main"), "{rendered}");
         assert!(rendered.contains("--------- `a` moved here"), "{rendered}");
         assert!(rendered.contains("^^^^^^^^ `a` used after move"), "{rendered}");
         assert!(rendered.contains("fix: Pass `a.copy` at line 4"), "{rendered}");
-        assert!(rendered.contains("doc: blot explain SPENT_VALUE"), "{rendered}");
+        assert!(rendered.contains("doc: squid explain SPENT_VALUE"), "{rendered}");
     }
 
     #[test]
-    fn describes_non_blot_plugin_diagnostic_without_blot_doc_link() {
+    fn describes_non_squid_plugin_diagnostic_without_squid_doc_link() {
         let source = "fn main() {\n    let x: u32 = true;\n}\n";
         let start = u32::try_from(source.find("true").unwrap()).unwrap();
         let end = start + 4;
@@ -776,7 +776,7 @@ mod tests {
         let rendered = describe(&diagnostic, Some(("/tmp/main.rs", source)));
         assert!(rendered.contains("fix: Use an integer literal like `1`"), "{rendered}");
         assert!(rendered.contains("doc: rustc --explain E0308"), "{rendered}");
-        assert!(!rendered.contains("blot explain"), "{rendered}");
+        assert!(!rendered.contains("squid explain"), "{rendered}");
     }
 
     #[test]
@@ -785,7 +785,7 @@ mod tests {
         let start = u32::try_from(virtual_source.find("123").unwrap()).unwrap();
         let end = start + 3;
         let diagnostic = Diagnostic {
-            file: "/nonexistent/proj/assets/salt.wgsl.blot".to_owned(),
+            file: "/nonexistent/proj/assets/salt.wgsl.sq".to_owned(),
             stage: "check".to_owned(),
             code: "type_mismatch".to_owned(),
             start,
@@ -797,9 +797,9 @@ mod tests {
                     "provenance": {
                         "stage": "stage0",
                         "phase": "generated_source",
-                        "module": "/nonexistent/proj/assets/salt.wgsl.blot",
+                        "module": "/nonexistent/proj/assets/salt.wgsl.sq",
                         "input": "/nonexistent/proj/assets/salt.wgsl",
-                        "generator": "/nonexistent/proj/tools/wgsl_gen.blot",
+                        "generator": "/nonexistent/proj/tools/wgsl_gen.sq",
                     }
                 })
                 .to_string(),
@@ -808,9 +808,9 @@ mod tests {
             doc: None,
         };
         let rendered = describe(&diagnostic, None);
-        assert!(rendered.contains("salt.wgsl.blot:2:19: [TYPE_MISMATCH]"), "{rendered}");
-        assert!(rendered.contains("in salt.wgsl.blot › const bad"), "{rendered}");
-        assert!(rendered.contains("from salt.wgsl via wgsl_gen.blot (stage0 generated_source)"), "{rendered}");
+        assert!(rendered.contains("salt.wgsl.sq:2:19: [TYPE_MISMATCH]"), "{rendered}");
+        assert!(rendered.contains("in salt.wgsl.sq › const bad"), "{rendered}");
+        assert!(rendered.contains("from salt.wgsl via wgsl_gen.sq (stage0 generated_source)"), "{rendered}");
         assert!(rendered.contains("2 | const bad: Bool = 123"), "{rendered}");
         assert!(rendered.contains("^^^ type mismatch here"), "{rendered}");
     }

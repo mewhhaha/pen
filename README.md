@@ -23,8 +23,8 @@ cd plugins
 cargo build --locked --release --target wasm32-wasip2
 ```
 
-Build Blot's native development compiler as described in its handoff. Once the
-real Gdev main compiles, run from `../blot2`:
+Build Squid's native development compiler as described in its handoff. Once the
+real Gdev main compiles, run from `../squid-lang`:
 
 ```sh
 python3 scripts/storage_handoff/run_pen.py --launch

@@ -401,7 +401,7 @@ fn fredoka_matches_gdev_and_redraws_its_glyphs() {
         eprintln!("skipped: no font at {FREDOKA}");
         return;
     };
-    // Advances from gdev's src/font.blot, made by models/font/font.py from
+    // Advances from gdev's src/font.sq, made by models/font/font.py from
     // the same font at weight 600.
     let advances = [
         (' ', 0.24097),

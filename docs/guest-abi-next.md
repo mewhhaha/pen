@@ -2,16 +2,16 @@
 
 The current migration uses guest ABI **8**, the owned data-stack path. Read
 [CONTINUE.md](../CONTINUE.md) for integration status and
-[Blot's guest ABI](../../blot2/compiler/guest-abi.md) for the wire contract. The
+[Squid's guest ABI](../../squid-lang/compiler/guest-abi.md) for the wire contract. The
 guest ABI version is distinct from Pen's numeric session protocol **2**.
 
 ## Current boundary
 
-- `crates/pen-runtime/src/abi.rs` reads `blot:abi`. It admits versions 2, 3 and
+- `crates/pen-runtime/src/abi.rs` reads `squid:abi`. It admits versions 2, 3 and
   8; ABI 8 selects data stacks and rejects language-task callback tag 13.
   Retained older admission is implementation awaiting retirement, not a target
   compatibility requirement for this greenfield rewrite.
-- Native `blot-host` and the browser guest adapter must agree on ABI 8, storage
+- Native `squid-host` and the browser guest adapter must agree on ABI 8, storage
   budgets, copied numeric arrays and invocation lifetime. Rebuild the matching
   host/compiler/plugin after boundary changes; stale compiled module caches are
   not evidence for the new ABI.
@@ -33,7 +33,7 @@ checkpoint because mutations may already have happened.
 
 See [the game contract](game-contract.md),
 [packet diagnostics](packet-diagnostics.md) and the
-[active storage tasks](../../blot2/tasks/STORAGE_REWRITE.md).
+[active storage tasks](../../squid-lang/tasks/STORAGE_REWRITE.md).
 
 ## Qualification
 

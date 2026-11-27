@@ -1,0 +1,16 @@
+{
+  "game": { "name": "packaged-workers", "title": "Packaged Workers Fixture" },
+  "plugins": {
+    "squid": {
+      "read": ["../../../../../../squid-lang/std"],
+      "run": { "squidc": "../../../../../../squid-lang/generated/compiler/squidc.gz" }
+    }
+  },
+  "compiler": {
+    "plugin": "squid",
+    "settings": {
+      "std": "../../../../../../squid-lang/std",
+      "nativeAssets": { "roots": ["src"] }
+    }
+  }
+}

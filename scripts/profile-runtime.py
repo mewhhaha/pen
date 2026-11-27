@@ -73,7 +73,7 @@ def main():
                 command.append(str(budget))
             started = time.monotonic()
             with (out / (label + ".stdout")).open("wb") as stdout, (out / (label + ".stderr")).open("wb") as stderr:
-                child = subprocess.Popen(command, env=dict(os.environ, BLOT_INLINING="1"), stdout=stdout, stderr=stderr)
+                child = subprocess.Popen(command, env=dict(os.environ, SQUID_INLINING="1"), stdout=stdout, stderr=stderr)
                 _, status, usage = os.wait4(child.pid, 0)
                 child.returncode = os.waitstatus_to_exitcode(status)
             if child.returncode:

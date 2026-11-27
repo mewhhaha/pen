@@ -1,6 +1,6 @@
 //! Identical deterministic guest bytes run by native and browser sessions.
 use super::*;
-use crate::blot_test::tests::{program, signed_leb};
+use crate::squid_test::tests::{program, signed_leb};
 use pen_protocol::boundary::{EXTENSIONS_MARKER, PACKET_HEADER_FLOATS, PACKET_MAGIC, lanes};
 use pen_runtime::semantic::{self, Observation, Request as SemanticRequest};
 use serde_json::{Value, json};
@@ -48,7 +48,7 @@ fn observation(tick: u32) -> Observation {
             {"id":31,"value":{"kind":"float","value":2.5}}
         ]}],
         "decisions":if tick == 1 || tick == 2 {json!([{"tick":tick.to_string(),"object":identity(0),"system":"routing",
-            "source":{"file":"src/żuraw.blot","start":17,"end":u32::MAX},
+            "source":{"file":"src/żuraw.sq","start":17,"end":u32::MAX},
             "reason":if tick == 1 {"destination full"} else {"destination selected"}}])} else {json!([])},
         "omitted_objects":0,"omitted_decisions":0
     }))
@@ -254,7 +254,7 @@ fn semantic_history_preserves_simulation_and_external_service_replay() {
     let directory = PathBuf::from("/var/tmp").join(format!("pen-semantic-{}", std::process::id()));
     std::fs::create_dir_all(directory.join("assets")).unwrap();
     std::fs::write(directory.join("assets/saved.json"), r#"{"format":"ink-persist-v1"}"#).unwrap();
-    let engine = blot_host::engine().unwrap();
+    let engine = squid_host::engine().unwrap();
     let mut gpu = Gpu::headless((32, 24), &directory.join("assets"), false).unwrap();
     let mut witnesses = Vec::new();
     let mut expected = Vec::new();

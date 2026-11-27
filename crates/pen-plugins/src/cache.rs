@@ -4,10 +4,10 @@
 //! - `components/`: each plugin component compiled for this pen, by the
 //!   SHA-256 of its bytes and of what compiled code must match (wasmtime's
 //!   version and configuration).
-//! - `programs/`: the programs plugins run, unpacked (`blotc.gz`), one
+//! - `programs/`: the programs plugins run, unpacked (`squidc.gz`), one
 //!   directory each.
 //! - `plugins/NAME/`: each plugin's own directory, which the programs it runs
-//!   keep their caches in (blotc's restart cache).
+//!   keep their caches in (squidc's restart cache).
 //!
 //! Using a component or a program marks it used. Once per process, the
 //! first time a checkout's plugins load, components and programs go when
@@ -207,7 +207,7 @@ mod tests {
         // four used last stay.
         for (index, days) in [1, 2, 3, 4, 5, 6, 30].into_iter().enumerate() {
             let program = root.join(format!("programs/{index:016x}"));
-            write(&program.join("blotc"), 8, day(days), now);
+            write(&program.join("squidc"), 8, day(days), now);
             set_changed(&program, day(days), now);
         }
         // A program unpacking now.
@@ -218,11 +218,11 @@ mod tests {
         write(&root.join("components/old.cwasm"), 8, day(30), now);
         write(&root.join("components/new.cwasm.7.tmp"), 8, day(30), now);
         // A plugin's directory: a month-old file, and fresh ones.
-        let plugin = root.join("plugins/blot");
-        write(&plugin.join("v1/old/a.blotcache"), 8, day(30), now);
-        write(&plugin.join("v1/new/b.blotcache"), 16, day(1), now);
-        write(&plugin.join("v1/new/c.blotcache"), 16, day(2), now);
-        write(&plugin.join("v1/new/d.blotcache"), 16, day(3), now);
+        let plugin = root.join("plugins/squid");
+        write(&plugin.join("v1/old/a.sqcache"), 8, day(30), now);
+        write(&plugin.join("v1/new/b.sqcache"), 16, day(1), now);
+        write(&plugin.join("v1/new/c.sqcache"), 16, day(2), now);
+        write(&plugin.join("v1/new/d.sqcache"), 16, day(3), now);
         prune(&root, now);
         let mut programs: Vec<String> = entries(&root.join("programs"))
             .iter()
@@ -235,10 +235,10 @@ mod tests {
         assert!(root.join("components/new.cwasm.7.tmp").is_file());
         assert!(!plugin.join("v1/old").exists(), "an emptied directory goes");
         let left = |name: &str| plugin.join("v1/new").join(name).is_file();
-        assert!(left("b.blotcache") && left("c.blotcache") && left("d.blotcache"));
+        assert!(left("b.sqcache") && left("c.sqcache") && left("d.sqcache"));
         // Over its limit, the oldest go until the rest fit.
         prune_files(&plugin, now, 40);
-        assert!(left("b.blotcache") && left("c.blotcache") && !left("d.blotcache"));
+        assert!(left("b.sqcache") && left("c.sqcache") && !left("d.sqcache"));
         prune_files(&plugin, now, 8);
         assert!(!plugin.join("v1").exists());
         assert!(plugin.is_dir(), "the plugin's own directory stays");

@@ -83,7 +83,7 @@ try {
   if (status || messages.some(m => m.type === 'pageerror' || m.type === 'error')) {
     throw new Error(`browser verification failed: ${JSON.stringify({ status, errors: messages.filter(m => m.type === 'error' || m.type === 'pageerror').slice(0, 4) })}`);
   }
-  console.log(`Browser game, Blot console, diagnostics, resize and a dense display captured in ${shots}`);
+  console.log(`Browser game, Squid console, diagnostics, resize and a dense display captured in ${shots}`);
 } catch (error) {
   const status = await page?.locator('$status').textContent().catch(() => 'unresponsive');
   await writeFile(`${shots}/evidence.json`, JSON.stringify({ status, messages, failure: String(error) }, null, 2));

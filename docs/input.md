@@ -143,7 +143,7 @@ cmp first.trace replay.trace
   event on the exported game (`dist/gdev`) and checks the same input gives
   the same packets, rewinds among them run again exactly, and a recording
   replays them.
-- gdev: `tests/protocol.blot` decodes every new event as the host encodes it.
+- gdev: `tests/protocol.sq` decodes every new event as the host encodes it.
 - The browser: `crates/pen-web/tests/input.mjs` (`just browser-input`) drives
   keys, an input method (CDP's `Input.imeSetComposition` and `insertText`),
   the locked mouse, touches (`Input.dispatchTouchEvent`), a stubbed gamepad

@@ -5,7 +5,7 @@ Snapshot request; gdev answers with about 3 KB of lanes) and the edit history.
 A rewind starts a new program from the nearest earlier moment (instantiate,
 run `main` to its handshake, Restore, a frame to prove it works) and runs the
 recorded frames from there to the one asked for, unseen. pen-runtime's
-`memory_image` and blot-host's `Guest::capture`/`restore` are the other way:
+`memory_image` and squid-host's `Guest::capture`/`restore` are the other way:
 keep the guest's linear memory itself, page by page, and write it back.
 
 ## What is built
@@ -15,12 +15,12 @@ keep the guest's linear memory itself, page by page, and write it back.
   the pages the frame wrote), and restoring by writing back only the pages
   that differ from the memory as it is (zeroing what lies past the image,
   since Wasm memory does not shrink). Platform independent, for both hosts.
-- `blot_host::Guest::capture`/`restore`: an instance's image between calls,
+- `squid_host::Guest::capture`/`restore`: an instance's image between calls,
   its memory and its mutable globals, put back exactly. A module that keeps a
   mutable global it does not export is refused (`1 of its 2 mutable globals
   are not exported, out of the host's reach`): that state would not come
   back. Tested with hand-built modules (`images_put_idle_guests_back`).
-- `cargo run --release -p blot-host --example memory_images
+- `cargo run --release -p squid-host --example memory_images
   dist/gdev/game.wasm`: plays gdev's frames on the inlining engine, imaging
   its memory at every frame boundary from inside its host call, beside the
   snapshots the timeline asks for, and times both ways of coming back.

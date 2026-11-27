@@ -27,7 +27,7 @@ pub struct Results {
     /// pen's version, and the build label it was built with (`PEN_BUILD`).
     pub pen: String,
     pub build: Option<String>,
-    /// The game runtime's compatibility mark (wasmtime and blot-host).
+    /// The game runtime's compatibility mark (wasmtime and squid-host).
     pub runtime: String,
     /// FNV-1a of the game.wasm benched, so results of different games are
     /// not mistaken for a regression.

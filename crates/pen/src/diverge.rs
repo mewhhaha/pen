@@ -114,7 +114,7 @@ pub fn run(path: &Path, this: &Bundle, reference: &Bundle) -> Result<()> {
         this.directory.display(),
         reference.directory.display()
     );
-    let engine = blot_host::engine()?;
+    let engine = squid_host::engine()?;
     let mut theirs = Replay::start(
         &engine,
         reference,
@@ -349,7 +349,7 @@ mod tests {
     #[test]
     fn a_build_agrees_with_itself() {
         let Some(directory) = crate::fixtures::bundle() else { return };
-        let engine = blot_host::engine().unwrap();
+        let engine = squid_host::engine().unwrap();
         let module = crate::load_module(&engine, &directory, true, false).unwrap();
         let viewport = Viewport { width: 960, height: 640 };
         let mut host = Null(viewport, crate::session::load_state_adapter(&directory.join("assets")));

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 publish = false
-description = "Gather, a tiny pen game written in Rust: pen's guest boundary is not Blot's alone"
+description = "Gather, a tiny pen game written in Rust: pen's guest boundary is not Squid's alone"
 
 # A workspace of its own: pen's does not build it (it is a game, built for
 # wasm32-unknown-unknown, with a tool that bundles it, and a mod).

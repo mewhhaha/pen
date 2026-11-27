@@ -44,7 +44,7 @@ impl Identity {
     }
 
     /// The `game` block of a checkout's `pen.json`, `{"name": "gdev",
-    /// "title": "gdev — Blot 3D", "players": 2}`, any of which may be left
+    /// "title": "gdev — Squid 3D", "players": 2}`, any of which may be left
     /// out: the name is then the checkout directory's, the title the name,
     /// and the players one.
     #[cfg(feature = "compiler")]
@@ -279,7 +279,7 @@ fn checkout_compiler_entries(root: &Path) -> Result<(PathBuf, Option<PathBuf>)> 
     let config: serde_json::Value = serde_json::from_str(&text).with_context(reading)?;
     let compiler = config.get("compiler");
     let entry = match compiler.and_then(|c| c.get("entry")) {
-        None | Some(serde_json::Value::Null) => PathBuf::from("src/main.blot"),
+        None | Some(serde_json::Value::Null) => PathBuf::from("src/main.sq"),
         Some(serde_json::Value::String(path)) if !path.trim().is_empty() => PathBuf::from(path),
         Some(_) => bail!("{}: compiler.entry must be a non-empty path string", file.display()),
     };
@@ -303,7 +303,7 @@ fn has_game_entry(directory: &Path) -> bool {
     {
         return directory.join(entry).exists();
     }
-    directory.join("src/main.blot").is_file()
+    directory.join("src/main.sq").is_file()
 }
 
 #[cfg(feature = "compiler")]
@@ -311,7 +311,7 @@ pub struct Project {
     pub root: PathBuf,
     pub identity: Identity,
     pub web: WebConfig,
-    /// Relative path to the game entry (from `pen.json` `compiler.entry`, else `src/main.blot`).
+    /// Relative path to the game entry (from `pen.json` `compiler.entry`, else `src/main.sq`).
     pub entry: PathBuf,
     /// Optional relative path to the dev tools entry (from `pen.json` `compiler.devtools`).
     pub devtools_entry: Option<PathBuf>,
@@ -357,7 +357,7 @@ impl Project {
             None => bail!(
                 "{} is not inside a checkout (a directory with {}); pass --project DIR",
                 start.display(),
-                if require_game { "pen.json and its configured compiler.entry (or src/main.blot)" } else { "pen.json" }
+                if require_game { "pen.json and its configured compiler.entry (or src/main.sq)" } else { "pen.json" }
             ),
         }
     }
@@ -395,13 +395,13 @@ impl Project {
     }
 
     /// The dev tools' program (`compiler.devtools` in `pen.json`, else
-    /// `devtools/main.blot` or `src/devtools/main.blot`), relative to the
+    /// `devtools/main.sq` or `src/devtools/main.sq`), relative to the
     /// checkout, if it has one.
     pub fn devtools(&self) -> Option<PathBuf> {
         if let Some(entry) = &self.devtools_entry {
             return self.root.join(entry).exists().then(|| entry.clone());
         }
-        ["devtools/main.blot", "src/devtools/main.blot"]
+        ["devtools/main.sq", "src/devtools/main.sq"]
             .into_iter()
             .find(|entry| self.root.join(entry).is_file())
             .map(PathBuf::from)
@@ -771,7 +771,7 @@ pub struct PackageOptions {
     /// does not say. cargo-zigbuild's glibc suffix (`.2.28`) may be left on.
     pub target: Option<String>,
     /// The CPU game.cwasm is compiled for: a Cranelift preset, or `native`
-    /// (see blot_host::portable_engine; x86-64-v2 by default).
+    /// (see squid_host::portable_engine; x86-64-v2 by default).
     pub cpu: Option<String>,
     /// A macOS application bundle's identifier (`app_bundle`).
     pub bundle_id: Option<String>,
@@ -967,7 +967,7 @@ pub(crate) fn size_of(path: &Path) -> u64 {
 /// Identity of the original Wasm, including native packages which omit it.
 pub(crate) fn game_fingerprint(directory: &Path) -> Result<u64> {
     if directory.join("game.meta").is_file() {
-        blot_host::native_fingerprint(&std::fs::read(directory.join("game.meta"))?)
+        squid_host::native_fingerprint(&std::fs::read(directory.join("game.meta"))?)
     } else {
         #[cfg(feature = "compiler")]
         return Ok(pen_runtime::net::wire::hash_bytes(&std::fs::read(directory.join("game.wasm"))?));
@@ -1004,7 +1004,7 @@ fn package_into(source: GameSource, out: &Path, destination: &Path, options: Pac
             .to_owned(),
     };
     let steam = steam_library(&runtime, &runtime_bytes, &target)?;
-    let engine = blot_host::portable_engine(Some(&target), options.cpu.as_deref())?;
+    let engine = squid_host::portable_engine(Some(&target), options.cpu.as_deref())?;
 
     let identity = source.identity()?;
     let name = identity.name.clone();
@@ -1029,17 +1029,17 @@ fn package_into(source: GameSource, out: &Path, destination: &Path, options: Pac
             }
         }
     }
-    let precompiled = blot_host::precompile(&engine, &wasm)?;
+    let precompiled = squid_host::precompile(&engine, &wasm)?;
     std::fs::write(game.join("game.cwasm"), crate::compiled::encode(&precompiled)?)?;
-    let meta = blot_host::native_metadata(&wasm)?;
+    let meta = squid_host::native_metadata(&wasm)?;
     std::fs::write(game.join("game.meta"), &meta)?;
     if options.worker_deadlines {
-        let worker_engine = blot_host::bounded_portable_engine(
+        let worker_engine = squid_host::bounded_portable_engine(
             Some(&target),
             options.cpu.as_deref(),
             std::time::Duration::from_millis(2),
         )?;
-        let worker_precompiled = blot_host::precompile(&worker_engine, &wasm)?;
+        let worker_precompiled = squid_host::precompile(&worker_engine, &wasm)?;
         std::fs::write(game.join("workers.cwasm"), crate::compiled::encode(&worker_precompiled)?)?;
         std::fs::write(game.join("workers.meta"), &meta)?;
     }
@@ -1060,7 +1060,7 @@ fn package_into(source: GameSource, out: &Path, destination: &Path, options: Pac
     let version = crate::patch::record(out, &name, &store)?;
     let megabytes = |path: &Path| size_of(path) as f64 / 1e6;
     let x86_64 = target.starts_with("x86_64");
-    let cpu = options.cpu.as_deref().unwrap_or(if x86_64 { blot_host::PORTABLE_X86_64 } else { "baseline" });
+    let cpu = options.cpu.as_deref().unwrap_or(if x86_64 { squid_host::PORTABLE_X86_64 } else { "baseline" });
     eprintln!(
         "packaged {} for {target} ({} CPU): runtime {:.1} MB{}, game.cwasm {:.1} MB, {assets}; {:.1} MB in all",
         destination.display(),
@@ -1078,9 +1078,9 @@ fn package_into(source: GameSource, out: &Path, destination: &Path, options: Pac
 #[cfg(feature = "compiler")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WebHostPlan {
-    /// Whether the game uses retired `blot:tasks` structured concurrency (`structured.js`).
+    /// Whether the game uses retired `squid:tasks` structured concurrency (`structured.js`).
     pub structured_js: bool,
-    /// Whether the game declares any compute kernels in `blot:abi` (`kernels.js` + `kernel_worker.js`).
+    /// Whether the game declares any compute kernels in `squid:abi` (`kernels.js` + `kernel_worker.js`).
     pub kernels_js: bool,
     /// Exact Cargo features to pass to `build.sh --features` when tailoring a static host.
     pub features: Vec<&'static str>,
@@ -1798,13 +1798,13 @@ mod tests {
         assert!(Project::find(Some(root.clone())).is_err());
         // Game commands and session scenarios still need an actual game.
         std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(root.join("src/main.blot"), "").unwrap();
+        std::fs::write(root.join("src/main.sq"), "").unwrap();
         assert_eq!(Project::find(Some(root.clone())).unwrap().root, found.root);
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn custom_compiler_entry_and_devtools_work_without_blot_files() {
+    fn custom_compiler_entry_and_devtools_work_without_squid_files() {
         let root = fixture("custom-entry");
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::create_dir_all(root.join("devtools")).unwrap();
@@ -1827,13 +1827,13 @@ mod tests {
     fn identities_come_from_pen_json_or_the_checkout() {
         let root = fixture("identity").join("salt game");
         std::fs::create_dir_all(root.join("src")).unwrap();
-        std::fs::write(root.join("src/main.blot"), "").unwrap();
+        std::fs::write(root.join("src/main.sq"), "").unwrap();
         std::fs::write(root.join("pen.json"), "{}").unwrap();
         let project = Project::find(Some(root.join("src"))).unwrap();
         assert_eq!(project.identity, Identity::named("salt game"));
-        std::fs::write(root.join("pen.json"), r#"{"game": {"name": "gdev", "title": "gdev — Blot 3D"}}"#).unwrap();
+        std::fs::write(root.join("pen.json"), r#"{"game": {"name": "gdev", "title": "gdev — Squid 3D"}}"#).unwrap();
         let identity = Identity::of_checkout(&root).unwrap();
-        assert_eq!((identity.name.as_str(), identity.title.as_str()), ("gdev", "gdev — Blot 3D"));
+        assert_eq!((identity.name.as_str(), identity.title.as_str()), ("gdev", "gdev — Squid 3D"));
         std::fs::write(root.join("pen.json"), r#"{"game": {"title": "Salt"}}"#).unwrap();
         let salt = Identity { name: "salt game".into(), title: "Salt".into(), players: 1 };
         assert_eq!(Identity::of_checkout(&root).unwrap(), salt);
@@ -1896,7 +1896,7 @@ mod tests {
         std::fs::write(bundle.join("assets/quad.mesh.json"), mesh).unwrap();
         std::fs::write(bundle.join("assets/fill.material.json"), r#"{"shader": "fill.wgsl"}"#).unwrap();
         std::fs::write(bundle.join("assets/fill.wgsl"), "").unwrap();
-        let wasm = [&b"\0asm\x01\0\0\0\0\x0c\x08blot:abi"[..], &[2, 0, 0]].concat();
+        let wasm = [&b"\0asm\x01\0\0\0\0\x0d\x09squid:abi"[..], &[2, 0, 0]].concat();
         std::fs::write(bundle.join("game.wasm"), &wasm).unwrap();
         Manifest { game: Identity::named("gather"), runtime: None, worker_deadlines: false, web: None }
             .write(&bundle)
@@ -1920,12 +1920,12 @@ mod tests {
         package(GameSource::Bundle(&bundle), &out, options).unwrap();
         assert_eq!(std::fs::read(out.join("gather")).unwrap(), runtime, "the runtime, named after the game");
         assert!(!out.join("game/game.wasm").exists());
-        assert_eq!(std::fs::read(out.join("game/game.meta")).unwrap(), blot_host::native_metadata(&wasm).unwrap());
+        assert_eq!(std::fs::read(out.join("game/game.meta")).unwrap(), squid_host::native_metadata(&wasm).unwrap());
         assert!(out.join("game/game.cwasm").is_file() && !out.join("game/main.scene").exists());
         let manifest = Manifest::read(&out.join("game")).unwrap().unwrap();
         assert_eq!((manifest.game.name.as_str(), manifest.runtime.as_deref()), ("gather", Some(RUNTIME)));
         // Exercise the player's decompression and Wasmtime loading path.
-        crate::load_module(&blot_host::engine().unwrap(), &out.join("game"), false, false).unwrap();
+        crate::load_module(&squid_host::engine().unwrap(), &out.join("game"), false, false).unwrap();
         assert!(std::fs::read(out.join("game/assets/quad.mesh.json")).unwrap().starts_with(b"PMSH"));
         assert!(out.join("game/assets/fill.wgsl").is_file());
         std::fs::remove_dir_all(root).unwrap();

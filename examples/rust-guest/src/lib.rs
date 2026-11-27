@@ -16,7 +16,7 @@ use pen_protocol::boundary::{
 #[cfg(target_arch = "wasm32")]
 mod guest;
 
-/// What a program says first (ink's `program.blot`): this magic number, its
+/// What a program says first (ink's `program.sq`): this magic number, its
 /// protocol version, its state schema and whether it keeps scenes.
 pub const HANDSHAKE_MAGIC: f32 = 4670544.0;
 pub const PROGRAM_VERSION: f32 = 2.0;

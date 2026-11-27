@@ -298,7 +298,7 @@ impl ChildProcess {
     }
 
     /// Once it has exited, its standard error is read to the end: the last
-    /// line a failing program writes (blotc's `blotc: <ErrorName>`) is
+    /// line a failing program writes (squidc's `squidc: <ErrorName>`) is
     /// what says why.
     fn finish_errors(&mut self) {
         if matches!(self.child.try_wait(), Ok(Some(_)))
@@ -319,7 +319,7 @@ impl Drop for ChildProcess {
     }
 }
 
-/// A gzipped program (`blotc.gz`) unpacked once into pen's cache, by its
+/// A gzipped program (`squidc.gz`) unpacked once into pen's cache, by its
 /// digest, and made executable; any other program as it is.
 fn runnable(program: &Path) -> Result<PathBuf> {
     if program.extension().is_none_or(|extension| extension != "gz") {

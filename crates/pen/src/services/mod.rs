@@ -1,5 +1,5 @@
 //! Services: what the platform and native libraries do for the game, through
-//! one deterministic boundary (gdev's `packages/services.blot`). The game asks
+//! one deterministic boundary (gdev's `packages/services.sq`). The game asks
 //! in its render packet's `services` section; a [`Service`] answers each
 //! request once, and the answer reaches the game as input, a ServiceAnswer
 //! event and then ServiceData events carrying its values three at a time, in
@@ -19,7 +19,7 @@
 //! numbers and values) and register it ([`Services::register`]); give it a
 //! code in `protocol/schema.json` (`Service`, and its operations'
 //! enumeration), regenerate (`just sync-protocol`), and add the request to
-//! `packages/services.blot`. `pen_simulation::Noise` is one example.
+//! `packages/services.sq`. `pen_simulation::Noise` is one example.
 //!
 //! A service answers at once, or later: [`Service::call`] returns None and
 //! [`Service::poll`] hands the answer over when it is ready (a dialog
@@ -183,10 +183,10 @@ mod replay {
     }
 
     fn start(directory: &Path) -> GameRuntime {
-        let engine = blot_host::engine().unwrap();
+        let engine = squid_host::engine().unwrap();
         let wasm = std::fs::read(directory.join("game.wasm")).unwrap();
         let cache = std::env::temp_dir().join("pen-test-wasm");
-        let module = blot_host::GuestModule::new(&engine, &wasm, Some(&cache)).unwrap();
+        let module = squid_host::GuestModule::new(&engine, &wasm, Some(&cache)).unwrap();
         let catalog = read_catalog(&directory.join("assets")).unwrap();
         let scene = snapshot::read(&directory.join("main.scene")).ok();
         let mut runtime = GameRuntime::new(&engine, module, catalog, &mut Null, None, scene).unwrap();

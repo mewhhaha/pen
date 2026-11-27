@@ -25,10 +25,10 @@ pen packets out --game dist/gdev --mod mods/x --script "wait=60 quit"
 
   `name` is up to 64 letters, digits, spaces, `-` and `_`. `capabilities` are
   what it may do; an unknown one refuses the mod.
-- `mod.wasm`, a module of Blot's guest ABI (2 or 3; blot2's
+- `mod.wasm`, a module of Squid's guest ABI (2 or 3; squid-lang's
   `compiler/guest-abi.md`) that exports `frame: Array F32 -> Array F32` (its
-  manifest: `02 01 05 frame 06 06 00`) with the array arena (`blot:memory`,
-  `blot:allocate`, `blot:reset`), and imports nothing.
+  manifest: `02 01 05 frame 06 06 00`) with the array arena (`squid:memory`,
+  `squid:allocate`, `squid:reset`), and imports nothing.
 
 ## Capabilities
 
@@ -62,7 +62,7 @@ pen-protocol's `key_code`). It answers
 - **Nothing to call.** The module may import nothing: the guest ABI admits
   only the host callbacks its manifest declares, and a mod's `frame` takes
   none.
-- **Memory**: 64 MiB at most (blot-host's `Guest::sandboxed`): growing past
+- **Memory**: 64 MiB at most (squid-host's `Guest::sandboxed`): growing past
   it fails, as `memory.grow` does at its limit.
 - **Time**: 100 ms a call, on the development engine whose code checks a
   deadline.
@@ -82,7 +82,7 @@ pen-protocol's `key_code`). It answers
 `examples/rust-guest/sticky/` is a mod in Rust: an arrow key, once tapped,
 stays held until it is tapped again or another arrow is (`just rust-guest`
 builds it into `dist/mods/sticky-arrows`). Rust exports `frame` directly; its
-`build.rs` names the memory `blot:memory` and a `link_section` static carries
+`build.rs` names the memory `squid:memory` and a `link_section` static carries
 the manifest. With it, a tap moves Gather's player across the field, and a
 recording made with the mod replays exactly without it (the traces' input and
 packet hashes agree frame for frame).
@@ -91,5 +91,5 @@ packet hashes agree frame for frame).
 `observe`, which events it may add and the splicing; pen's
 `mods_add_what_they_may_and_stop_otherwise` runs hand-built mods (one adding
 a key, one adding input without the capability, one looping past its
-deadline); blot-host's `sandboxes_keep_guests_to_their_memory` checks the
+deadline); squid-host's `sandboxes_keep_guests_to_their_memory` checks the
 memory limit.

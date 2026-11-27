@@ -113,11 +113,11 @@ interface process {
     cache-directory: func() -> string;
 }
 
-/// Running a pure, zero-import Blot ABI 8 Wasm module built by the plugin
+/// Running a pure, zero-import Squid ABI 8 Wasm module built by the plugin
 /// (such as a Stage-0 generator), in a fresh sandboxed instance with bounded
 /// memory and the call's deadline.
 interface guest {
-    /// Decoded `blot:traps` v1 provenance attached to a runtime trap, when present.
+    /// Decoded `squid:traps` v1 provenance attached to a runtime trap, when present.
     record trap-info {
         kind: string,
         message: string,
@@ -130,7 +130,7 @@ interface guest {
     variant call-error {
         /// Invalid Wasm, unsupported ABI, unexpected host imports, or signature mismatch.
         invalid(string),
-        /// Guest trapped at runtime (diagnostic text and optional decoded `blot:traps` v1).
+        /// Guest trapped at runtime (diagnostic text and optional decoded `squid:traps` v1).
         trapped(tuple<string, option<trap-info>>),
         /// Exceeded the plugin call's deadline.
         timeout,
@@ -202,7 +202,7 @@ interface tests {
         /// standing in at `entry`, say.
         overlays: list<overlay>,
         /// Its tests: the exports whose names start with this that take
-        /// Unit and return an Array F32 (the Blot guest ABI's types).
+        /// Unit and return an Array F32 (the Squid guest ABI's types).
         prefix: string,
         expect: expectation,
     }

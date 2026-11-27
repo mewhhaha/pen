@@ -1,0 +1,17 @@
+// Citadel Striker — Playable 3D Third-Person Action-Adventure Vertical Slice.
+// Declares Squid multi-core `#kernel` crowd steering & terrain offload
+// backed by `ink/kernel_kits` and runs the game over Pen's Session 2 loop.
+import * as kernel_kits from "ink/kernel_kits"
+import { run } from "./game"
+
+#kernel const steer_crowd: Kernel [#[F32], #[4; F32], #[4; F32]] = {
+  prepare: kernel_kits.crowd_prepare,
+  run: kernel_kits.crowd_steer_agent,
+}
+
+#kernel const bake_terrain: Kernel [#[F32], #[2; F32], #[4; F32]] = {
+  prepare: kernel_kits.terrain_prepare,
+  run: kernel_kits.terrain_eval_cell,
+}
+
+io const main = func host => run steer_crowd host

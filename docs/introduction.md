@@ -10,7 +10,7 @@ recording and replay, time travel, hot reload with the game's state kept,
 golden-image tests, accessibility, Steam, and packages for Linux, Windows
 and the web.
 
-gdev, a 3D game written in Blot, is the game pen was built for, and the
+gdev, a 3D game written in Squid, is the game pen was built for, and the
 largest one it runs. pen assumes nothing of it: a new game starts with
 `pen new`, builds on the bindings pen generates, and can add events and
 render sections of its own without changing pen.

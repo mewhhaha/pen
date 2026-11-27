@@ -12,7 +12,7 @@
 //! pen's protocol carries them generically: an event as the `Game` input
 //! event (its tag and up to three values), a section after the render
 //! packet, in its extensions block (its tag and its lanes). `pen codegen`
-//! writes the game's typed bindings for them into `pen/extensions.blot`,
+//! writes the game's typed bindings for them into `pen/extensions.sq`,
 //! and pen's tools (script steps, `pen packets`) name them by these
 //! declarations.
 use std::path::Path;
@@ -35,7 +35,7 @@ pub enum FieldKind {
     F32,
     /// A whole number from 0 to [`MAX_INTEGER`].
     Integer,
-    /// 0 or 1, a Bool in Blot.
+    /// 0 or 1, a Bool in Squid.
     Flag,
 }
 
@@ -49,7 +49,7 @@ impl FieldKind {
         })
     }
 
-    fn blot_type(self) -> &'static str {
+    fn squid_type(self) -> &'static str {
         match self {
             FieldKind::F32 => "F32",
             FieldKind::Integer => "U32",
@@ -130,22 +130,22 @@ pub struct Declarations {
     pub sections: Vec<Declared>,
 }
 
-/// Names the bindings or Blot's prelude have already: the constructor of
-/// pen's events, the bindings' own types and Blot's.
+/// Names the bindings or Squid's prelude have already: the constructor of
+/// pen's events, the bindings' own types and Squid's.
 const TAKEN: [&str; 11] = ["Pen", "Event", "Input", "Array", "List", "Maybe", "Result", "Bool", "U32", "F32", "Unit"];
 
-/// A Blot type name: a capital, then letters and digits.
+/// A Squid type name: a capital, then letters and digits.
 fn type_name(name: &str) -> bool {
     let mut chars = name.chars();
     chars.next().is_some_and(|c| c.is_ascii_uppercase()) && chars.all(|c| c.is_ascii_alphanumeric())
 }
 
-/// Blot's words, which name no field (blot2's grammar.baba), and `self`.
+/// Squid's words, which name no field (squid-lang's grammar.baba), and `self`.
 const KEYWORDS: &str = "and as borrow break case cleanup code complete concurrent const copy data descriptor do effect else \
                         entry ever exists false fn for forall fork freeze from func if import in infix infixl infixr is let many not of once \
                         or own pack panic region return row seal self shared then true type unique unpack use where with";
 
-/// A Blot value name: lowercase letters, digits and underscores, and not
+/// A Squid value name: lowercase letters, digits and underscores, and not
 /// one of its words.
 fn value_name(name: &str) -> bool {
     let mut chars = name.chars();
@@ -163,7 +163,7 @@ fn declared(what: &str, value: &Value, most: Option<usize>) -> Result<Vec<Declar
     for (name, entry) in entries {
         let place = format!("protocol.{what}.{name}");
         ensure!(type_name(name), "{place}: a name is a capital, then letters and digits");
-        ensure!(!TAKEN.contains(&name.as_str()), "{place}: {name} is taken by the bindings or Blot");
+        ensure!(!TAKEN.contains(&name.as_str()), "{place}: {name} is taken by the bindings or Squid");
         let tag = entry["tag"].as_u64().filter(|tag| (1..=u64::from(MAX_TAG)).contains(tag));
         let tag = u32::try_from(tag.with_context(|| format!("{place}: tag is a whole number from 1 to {MAX_TAG}"))?)?;
         ensure!(all.iter().all(|other| other.tag != tag), "{place}: tag {tag} is taken");
@@ -177,7 +177,7 @@ fn declared(what: &str, value: &Value, most: Option<usize>) -> Result<Vec<Declar
             for (field, kind) in object {
                 ensure!(
                     value_name(field),
-                    "{place}.{field}: a field's name is lowercase, digits and _, and no Blot word"
+                    "{place}.{field}: a field's name is lowercase, digits and _, and no Squid word"
                 );
                 let kind = kind.as_str().and_then(FieldKind::parse);
                 fields.push((field.clone(), kind.with_context(|| format!("{place}.{field} is f32, integer or flag"))?));
@@ -261,7 +261,7 @@ fn comment(text: &str) -> Vec<String> {
     crate::model::wrap(text, 78).iter().map(|line| format!("// {line}")).collect()
 }
 
-/// `pen/extensions.blot` for `declarations`, under `header`'s lines.
+/// `pen/extensions.sq` for `declarations`, under `header`'s lines.
 pub fn emit(declarations: &Declarations, header: &[String]) -> String {
     let snake = |name: &str| crate::model::snake(name);
     let mut out = header.to_vec();
@@ -291,7 +291,7 @@ pub fn emit(declarations: &Declarations, header: &[String]) -> String {
             let fields = event
                 .fields
                 .iter()
-                .map(|(name, kind)| format!("{name}: {}", kind.blot_type()))
+                .map(|(name, kind)| format!("{name}: {}", kind.squid_type()))
                 .collect::<Vec<_>>()
                 .join(", ");
             out.push(format!("  | ${} {{ {fields} }}", event.name));
@@ -358,7 +358,7 @@ pub fn emit(declarations: &Declarations, header: &[String]) -> String {
         let fields = section
             .fields
             .iter()
-            .map(|(name, kind)| format!("{name}: {}", kind.blot_type()))
+            .map(|(name, kind)| format!("{name}: {}", kind.squid_type()))
             .collect::<Vec<_>>()
             .join(", ");
         out.push(format!("type {} is data = ${} {{ {fields} }}", section.name, section.name));
@@ -443,7 +443,7 @@ mod tests {
             (serde_json::json!({ "events": { "A": { "tag": 1, "fields": { "Big": "f32" } } } }), "lowercase"),
             (serde_json::json!({ "sections": { "A": { "tag": 1 } } }), "a section has fields"),
             (serde_json::json!({ "events": { "Pen": { "tag": 1 } } }), "Pen is taken"),
-            (serde_json::json!({ "events": { "A": { "tag": 1, "fields": { "type": "f32" } } } }), "no Blot word"),
+            (serde_json::json!({ "events": { "A": { "tag": 1, "fields": { "type": "f32" } } } }), "no Squid word"),
             (serde_json::json!({ "sections": { "Input": { "tag": 1, "fields": { "a": "f32" } } } }), "Input is taken"),
             (
                 serde_json::json!({ "sections": { "A": { "tag": 1, "fields": { "a": "f32" }, "size": 2 } } }),

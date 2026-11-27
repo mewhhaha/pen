@@ -8,9 +8,9 @@
 //! ```json
 //! {
 //!   "plugins": {
-//!     "blot": { "read": ["../blot2/std"], "run": { "blotc": "../blot2/generated/compiler/blotc.gz" } }
+//!     "squid": { "read": ["../squid-lang/std"], "run": { "squidc": "../squid-lang/generated/compiler/squidc.gz" } }
 //!   },
-//!   "compiler": { "plugin": "blot", "settings": { "imports": { "gdev/": "packages/" } } }
+//!   "compiler": { "plugin": "squid", "settings": { "imports": { "gdev/": "packages/" } } }
 //! }
 //! ```
 //!
@@ -104,7 +104,7 @@ pub struct Config {
     pub steam: Option<serde_json::Value>,
     pub itch: Option<serde_json::Value>,
     pub reports: Option<serde_json::Value>,
-    /// Native reference suites, run by `pen test-guest` / `pen test-blot`.
+    /// Native reference suites, run by `pen test-guest` / `pen test-squid`.
     pub tests: Option<NativeTests>,
     /// Checkout-owned Rust tools, invoked with `pen tool NAME -- ARGS`.
     #[serde(default)]
@@ -143,7 +143,7 @@ pub struct PluginConfig {
 #[serde(deny_unknown_fields)]
 pub struct Choice {
     pub plugin: String,
-    /// Optional entry path relative to the checkout root (defaults to `src/main.blot`).
+    /// Optional entry path relative to the checkout root (defaults to `src/main.sq`).
     #[serde(default)]
     pub entry: Option<String>,
     /// Optional dev tools entry path relative to the checkout root.
@@ -255,9 +255,9 @@ impl Plugins {
         self.config.compiler.is_some()
     }
 
-    /// Configured main program entry relative to the checkout root, defaulting to `src/main.blot`.
+    /// Configured main program entry relative to the checkout root, defaulting to `src/main.sq`.
     pub fn entry(&self) -> &str {
-        self.config.compiler.as_ref().and_then(|choice| choice.entry.as_deref()).unwrap_or("src/main.blot")
+        self.config.compiler.as_ref().and_then(|choice| choice.entry.as_deref()).unwrap_or("src/main.sq")
     }
 
     /// Configured dev tools entry relative to the checkout root, if declared.

@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use blot_host::{Guest, GuestModule, Limits, Value};
 use pen_runtime::mods::{MOD_ENTRY, ModManifest, check_mod, granted, request, splice};
+use squid_host::{Guest, GuestModule, Limits, Value};
 
 use crate::devlog::{self, Source};
 
@@ -34,7 +34,7 @@ pub struct Mods {
 impl Mods {
     /// The mods in `directories`, each a `mod.json` and `mod.wasm`.
     pub fn load(directories: &[PathBuf]) -> Result<Mods> {
-        let engine = blot_host::dev_engine().context("mods are compiled, and this pen has no compiler")?;
+        let engine = squid_host::dev_engine().context("mods are compiled, and this pen has no compiler")?;
         let mut mods = Vec::new();
         for directory in directories {
             let loaded = load(&engine, directory).with_context(|| format!("the mod in {}", directory.display()))?;
@@ -129,11 +129,11 @@ mod tests {
             &[0x04][..],
             &name("frame"),
             &[0x00, 0x00],
-            &name("blot:memory"),
+            &name("squid:memory"),
             &[0x02, 0x00],
-            &name("blot:allocate"),
+            &name("squid:allocate"),
             &[0x00, 0x01],
-            &name("blot:reset"),
+            &name("squid:reset"),
             &[0x00, 0x02],
         ]
         .concat();

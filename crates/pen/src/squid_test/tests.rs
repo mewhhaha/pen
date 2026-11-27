@@ -1,0 +1,1021 @@
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "hand-built Wasm's small sizes and LEB128 bytes"
+)]
+use super::*;
+
+fn leb(mut value: u32) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    loop {
+        let byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value == 0 {
+            bytes.push(byte);
+            return bytes;
+        }
+        bytes.push(byte | 0x80);
+    }
+}
+
+pub(crate) fn signed_leb(mut value: i32) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    loop {
+        let byte = (value & 0x7f) as u8;
+        value >>= 7;
+        let done = (value == 0 && byte & 0x40 == 0) || (value == -1 && byte & 0x40 != 0);
+        bytes.push(if done { byte } else { byte | 0x80 });
+        if done {
+            return bytes;
+        }
+    }
+}
+
+fn vector(items: Vec<Vec<u8>>) -> Vec<u8> {
+    let mut bytes = leb(items.len() as u32);
+    items.into_iter().for_each(|item| bytes.extend(item));
+    bytes
+}
+
+fn name(text: &str) -> Vec<u8> {
+    let mut bytes = leb(text.len() as u32);
+    bytes.extend(text.as_bytes());
+    bytes
+}
+
+fn section(id: u8, payload: Vec<u8>) -> Vec<u8> {
+    let mut bytes = vec![id];
+    bytes.extend(leb(payload.len() as u32));
+    bytes.extend(payload);
+    bytes
+}
+
+/// `i32.const at`, as a function body or an offset.
+fn constant(at: i32) -> Vec<u8> {
+    [vec![0x41], signed_leb(at), vec![0x0b]].concat()
+}
+
+/// A Squid guest as the compiler lays one out, with these entries
+/// (`test_…` among them) and a `main(host)` that imports its adapter:
+/// each entry is a name, its manifest tags and its Wasm type and body.
+/// The arrays it returns lie at fixed places in its memory.
+fn guest(entries: &[(&str, &[u8], usize, Vec<u8>)], arrays: &[(i32, &[f32])]) -> Vec<u8> {
+    guest_with_main(entries, arrays, constant(0))
+}
+
+/// A long-lived program fixture, without a compiler or plugin dependency.
+pub(crate) fn program(main: Vec<u8>, arrays: &[(i32, &[f32])]) -> Vec<u8> {
+    guest_with_main(&[], arrays, main)
+}
+
+fn guest_with_main(entries: &[(&str, &[u8], usize, Vec<u8>)], arrays: &[(i32, &[f32])], main: Vec<u8>) -> Vec<u8> {
+    let function_type = |parameters: &[u8], results: &[u8]| {
+        [
+            vec![0x60],
+            vector(parameters.iter().map(|&p| vec![p]).collect()),
+            vector(results.iter().map(|&r| vec![r]).collect()),
+        ]
+        .concat()
+    };
+    // 0: Unit, U32 or an array to one (and the arena's functions); 1: F32 to F32;
+    // 2: the adapter; 3: main.
+    let types = vector(vec![
+        function_type(&[I32], &[I32]),
+        function_type(&[F32], &[F32]),
+        function_type(&[EXTERNREF, I32], &[I32]),
+        function_type(&[EXTERNREF], &[I32]),
+    ]);
+    let imports =
+        vector(vec![[name(squid_host::HOST_MODULE), name("call_array_f32_array_f32"), vec![0x00, 2]].concat()]);
+    // Functions after the import: squid:allocate, squid:reset, main, then the entries.
+    let mut bodies = vec![constant(1024), constant(0), main];
+    let mut type_indices = vec![0, 0, 3];
+    let mut exports = vec![
+        [name("squid:memory"), vec![0x02, 0]].concat(),
+        [name("squid:allocate"), vec![0x00, 1]].concat(),
+        [name("squid:reset"), vec![0x00, 2]].concat(),
+        [name("main"), vec![0x00, 3]].concat(),
+    ];
+    // main takes (Array F32 -> Array F32 ! {Foreign}) and returns Unit.
+    let mut manifest = vec![[name("main"), vec![4, 6, 6, 0]].concat()];
+    for (index, (entry, tags, type_index, body)) in entries.iter().enumerate() {
+        bodies.push(body.clone());
+        type_indices.push(*type_index as u32);
+        exports.push([name(entry), vec![0x00], leb(4 + index as u32)].concat());
+        manifest.push([name(entry), tags.to_vec()].concat());
+    }
+    let code = vector(bodies.into_iter().map(|body| [leb(body.len() as u32 + 1), vec![0], body].concat()).collect());
+    let data = vector(
+        arrays
+            .iter()
+            .map(|(at, lanes)| {
+                let mut bytes = (lanes.len() as u32).to_le_bytes().to_vec();
+                lanes.iter().for_each(|lane| bytes.extend(lane.to_le_bytes()));
+                [vec![0x00], constant(*at), vector(bytes.into_iter().map(|byte| vec![byte]).collect())].concat()
+            })
+            .collect(),
+    );
+    let abi = [name("squid:abi"), leb(2), vector(manifest), leb(0)].concat();
+    [
+        b"\0asm\x01\0\0\0".to_vec(),
+        section(1, types),
+        section(2, imports),
+        section(3, vector(type_indices.into_iter().map(leb).collect())),
+        section(5, vector(vec![vec![0x00, 1]])),
+        section(7, vector(exports)),
+        section(10, code),
+        section(11, data),
+        section(0, abi),
+    ]
+    .concat()
+}
+
+const I32: u8 = 0x7f;
+const F32: u8 = 0x7d;
+const EXTERNREF: u8 = 0x6f;
+/// Manifest tags: Unit to Array F32, and F32 to F32.
+const UNIT_TO_ARRAY: &[u8] = &[0, 6];
+const F32_TO_F32: &[u8] = &[3, 3];
+
+fn sample() -> Vec<u8> {
+    guest(
+        &[
+            ("test_passes", UNIT_TO_ARRAY, 0, constant(8)),
+            ("test_fails", UNIT_TO_ARRAY, 0, constant(24)),
+            ("test_traps", UNIT_TO_ARRAY, 0, vec![0x00, 0x0b]),
+            ("test_takes_f32", F32_TO_F32, 1, vec![0x20, 0, 0x0b]),
+            ("failing_on_purpose", UNIT_TO_ARRAY, 0, constant(24)),
+            ("test_malformed", UNIT_TO_ARRAY, 0, constant(64)),
+        ],
+        &[(8, &[2.0, 0.0]), (24, &[2.0, 1.0, 2.0, 2.0, 2.0, 3.0, 2.0, 2.0, 4.0]), (64, &[1.0, 1.0, 1.0, 5.0])],
+    )
+}
+
+/// Entries for a module that must trap: one stopping at `unreachable`, as
+/// Squid's `@panic` does; two returning, a report and lanes that are
+/// none; and three trapping otherwise.
+fn trapping_sample() -> Vec<u8> {
+    guest(
+        &[
+            ("test_panics", UNIT_TO_ARRAY, 0, vec![0x00, 0x0b]),
+            ("test_returns_a_report", UNIT_TO_ARRAY, 0, constant(24)),
+            ("test_returns_lanes", UNIT_TO_ARRAY, 0, constant(64)),
+            // i32.load at the address space's last byte.
+            (
+                "test_reads_out_of_bounds",
+                UNIT_TO_ARRAY,
+                0,
+                [vec![0x41], signed_leb(-1), vec![0x28, 2, 0, 0x0b]].concat(),
+            ),
+            // 1 / 0 (i32.div_s).
+            ("test_divides_by_zero", UNIT_TO_ARRAY, 0, vec![0x41, 1, 0x41, 0, 0x6d, 0x0b]),
+            // Calls itself, function 9: the import, squid:allocate,
+            // squid:reset, main, then these entries.
+            ("test_recurses", UNIT_TO_ARRAY, 0, vec![0x20, 0, 0x10, 9, 0x0b]),
+        ],
+        &[(24, &[2.0, 1.0, 2.0, 2.0, 2.0, 3.0, 2.0, 2.0, 4.0]), (64, &[1.0, 1.0, 1.0, 5.0])],
+    )
+}
+
+#[test]
+fn reads_reports() {
+    assert_eq!(decode(&[0.0, 0.0]).unwrap(), Report { checks: 0, failures: vec![] });
+    assert_eq!(decode(&[5.0, 0.0]).unwrap(), Report { checks: 5, failures: vec![] });
+    // gdev's tests/hand_salt.sq's `failing_on_purpose`.
+    assert_eq!(
+        decode(&[2.0, 1.0, 2.0, 2.0, 2.0, 3.0, 2.0, 2.0, 4.0]).unwrap(),
+        Report { checks: 2, failures: vec![Failure { place: 2, expected: vec![2.0, 3.0], actual: vec![2.0, 4.0] }] }
+    );
+    let two = decode(&[3.0, 2.0, 1.0, 0.0, 1.0, 0.5, 3.0, 1.0, 1.0, 1.0, 0.0]).unwrap();
+    assert_eq!(two.failures[0], Failure { place: 1, expected: vec![], actual: vec![0.5] });
+    assert_eq!(two.failures[1], Failure { place: 3, expected: vec![1.0], actual: vec![0.0] });
+    for malformed in [
+        &[][..],
+        &[1.0],
+        &[1.0, 2.0],
+        &[1.0, 1.0],
+        &[1.0, 1.0, 1.0, 2.0, 1.0],
+        &[1.0, 1.0, 2.0, 0.0, 0.0],
+        &[1.0, 0.0, 7.0],
+        &[1.5, 0.0],
+        &[-1.0, 0.0],
+        &[f32::NAN, 0.0],
+        &[f32::INFINITY, 0.0],
+    ] {
+        assert!(decode(malformed).is_err(), "{malformed:?}");
+    }
+}
+
+#[test]
+fn rejects_malformed_btst_reports() {
+    let magic = 0x4254_5354;
+    for (words, message) in [
+        (&[magic, 1, 0][..], "truncated BTST header"),
+        (&[0, 1, 0, 0][..], "invalid BTST magic"),
+        (&[magic, 2, 0, 0][..], "unsupported BTST version"),
+        (&[magic, 1, 0, u32::MAX][..], "truncated BTST failure records"),
+        (&[magic, 1, 0, 1, 100, 0, 0, 0, 0][..], "truncated BTST text"),
+        (&[magic, 1, 0, 1, 1, 0xd800, 0, 0, 0, 0][..], "invalid Unicode scalar"),
+        (&[magic, 1, 0, 0, 0][..], "trailing words"),
+    ] {
+        let error = decode_btst(words).unwrap_err().to_string();
+        assert!(error.contains(message), "{words:?}: {error}");
+    }
+}
+
+#[test]
+fn describes_outcomes() {
+    let passed = Outcome::Reported(Report { checks: 2, failures: vec![] });
+    assert_eq!(describe("test_a", &passed), ["  ok      test_a"]);
+    let failed = Outcome::Reported(decode(&[2.0, 1.0, 2.0, 2.0, 2.0, 3.0, 2.0, 2.0, 4.0]).unwrap());
+    assert_eq!(
+        describe("test_b", &failed),
+        ["  FAILED  test_b (1 of 2 checks)", "    check 2: expected [2, 3] got [2, 4]"]
+    );
+    let near = Failure { place: 1, expected: vec![0.39, -0.0], actual: vec![1e-7, f32::NAN] };
+    let near = Outcome::Reported(Report { checks: 1, failures: vec![near] });
+    assert_eq!(describe("test_c", &near)[1], "    check 1: expected [0.39, -0] got [0.0000001, NaN]");
+    let broken = Outcome::Broken("wasm trap\nunreachable".into());
+    assert_eq!(describe("test_d", &broken), ["  FAILED  test_d", "    wasm trap\n    unreachable"]);
+}
+
+#[test]
+fn runs_tests_that_must_trap() {
+    let engine = squid_host::engine().unwrap();
+    let tests = run_tests(&engine, &trapping_sample(), Kind::Traps, "test_", None, &Slots::new(4)).unwrap();
+    assert_eq!(tests.tests.len(), 6);
+    let outcome = |name: &str| &tests.tests.iter().find(|(test, _)| test == name).unwrap().1;
+    // Trapping at `unreachable`, as `@panic` does, passes.
+    assert_eq!(*outcome("test_panics"), Outcome::Panicked);
+    assert!(outcome("test_panics").passed());
+    assert_eq!(describe("test_panics", outcome("test_panics")), ["  ok      test_panics"]);
+    // Returning fails, showing the report it returned, or its lanes.
+    assert!(!outcome("test_returns_a_report").passed());
+    assert_eq!(
+        describe("test_returns_a_report", outcome("test_returns_a_report")),
+        [
+            "  FAILED  test_returns_a_report (returned instead of trapping)",
+            "    its report: 1 of 2 checks failed",
+            "    check 2: expected [2, 3] got [2, 4]",
+        ]
+    );
+    assert_eq!(*outcome("test_returns_lanes"), Outcome::Returned(Value::ArrayF32(vec![1.0, 1.0, 1.0, 5.0])));
+    assert_eq!(
+        describe("test_returns_lanes", outcome("test_returns_lanes")),
+        ["  FAILED  test_returns_lanes (returned instead of trapping)", "    it returned [1, 1, 1, 5]"]
+    );
+    // Any other trap fails, showing it.
+    for (name, trap) in [
+        ("test_reads_out_of_bounds", "out of bounds memory access"),
+        ("test_divides_by_zero", "integer divide by zero"),
+        ("test_recurses", "call stack exhausted"),
+    ] {
+        let Outcome::Mistrapped(message) = outcome(name) else { panic!("{name}: {:?}", outcome(name)) };
+        assert!(message.starts_with(&format!("wasm trap: {trap}")), "{message}");
+        let lines = describe(name, outcome(name));
+        assert_eq!(lines[0], format!("  FAILED  {name} (trapped, but not at `unreachable`)"));
+        assert!(lines[1].starts_with(&format!("    wasm trap: {trap}")), "{}", lines[1]);
+    }
+    // Where a test must not trap, `unreachable` fails it.
+    let checks = run_tests(&engine, &trapping_sample(), Kind::Checks, "test_", Some("panics"), &Slots::new(4)).unwrap();
+    let Outcome::Broken(trap) = &checks.tests[0].1 else { panic!("{:?}", checks.tests) };
+    assert!(trap.starts_with("wasm trap: wasm `unreachable`"), "{trap}");
+}
+
+#[test]
+fn judges_modules_that_must_not_compile() {
+    let rejects = "component type already registered";
+    // Not compiling, with diagnostics that contain the text, passes.
+    let diagnostics = "/gdev/packages/ecs.sq:0-0: const_panic: component type already registered";
+    let rejected = rejection(rejects, Err(anyhow!("{diagnostics}")));
+    assert_eq!(rejected.tests, [(rejects.to_owned(), Outcome::Rejected)]);
+    assert!(rejected.tests[0].1.passed());
+    assert_eq!(describe(rejects, &Outcome::Rejected), ["  ok      rejected: component type already registered"]);
+    // Compiling fails.
+    let compiled = rejection(rejects, Ok(sample()));
+    assert_eq!(compiled.tests, [(rejects.to_owned(), Outcome::Compiled)]);
+    assert!(!compiled.tests[0].1.passed());
+    assert_eq!(
+        describe(rejects, &Outcome::Compiled),
+        ["  FAILED  compiled, but should be rejected: component type already registered"]
+    );
+    // Not compiling with other diagnostics fails, showing them.
+    for other in [
+        "/gdev/src/test_fixture.sq:9532-9551: type_mismatch: Types do not match",
+        "/gdev/packages/ecs.sq:0-0: const_panic: component type already initialized",
+    ] {
+        let misrejected = rejection(rejects, Err(anyhow!("{other}")));
+        assert_eq!(misrejected.tests, [(rejects.to_owned(), Outcome::Misrejected(other.to_owned()))]);
+        assert!(!misrejected.tests[0].1.passed());
+        assert_eq!(
+            describe(rejects, &misrejected.tests[0].1),
+            [
+                "  FAILED  rejected, but the diagnostics lack: component type already registered".to_owned(),
+                format!("    {other}")
+            ]
+        );
+    }
+}
+
+#[test]
+fn tallies_modules_by_what_the_plugin_expects() {
+    let expected = [Expectation::Checks, Expectation::Traps, Expectation::Rejected("type_mismatch".into())];
+    assert_eq!(expected.map(|expect| Kind::of(&expect)), Kind::ALL);
+    let test = TestModule {
+        path: "/gdev/tests/traps/codec.sq".into(),
+        entry: "/gdev/src/test_fixture.sq".into(),
+        overlays: Vec::new(),
+        prefix: "test_".into(),
+        expect: Expectation::Traps,
+    };
+    let module = Module::new(Path::new("/gdev"), test);
+    let shown = Path::new("tests/traps/codec.sq").to_str().unwrap();
+    assert_eq!((module.shown.as_str(), module.kind), (shown, Kind::Traps));
+}
+
+#[test]
+fn slots_bound_how_many_tests_run_at_once() {
+    let slots = Slots::new(2);
+    let (running, most) = (AtomicUsize::new(0), AtomicUsize::new(0));
+    std::thread::scope(|scope| {
+        for _ in 0..6 {
+            scope.spawn(|| {
+                slots.hold(|| {
+                    most.fetch_max(running.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(20));
+                    running.fetch_sub(1, Ordering::SeqCst);
+                });
+            });
+        }
+    });
+    assert_eq!(most.load(Ordering::SeqCst), 2);
+    // A slot comes back when its work panics.
+    let one = Slots::new(1);
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| one.hold(|| panic!("a test")))).is_err());
+    assert_eq!(one.hold(|| 7), 7);
+}
+
+#[test]
+fn hands_results_over_in_order() {
+    let items: Vec<u64> = (0..12).collect();
+    let (running, most) = (AtomicUsize::new(0), AtomicUsize::new(0));
+    let mut handed = Vec::new();
+    in_order(
+        &items,
+        4,
+        || (),
+        |(), &item| {
+            most.fetch_max(running.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+            // Later items finish sooner.
+            std::thread::sleep(Duration::from_millis(3 * (12 - item)));
+            running.fetch_sub(1, Ordering::SeqCst);
+            item * 10
+        },
+        |&item, result| handed.push((item, result)),
+    );
+    assert_eq!(handed, items.iter().map(|&item| (item, item * 10)).collect::<Vec<_>>());
+    let most = most.load(Ordering::SeqCst);
+    assert!((2..=4).contains(&most), "{most} at once");
+    // Nothing to do, and one at a time.
+    in_order(&[] as &[u64], 4, || (), |(), _| unreachable!(), |_, ()| unreachable!());
+    let mut one = Vec::new();
+    in_order(&items, 1, || (), |(), &item| item, |_, result| one.push(result));
+    assert_eq!(one, items);
+}
+
+#[test]
+fn runs_a_modules_tests() {
+    let engine = squid_host::engine().unwrap();
+    let tests = run_tests(&engine, &sample(), Kind::Checks, "test_", None, &Slots::new(4)).unwrap();
+    let names: Vec<&str> = tests.tests.iter().map(|(name, _)| name.as_str()).collect();
+    // Only `test_…` entries, Unit to Array F32, in the module's order.
+    assert_eq!(names, ["test_passes", "test_fails", "test_traps", "test_malformed"]);
+    assert_eq!(
+        tests.skipped,
+        ["test_takes_f32: it is F32 -> F32, expected Unit -> Unit, Bool, Array F32, or Array U32"]
+    );
+    let outcome = |name: &str| &tests.tests.iter().find(|(test, _)| test == name).unwrap().1;
+    assert_eq!(*outcome("test_passes"), Outcome::Reported(Report { checks: 2, failures: vec![] }));
+    assert!(outcome("test_passes").passed());
+    assert_eq!(describe("test_fails", outcome("test_fails"))[1], "    check 2: expected [2, 3] got [2, 4]");
+    let Outcome::Broken(trap) = outcome("test_traps") else { panic!("test_traps did not trap") };
+    assert!(trap.starts_with("wasm trap: wasm `unreachable`"), "{trap}");
+    let Outcome::Broken(malformed) = outcome("test_malformed") else { panic!("test_malformed passed") };
+    assert!(malformed.starts_with("its report is malformed (it ends within failure 1's expected"), "{malformed}");
+    assert!(malformed.ends_with("[1, 1, 1, 5]"), "{malformed}");
+
+    let filtered = run_tests(&engine, &sample(), Kind::Checks, "test_", Some("fail"), &Slots::new(4)).unwrap();
+    assert_eq!(filtered.tests.len(), 1);
+    assert_eq!(filtered.tests[0].0, "test_fails");
+    assert!(run_tests(&engine, b"\0asm\x01\0\0\0", Kind::Checks, "test_", None, &Slots::new(4)).is_err());
+}
+
+#[test]
+fn metadata_takes_precedence_over_legacy_prefixes() {
+    let mut wasm = sample();
+    let mut metadata = name(pen_runtime::abi::TESTS_SECTION);
+    metadata.extend([1, 1, 0]);
+    metadata.extend(name("test_passes"));
+    metadata.extend([0, 0, 1]); // Empty display name and filename, line 1.
+    wasm.extend(section(0, metadata));
+    let engine = squid_host::engine().unwrap();
+    let slots = Slots::new(1);
+    let tests = run_tests(&engine, &wasm, Kind::Checks, "test_", Some("passes"), &slots).unwrap();
+    assert_eq!(tests.tests, [("test_passes".into(), Outcome::Reported(Report { checks: 2, failures: vec![] }))]);
+    let secondary = run_tests(&engine, &wasm, Kind::Traps, "trap_", None, &slots).unwrap();
+    assert!(secondary.tests.is_empty());
+}
+
+#[test]
+fn runs_real_first_class_and_legacy_squid_tests_together() {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+    let squid = repository.join("../squid-lang");
+    let compiler = std::env::var_os("SQUID_TEST_COMPILER")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| squid.join("compiler-goose/build/squidc-goose"));
+    let component = std::env::var_os("PEN_TEST_SQUID_PLUGIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| repository.join("plugins/target/wasm32-wasip2/release/pen_plugin_squid.wasm"));
+    let std = squid.join("std");
+    if !compiler.is_file() || !component.is_file() || !std.is_dir() {
+        crate::fixtures::missing("first-class Squid tests need squidc-goose, the WASI Squid plugin, and Squid std");
+        return;
+    }
+    struct Project(PathBuf);
+    impl Drop for Project {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let project = Project(std::env::temp_dir().join(format!("pen-first-class-squid-{}", std::process::id())));
+    let root = &project.0;
+    std::fs::create_dir_all(root.join("tests")).unwrap();
+    let config = serde_json::json!({
+        "plugins": { "squid": { "wasm": component, "read": [&std], "run": { "squidc": compiler } } },
+        "compiler": { "plugin": "squid", "settings": { "std": std, "testMode": false, "tests": {
+            "entry": "tests/.fixture.sq", "files": ["tests/first.sq", "tests/mixed.sq"]
+        } } }
+    });
+    std::fs::write(root.join("pen.json"), config.to_string()).unwrap();
+    std::fs::write(
+        root.join("tests/first.sq"),
+        r#"import * as test from "std/test"
+
+test "unit ok":
+  let _ = 42
+
+test "bool ok" => true
+test "bool fail" => false
+
+@[test.suite]
+test "btst ok":
+  use test.eq "equal" 42 42
+
+@[test.suite]
+test "btst fail":
+  use test.eq "equal" 42 42
+  use test.group "nested λ" (func () =>
+    use test.eq "mismatch" 41 42
+    return ())
+
+test expect_trap "panics":
+  panic "expected"
+
+test expect_trap "div zero":
+  let zero = #[0]
+  return @u32.div 1 zero[0]
+
+test expect_trap "returns u32" => 42
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("tests/mixed.sq"),
+        r#"test "mixed check" => true
+test expect_trap "mixed trap" => panic "expected"
+
+io test_legacy () => #[1.0, 0.0]
+io trap_legacy (): U32 => @panic "legacy panic"
+"#,
+    )
+    .unwrap();
+
+    let plugins = test_plugins(root).unwrap();
+    let checkout = plugins.root();
+    let engine = squid_host::dev_engine().unwrap();
+    let slots = Slots::new(2);
+    let discover = |filter| {
+        plugins
+            .tests(&checkout.join(ENTRY), &[], filter)
+            .unwrap()
+            .into_iter()
+            .map(|test| Module::new(checkout, test))
+            .collect::<Vec<_>>()
+    };
+    let modules = discover(None);
+    assert_eq!(modules.iter().map(|module| module.kind).collect::<Vec<_>>(), [Kind::Checks, Kind::Checks, Kind::Traps]);
+    let mut builder = None;
+    let mut execute =
+        |module: &Module, filter| run_module(&mut builder, &plugins, &engine, module, filter, &slots, None);
+    let first = execute(&modules[0], None);
+    let lines = module_lines(&modules[0], &first, None).join("\n");
+    let first = first.tests.unwrap_or_else(|_| panic!("{lines}"));
+    assert_eq!(
+        first.tests.iter().map(|(name, outcome)| (name.as_str(), outcome.passed())).collect::<Vec<_>>(),
+        [
+            ("unit ok", true),
+            ("bool ok", true),
+            ("bool fail", false),
+            ("btst ok", true),
+            ("btst fail", false),
+            ("panics", true),
+            ("div zero", true),
+            ("returns u32", false),
+        ],
+        "{lines}"
+    );
+    for shown in [
+        "returned false",
+        "btst fail (1 of 2 checks)",
+        "\"nested λ\" / \"mismatch\": \"expected equal values\"",
+        "expected \"41\", got \"42\"",
+        "returns u32 (returned instead of trapping)\n    it returned 42",
+    ] {
+        assert!(lines.contains(shown), "{lines}");
+    }
+
+    for (module, expected) in
+        [(&modules[1], &["mixed check", "mixed trap", "test_legacy"][..]), (&modules[2], &["trap_legacy"][..])]
+    {
+        let ran = execute(module, None);
+        let lines = module_lines(module, &ran, None).join("\n");
+        let ran = ran.tests.unwrap_or_else(|_| panic!("{lines}"));
+        assert_eq!(ran.tests.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>(), expected, "{lines}");
+        assert!(ran.tests.iter().all(|(_, outcome)| outcome.passed()), "{lines}");
+    }
+
+    for (filter, expected) in [("bool ok", "bool ok"), ("__squid_test_6", "div zero")] {
+        let filtered = discover(Some(filter));
+        assert_eq!(filtered.len(), 1);
+        let ran = execute(&filtered[0], Some(filter)).tests.unwrap();
+        assert_eq!(ran.tests.len(), 1);
+        assert_eq!(ran.tests[0].0, expected);
+        assert!(ran.tests[0].1.passed());
+    }
+
+    let options = |filter: &str| Options {
+        session: None,
+        files: vec![],
+        filter: Some(filter.into()),
+        jobs: Some(1),
+        deadline: None,
+    };
+    run(root, options("mixed")).unwrap();
+    let failed = run(root, options("bool fail")).unwrap_err().to_string();
+    assert_eq!(failed, "tests failed:\n  tests/first.sq: bool fail");
+
+    let mixed = &modules[1].test;
+    let mut normal = Builder::new(plugins, Path::new(&mixed.entry));
+    let normal_wasm = build_test_module(&mut normal, mixed).unwrap();
+    let mut legacy_only = mixed.clone();
+    let source = legacy_only.overlays[0].contents.as_mut().unwrap();
+    *source = source.lines().skip_while(|line| !line.starts_with("io ")).collect::<Vec<_>>().join("\n") + "\n";
+    assert_eq!(normal_wasm, build_test_module(&mut normal, &legacy_only).unwrap());
+    assert!(pen_runtime::abi::read_abi(&normal_wasm).unwrap().tests.is_empty());
+}
+
+#[test]
+fn runs_the_checkouts_pilot() {
+    // The sibling gdev checkout's pilot module, when this repo has one
+    // and its plugins are there to compile it.
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../gdev");
+    let pilot = root.join("tests/hand_salt.sq");
+    let plugins = pilot.is_file().then(|| test_plugins(&root).ok()).flatten();
+    let Some(plugins) = plugins else {
+        eprintln!("skipped: no ../gdev/tests/hand_salt.sq, or no plugins to compile it");
+        return;
+    };
+    // As the plugin lays it out.
+    let pilot = pilot.canonicalize().unwrap();
+    let mut found = plugins.tests(&plugins.root().join(ENTRY), std::slice::from_ref(&pilot), None).unwrap();
+    assert_eq!(found.len(), 1);
+    let test = found.remove(0);
+    assert!(Path::new(&test.path) == pilot && matches!(test.expect, Expectation::Checks), "{}", test.path);
+    let mut builder = Builder::new_for_tests(plugins, Path::new(&test.entry));
+    let wasm = build_test_module(&mut builder, &test).unwrap();
+    let engine = squid_host::dev_engine().unwrap();
+    let tests = run_tests(&engine, &wasm, Kind::Checks, &test.prefix, None, &Slots::new(4)).unwrap();
+    assert!(!tests.tests.is_empty());
+    for (name, outcome) in &tests.tests {
+        assert!(outcome.passed(), "{}", describe(name, outcome).join("\n"));
+    }
+    // A test that fails on purpose (and is no `test_…`, so it does not run).
+    let module = GuestModule::new(&engine, &wasm, None).unwrap();
+    if module.abi().function("failing_on_purpose").is_some() {
+        let lanes = std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .stack_size(squid_host::GUEST_STACK_BYTES + (8 << 20))
+                .spawn_scoped(scope, || {
+                    Guest::new(&engine, &module).unwrap().call("failing_on_purpose", Value::Unit).unwrap()
+                })
+                .unwrap()
+                .join()
+                .unwrap()
+        });
+        let outcome = Outcome::Reported(decode(&lanes.into_f32_array().unwrap()).unwrap());
+        assert!(!outcome.passed());
+        let lines = describe("failing_on_purpose", &outcome);
+        eprintln!("{}", lines.join("\n"));
+        assert!(lines[1].starts_with("    check "), "{lines:?}");
+    }
+    // A module that does not compile, in the same session, fails with the
+    // compiler's diagnostics, placed in the module.
+    let source = "io const test_broken = func () => return missing_name\n";
+    let broken = TestModule {
+        path: root.join("tests/broken.sq").display().to_string(),
+        overlays: vec![pen_plugins::Overlay { path: test.entry.clone(), contents: Some(source.into()) }],
+        ..test
+    };
+    let error = format!("{:#}", build_test_module(&mut builder, &broken).unwrap_err());
+    assert!(error.contains("missing_name"), "{error}");
+    assert!(error.starts_with(&format!("{}:1:", broken.path)), "{error}");
+    assert!(error.contains("in broken.sq"), "{error}");
+}
+
+#[test]
+fn reports_trap_provenance_and_source_locations() {
+    let source = concat!(
+        "let header = 1\n",
+        "test \"panic site\":\n",
+        "  panic \"audit: lost receipt\"\n",
+        "\n",
+        "test \"bounds site\":\n",
+        "  let xs = #[10, 20]\n",
+        "  return xs[9]\n",
+    );
+    let panic_start = source.find("panic \"audit: lost receipt\"").unwrap() as u32;
+    let panic_end = panic_start + "panic \"audit: lost receipt\"".len() as u32;
+    let bounds_start = source.find("xs[9]").unwrap() as u32;
+    let bounds_end = bounds_start + "xs[9]".len() as u32;
+
+    let store_trap = |trap_id: i32| -> Vec<u8> {
+        [
+            vec![0x41],
+            signed_leb(i32::try_from(squid_host::TRAP_SITE_OFFSET).unwrap()),
+            vec![0x41],
+            signed_leb(trap_id),
+            vec![0x36, 0x02, 0x00, 0x00, 0x0b],
+        ]
+        .concat()
+    };
+
+    // Scalar-only ABI 8 module exporting squid:memory (without squid:allocate/squid:reset) + squid:traps + squid:tests.
+    let entries: &[(&str, Vec<u8>)] = &[
+        ("test_panic", store_trap(1)),
+        ("test_bounds", store_trap(2)),
+        ("test_imported_panic", store_trap(3)),
+        ("expect_panic", store_trap(1)),
+        ("expect_bounds", store_trap(2)),
+        ("trap_legacy", store_trap(1)),
+    ];
+    let types = vector(vec![[vec![0x60, 0x01, I32, 0x01, I32]].concat()]);
+    let type_indices = vector((0..entries.len()).map(|_| leb(0)).collect());
+    let mut exports = vec![[name("squid:memory"), vec![0x02, 0]].concat()];
+    let mut manifest = Vec::new();
+    let mut bodies = Vec::new();
+    for (index, (export, body)) in entries.iter().enumerate() {
+        exports.push([name(export), vec![0x00], leb(index as u32)].concat());
+        manifest.push([name(export), vec![0, 0]].concat());
+        bodies.push([leb(body.len() as u32 + 1), vec![0], body.clone()].concat());
+    }
+    let abi_section = [name(pen_runtime::abi::ABI_SECTION), leb(8), vector(manifest), leb(0)].concat();
+
+    let mut traps_payload = name(pen_runtime::abi::TRAPS_SECTION);
+    traps_payload.push(1);
+    traps_payload.extend(3u32.to_le_bytes());
+    for (kind, unit, start, end, msg) in [
+        (1u8, 1u32, panic_start, panic_end, "audit: lost receipt"),
+        (2, 1, bounds_start, bounds_end, "index out of bounds"),
+        // Span 0..5 points at `let h` in `source` (an imported module's offset) and must not emit a bogus `at`.
+        (1, 2, 0, 5, "from imported helper"),
+    ] {
+        traps_payload.push(kind);
+        traps_payload.extend(unit.to_le_bytes());
+        traps_payload.extend(start.to_le_bytes());
+        traps_payload.extend(end.to_le_bytes());
+        traps_payload.extend((msg.len() as u32).to_le_bytes());
+        traps_payload.extend(msg.as_bytes());
+    }
+
+    let mut tests_payload = name(pen_runtime::abi::TESTS_SECTION);
+    tests_payload.push(1);
+    tests_payload.extend(leb(5));
+    for (kind, export, display, line) in [
+        (0u8, "test_panic", "panic site", 2u32),
+        (0, "test_bounds", "bounds site", 5),
+        (0, "test_imported_panic", "imported panic", 5),
+        (1, "expect_panic", "expect panic", 2),
+        (1, "expect_bounds", "expect bounds", 5),
+    ] {
+        tests_payload.push(kind);
+        tests_payload.extend(name(export));
+        tests_payload.extend(name(display));
+        tests_payload.extend(name("tests/audit.sq"));
+        tests_payload.extend(leb(line));
+    }
+
+    let wasm = [
+        b"\0asm\x01\0\0\0".to_vec(),
+        section(1, types),
+        section(3, type_indices),
+        section(5, vector(vec![vec![0x01, 1, 1]])),
+        section(7, vector(exports)),
+        section(10, vector(bodies)),
+        section(0, abi_section),
+        section(0, traps_payload),
+        section(0, tests_payload),
+    ]
+    .concat();
+
+    let engine = squid_host::engine().unwrap();
+    let slots = Slots::new(2);
+    let checks = run_tests_with_session(
+        &engine,
+        &wasm,
+        Kind::Checks,
+        "test_",
+        None,
+        &slots,
+        None,
+        Some(("tests/audit.sq", source)),
+    )
+    .unwrap();
+    let outcome = |label: &str| &checks.tests.iter().find(|(name, _)| name == label).unwrap().1;
+
+    let Outcome::Broken(panic_msg) = outcome("panic site") else {
+        panic!("expected broken panic site: {:?}", outcome("panic site"));
+    };
+    assert!(panic_msg.starts_with("panic: \"audit: lost receipt\"\n"), "{panic_msg}");
+    assert!(panic_msg.contains("at tests/audit.sq:3:3"), "{panic_msg}");
+    assert!(!panic_msg.contains("wasm `unreachable`"), "{panic_msg}");
+
+    let Outcome::Broken(bounds_msg) = outcome("bounds site") else {
+        panic!("expected broken bounds site: {:?}", outcome("bounds site"));
+    };
+    assert!(bounds_msg.starts_with("index out of bounds\n"), "{bounds_msg}");
+    assert!(bounds_msg.contains("at tests/audit.sq:7:10"), "{bounds_msg}");
+    assert!(!bounds_msg.contains("wasm `unreachable`"), "{bounds_msg}");
+
+    let Outcome::Broken(imported_msg) = outcome("imported panic") else {
+        panic!("expected broken imported panic: {:?}", outcome("imported panic"));
+    };
+    assert!(imported_msg.starts_with("panic: \"from imported helper\""), "{imported_msg}");
+    assert!(!imported_msg.contains("at tests/audit.sq:"), "{imported_msg}");
+
+    // First-class `expect_trap` still passes on both @panic and bounds traps.
+    assert_eq!(*outcome("expect panic"), Outcome::Panicked);
+    assert_eq!(*outcome("expect bounds"), Outcome::Panicked);
+
+    // Legacy `trap_` still passes on @panic (Trap::UnreachableCodeReached).
+    let legacy = run_tests_with_session(
+        &engine,
+        &wasm,
+        Kind::Traps,
+        "trap_",
+        None,
+        &slots,
+        None,
+        Some(("tests/audit.sq", source)),
+    )
+    .unwrap();
+    assert_eq!(legacy.tests, [("trap_legacy".into(), Outcome::Panicked)]);
+}
+
+#[test]
+fn runs_real_trap_provenance_tests() {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+    let squid = repository.join("../squid-lang");
+    let compiler = std::env::var_os("SQUID_TEST_COMPILER")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| squid.join("compiler-goose/build/squidc-goose"));
+    let component = std::env::var_os("PEN_TEST_SQUID_PLUGIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| repository.join("plugins/target/wasm32-wasip2/release/pen_plugin_squid.wasm"));
+    let std = squid.join("std");
+    if !compiler.is_file() || !component.is_file() || !std.is_dir() {
+        crate::fixtures::missing("trap provenance tests need squidc-goose, the WASI Squid plugin, and Squid std");
+        return;
+    }
+    struct Project(PathBuf);
+    impl Drop for Project {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let project = Project(std::env::temp_dir().join(format!("pen-trap-provenance-{}", std::process::id())));
+    let root = &project.0;
+    std::fs::create_dir_all(root.join("tests")).unwrap();
+    let config = serde_json::json!({
+        "plugins": { "squid": { "wasm": component, "read": [&std], "run": { "squidc": compiler } } },
+        "compiler": { "plugin": "squid", "settings": { "std": std, "testMode": false, "tests": {
+            "entry": "tests/.fixture.sq", "files": ["tests/scalar_panic.sq", "tests/bounds.sq"]
+        } } }
+    });
+    std::fs::write(root.join("pen.json"), config.to_string()).unwrap();
+    std::fs::write(
+        root.join("tests/scalar_panic.sq"),
+        r#"test "unexpected scalar panic":
+  panic "audit: lost receipt"
+
+test expect_trap "expected scalar panic":
+  panic "expected scalar"
+
+io trap_legacy (): U32 => @panic "legacy scalar"
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("tests/bounds.sq"),
+        r#"test "unexpected bounds":
+  let xs = #[10, 20]
+  let _ = xs[5]
+
+test expect_trap "expected bounds":
+  let xs = #[10]
+  let _ = xs[3]
+"#,
+    )
+    .unwrap();
+
+    let plugins = test_plugins(root).unwrap();
+    let checkout = plugins.root();
+    let engine = squid_host::dev_engine().unwrap();
+    let slots = Slots::new(2);
+    let modules: Vec<Module> = plugins
+        .tests(&checkout.join(ENTRY), &[], None)
+        .unwrap()
+        .into_iter()
+        .map(|test| Module::new(checkout, test))
+        .collect();
+    let mut builder = None;
+
+    // Scalar-only panicking module (checks + legacy trap).
+    let scalar_checks = modules.iter().find(|m| m.shown == "tests/scalar_panic.sq" && m.kind == Kind::Checks).unwrap();
+    let ran = run_module(&mut builder, &plugins, &engine, scalar_checks, None, &slots, None);
+    let lines = module_lines(scalar_checks, &ran, None).join("\n");
+    let tests = ran.tests.unwrap_or_else(|_| panic!("{lines}"));
+    assert_eq!(
+        tests.tests.iter().map(|(name, outcome)| (name.as_str(), outcome.passed())).collect::<Vec<_>>(),
+        [("unexpected scalar panic", false), ("expected scalar panic", true)],
+        "{lines}"
+    );
+    assert!(lines.contains("panic: \"audit: lost receipt\""), "{lines}");
+    assert!(lines.contains("at tests/scalar_panic.sq:2:3"), "{lines}");
+
+    let scalar_traps = modules.iter().find(|m| m.shown == "tests/scalar_panic.sq" && m.kind == Kind::Traps).unwrap();
+    let ran = run_module(&mut builder, &plugins, &engine, scalar_traps, None, &slots, None);
+    let lines = module_lines(scalar_traps, &ran, None).join("\n");
+    let tests = ran.tests.unwrap_or_else(|_| panic!("{lines}"));
+    assert_eq!(tests.tests, [("trap_legacy".into(), Outcome::Panicked)], "{lines}");
+
+    // Array bounds module.
+    let bounds_mod = modules.iter().find(|m| m.shown == "tests/bounds.sq" && m.kind == Kind::Checks).unwrap();
+    let ran = run_module(&mut builder, &plugins, &engine, bounds_mod, None, &slots, None);
+    let lines = module_lines(bounds_mod, &ran, None).join("\n");
+    let tests = ran.tests.unwrap_or_else(|_| panic!("{lines}"));
+    assert_eq!(
+        tests.tests.iter().map(|(name, outcome)| (name.as_str(), outcome.passed())).collect::<Vec<_>>(),
+        [("unexpected bounds", false), ("expected bounds", true)],
+        "{lines}"
+    );
+    assert!(lines.contains("index out of bounds"), "{lines}");
+    assert!(lines.contains("at tests/bounds.sq:3:11"), "{lines}");
+
+    // Overlay diagnostic on a rejected test file names the test file on BOTH header and `in <basename>` lines.
+    let mut rejected_test = scalar_checks.test.clone();
+    rejected_test.path = root.join("tests/overlay_bad.sq").display().to_string();
+    rejected_test.overlays = vec![pen_plugins::Overlay {
+        path: rejected_test.entry.clone(),
+        contents: Some("io bad (): U32 => return missing_symbol\n".into()),
+    }];
+    let diag = format!("{:#}", build_test_module(builder.as_mut().unwrap(), &rejected_test).unwrap_err());
+    assert!(diag.starts_with(&format!("{}:1:", rejected_test.path)), "{diag}");
+    assert!(diag.contains("in overlay_bad.sq"), "{diag}");
+    assert!(!diag.contains(".fixture.sq"), "{diag}");
+}
+
+#[test]
+fn runs_real_stage0_generator_tests() {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+    let squid = repository.join("../squid-lang");
+    let compiler = std::env::var_os("SQUID_TEST_COMPILER")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| squid.join("compiler-goose/build/squidc-goose"));
+    let component = std::env::var_os("PEN_TEST_SQUID_PLUGIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| repository.join("plugins/target/wasm32-wasip2/release/pen_plugin_squid.wasm"));
+    let std_root = squid.join("std");
+    let squid_lang_examples = squid.join("examples/generators");
+    if !compiler.is_file()
+        || !component.is_file()
+        || !std_root.is_dir()
+        || !squid_lang_examples.join("wgsl_gen.sq").is_file()
+    {
+        crate::fixtures::missing(
+            "stage0 generator tests need squidc-goose, the WASI Squid plugin, Squid std, and examples",
+        );
+        return;
+    }
+
+    struct Project(PathBuf);
+    impl Drop for Project {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let project = Project(std::env::temp_dir().join(format!("pen-stage0-generators-{}", std::process::id())));
+    let root = &project.0;
+    let _ = std::fs::remove_dir_all(root);
+    std::fs::create_dir_all(root.join("tools")).unwrap();
+    std::fs::create_dir_all(root.join("assets")).unwrap();
+    std::fs::create_dir_all(root.join("raw")).unwrap();
+    std::fs::create_dir_all(root.join("tests")).unwrap();
+    std::fs::copy(squid_lang_examples.join("wgsl_gen.sq"), root.join("tools/wgsl_gen.sq")).unwrap();
+    std::fs::copy(squid_lang_examples.join("csv_gen.sq"), root.join("tools/csv_gen.sq")).unwrap();
+    std::fs::copy(squid_lang_examples.join("literals.sq"), root.join("tools/literals.sq")).unwrap();
+    std::fs::write(
+        root.join("assets/salt.wgsl"),
+        "struct Parameters { clear: f32, active: bool };\nconst stage_light_slot = 16u;\nconst marker = -1.5;\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("raw/units.csv"), "name,hp,speed\nScout,25,3.5\nTank,100,1.25\n").unwrap();
+
+    let pen_json = serde_json::json!({
+        "plugins": {
+            "squid": {
+                "wasm": component,
+                "read": [std_root],
+                "run": { "squidc": compiler }
+            }
+        },
+        "compiler": {
+            "plugin": "squid",
+            "settings": {
+                "std": std_root,
+                "tests": { "entry": "tests/.fixture.sq" },
+                "generators": [
+                    { "match": "assets/*.wgsl", "generator": "tools/wgsl_gen.sq", "inputMode": "text" },
+                    { "module": "assets/units.csv", "input": "raw/units.csv", "generator": "tools/csv_gen.sq", "inputMode": "text" }
+                ]
+            }
+        }
+    });
+    std::fs::write(root.join("pen.json"), pen_json.to_string()).unwrap();
+
+    std::fs::write(
+        root.join("tests/generated.sq"),
+        r#"import * as t from "std/test"
+import { Parameters, stage_light_slot, marker } from "../assets/salt.wgsl"
+import { specs } from "../assets/units.csv"
+
+test "stage0 wgsl and csv virtual modules execute in pen test-squid":
+  return t.run (func () =>
+    let p = $Parameters { clear: 0.25, active: true }
+    let count = specs.length
+    let hp0 = specs[0].hp
+    let hp1 = specs[1].hp
+    let spd1 = specs[1].speed
+    use t.holds "active" p.active
+    use t.eq "slot" 16 stage_light_slot
+    use t.near "marker" 0.0001 (-1.5) marker
+    use t.eq "unit count" 2 count
+    use t.eq "scout hp" 25 hp0
+    use t.eq "tank hp" 100 hp1
+    use t.near "tank speed" 0.0001 1.25 spd1
+    return ()
+  )
+"#,
+    )
+    .unwrap();
+
+    let plugins = test_plugins(root).unwrap();
+    let checkout = plugins.root();
+    let engine = squid_host::dev_engine().unwrap();
+    let slots = Slots::new(2);
+    let modules: Vec<Module> = plugins
+        .tests(&checkout.join(ENTRY), &[], None)
+        .unwrap()
+        .into_iter()
+        .map(|test| Module::new(checkout, test))
+        .collect();
+    assert_eq!(modules.len(), 1);
+    let mut builder = None;
+    let ran = run_module(&mut builder, &plugins, &engine, &modules[0], None, &slots, None);
+    let lines = module_lines(&modules[0], &ran, None).join("\n");
+    let tests = ran.tests.unwrap_or_else(|_| panic!("{lines}"));
+    assert_eq!(
+        tests.tests.iter().map(|(name, outcome)| (name.as_str(), outcome.passed())).collect::<Vec<_>>(),
+        [("stage0 wgsl and csv virtual modules execute in pen test-squid", true)],
+        "{lines}"
+    );
+}

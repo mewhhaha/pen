@@ -2,7 +2,7 @@
 //! from the module's standard `name` custom section (and its exports' for
 //! functions that has no name for), and source positions
 //! from a source map embedded in its `sourceMappingURL` section
-//! (docs/source-maps.md). Native pen (blot-host) and the browser read them
+//! (docs/source-maps.md). Native pen (squid-host) and the browser read them
 //! alike and describe a trap's frames the same way. Debug information only
 //! adds words: a module without it runs the same, its frames shown by
 //! function index, and one with unreadable debug information runs too, the
@@ -470,10 +470,10 @@ pub(crate) mod tests {
 
     #[test]
     fn names_come_from_the_name_section() {
-        let symbols = Symbols::read(&module(&[names("main", &[(0, "blot:host.call"), (3, "game.update")])]));
+        let symbols = Symbols::read(&module(&[names("main", &[(0, "squid:host.call"), (3, "game.update")])]));
         assert_eq!(symbols.module.as_deref(), Some("main"));
         assert_eq!(symbols.function(3), Some("game.update"));
-        assert_eq!(symbols.label(0), "blot:host.call");
+        assert_eq!(symbols.label(0), "squid:host.call");
         assert_eq!(symbols.label(4), "<wasm function 4>");
         assert!(symbols.problems.is_empty() && !symbols.is_empty() && !symbols.has_source_map());
         assert!(Symbols::read(&module(&[])).is_empty(), "a module without them");
@@ -490,18 +490,18 @@ pub(crate) mod tests {
 
     #[test]
     fn source_maps_place_offsets_in_files() {
-        // Offsets 0x40 and 0x48 in src/game.blot lines 12 and 14; from 0x50
-        // in src/ink.blot line 3; from 0x60 nowhere.
-        let map = r#"{"version":3,"sources":["src/game.blot","src/ink.blot"],"names":[],
+        // Offsets 0x40 and 0x48 in src/game.sq lines 12 and 14; from 0x50
+        // in src/ink.sq line 3; from 0x60 nowhere.
+        let map = r#"{"version":3,"sources":["src/game.sq","src/ink.sq"],"names":[],
             "mappings":"gEAWI,QAEC,QCXH,gB"}"#;
         let symbols = Symbols::read(&module(&[source_map(map)]));
         assert!(symbols.problems.is_empty(), "{:?}", symbols.problems);
         let at = |offset| symbols.location(offset).map(|location| location.to_string());
         assert_eq!(at(0x3f), None, "before the first mapping");
-        assert_eq!(at(0x40).as_deref(), Some("src/game.blot:12:5"));
-        assert_eq!(at(0x47).as_deref(), Some("src/game.blot:12:5"));
-        assert_eq!(at(0x48).as_deref(), Some("src/game.blot:14:6"));
-        assert_eq!(at(0x50).as_deref(), Some("src/ink.blot:3:3"));
+        assert_eq!(at(0x40).as_deref(), Some("src/game.sq:12:5"));
+        assert_eq!(at(0x47).as_deref(), Some("src/game.sq:12:5"));
+        assert_eq!(at(0x48).as_deref(), Some("src/game.sq:14:6"));
+        assert_eq!(at(0x50).as_deref(), Some("src/ink.sq:3:3"));
         assert_eq!(at(0x60), None, "unmapped from there");
     }
 
@@ -513,7 +513,7 @@ pub(crate) mod tests {
         assert_eq!(vlq("2H").unwrap(), [123]);
         assert!(vlq("g").is_err(), "cut off");
         assert_eq!(base64(&encode_base64(b"pen")).unwrap(), b"pen");
-        assert_eq!(base64(&encode_base64(b"blot2")).unwrap(), b"blot2");
+        assert_eq!(base64(&encode_base64(b"squid-lang")).unwrap(), b"squid-lang");
         assert!(base64("a$").is_err());
     }
 
@@ -528,12 +528,12 @@ pub(crate) mod tests {
 
     #[test]
     fn backtraces_name_functions_and_places() {
-        let map = r#"{"version":3,"sources":["src/game.blot"],"names":[],"mappings":"gEAWI"}"#;
+        let map = r#"{"version":3,"sources":["src/game.sq"],"names":[],"mappings":"gEAWI"}"#;
         let symbols = Symbols::read(&module(&[names("main", &[(3, "game.update")]), source_map(map)]));
         let frames = [Frame { function: 3, offset: Some(0x42) }, Frame { function: 7, offset: None }];
         assert_eq!(
             symbols.backtrace(&frames).to_string(),
-            "guest backtrace:\n    0:     0x42 - game.update\n                at src/game.blot:12:5\n    1: <wasm function 7>"
+            "guest backtrace:\n    0:     0x42 - game.update\n                at src/game.sq:12:5\n    1: <wasm function 7>"
         );
     }
 

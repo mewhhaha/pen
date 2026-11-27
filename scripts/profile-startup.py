@@ -159,7 +159,7 @@ def main():
     compiler_pins, library_pins = {}, {}
     for root in projects.values():
         config = json.loads((root / "pen.json").read_text())
-        compiler = Path(config["plugins"]["blot"]["run"]["blotc"]).resolve()
+        compiler = Path(config["plugins"]["squid"]["run"]["squidc"]).resolve()
         compiler_pins[str(compiler)] = digest(compiler)
         library = Path(config["compiler"]["settings"]["std"]).resolve()
         library_pins[str(library)] = tree_pins(library)
@@ -169,7 +169,7 @@ def main():
               "platform": platform.platform(), "load_start": os.getloadavg(), "source_pins": pins, "interval_ms": args.interval_ms,
               "compiler_pins": compiler_pins, "library_pins": library_pins, "plugin_pins": plugin_pins, "host_pins": host_pins,
               "affinity": sorted(os.sched_getaffinity(0)), "cpu_count": os.cpu_count(),
-              "environment": {key: os.environ.get(key) for key in ("BLOT_INLINING", "RAYON_NUM_THREADS")},
+              "environment": {key: os.environ.get(key) for key in ("SQUID_INLINING", "RAYON_NUM_THREADS")},
               "scope": __doc__, "ignored_project_roots": ignored_project_roots, "runs": args.runs, "frames": args.frames, "samples": []}
     for name in ("cpu.max", "memory.max"):
         path = Path('/sys/fs/cgroup') / name

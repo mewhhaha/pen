@@ -1,0 +1,211 @@
+//! The component: wit/pen-plugin.wit's `compiler` over [`crate::Session`],
+//! whose compiler runs as pen's `process.child`, and its `tests` over
+//! [`crate::find_tests`], which reads through pen's `files`.
+use std::cell::RefCell;
+
+use crate::{Build, Expectation, Overlay, Program};
+
+wit_bindgen::generate!({ path: "../../wit", world: "compiler-plugin" });
+
+use exports::pen::plugin::codegen;
+use exports::pen::plugin::compiler::{self, BuildResult, GuestSession};
+use exports::pen::plugin::tests;
+use pen::plugin::log::{self, Level};
+use pen::plugin::{files, guest, process, types};
+
+struct Plugin;
+
+export!(Plugin);
+
+impl compiler::Guest for Plugin {
+    type Session = Compiler;
+}
+
+impl codegen::Guest for Plugin {
+    fn generate(
+        schema_json: String,
+        extensions_json: String,
+        _settings: String,
+    ) -> Result<codegen::Generation, String> {
+        let emitted = crate::generate_bindings(&schema_json, &extensions_json)?;
+        Ok(codegen::Generation {
+            files: emitted
+                .files
+                .into_iter()
+                .map(|(path, contents)| codegen::GeneratedFile { path, contents })
+                .collect(),
+            remove: emitted.remove,
+        })
+    }
+}
+
+/// The checkout's files, through what pen.json grants the plugin.
+struct Granted;
+
+impl crate::Files for Granted {
+    fn read(&mut self, path: &str) -> Result<Vec<u8>, String> {
+        files::read(path)
+    }
+
+    fn read_directory(&mut self, directory: &str) -> Result<Vec<String>, String> {
+        files::read_directory(directory)
+    }
+
+    fn is_file(&mut self, path: &str) -> bool {
+        files::is_file(path)
+    }
+
+    fn canonical(&mut self, path: &str) -> Result<String, String> {
+        files::canonical(path)
+    }
+}
+
+/// Runs pure, zero-import Stage-0 Squid ABI 8 modules through pen's `guest` import.
+struct HostGuest;
+
+impl crate::GuestRunner for HostGuest {
+    fn run_u32_packet(
+        &mut self,
+        wasm: &[u8],
+        export_name: &str,
+        input: &[u32],
+    ) -> Result<Vec<u32>, crate::GuestCallError> {
+        guest::run_u32_packet(wasm, export_name, input).map_err(|error| match error {
+            guest::CallError::Invalid(message) => crate::GuestCallError::Invalid(message),
+            guest::CallError::Trapped((message, trap)) => crate::GuestCallError::Trapped(
+                message,
+                trap.map(|info| crate::GuestTrapInfo {
+                    kind: info.kind,
+                    message: info.message,
+                    unit: info.unit,
+                    start: info.start,
+                    end: info.end,
+                }),
+            ),
+            guest::CallError::Timeout => crate::GuestCallError::Timeout,
+        })
+    }
+}
+
+impl tests::Guest for Plugin {
+    fn find(
+        program: types::Program,
+        paths: Vec<String>,
+        filter: Option<String>,
+    ) -> Result<Vec<tests::TestModule>, String> {
+        let program = Program { root: program.root, entry: program.entry, settings: program.settings };
+        let modules = crate::find_tests(&program, &paths, filter.as_deref(), &mut Granted)?;
+        Ok(modules
+            .into_iter()
+            .map(|module| tests::TestModule {
+                path: module.path,
+                entry: module.entry,
+                overlays: module
+                    .overlays
+                    .into_iter()
+                    .map(|overlay| types::Overlay { path: overlay.path, contents: overlay.contents })
+                    .collect(),
+                prefix: module.prefix,
+                expect: match module.expect {
+                    Expectation::Checks => tests::Expectation::Checks,
+                    Expectation::Traps => tests::Expectation::Traps,
+                    Expectation::Rejected(text) => tests::Expectation::Rejected(text),
+                },
+            })
+            .collect())
+    }
+}
+
+/// pen's child process, as the client's.
+struct Process(process::Child);
+
+impl crate::Child for Process {
+    fn write(&mut self, bytes: &[u8]) -> Result<(), String> {
+        self.0.write(bytes)
+    }
+
+    fn close_input(&mut self) {
+        self.0.close_input();
+    }
+
+    fn read(&mut self, max: u32, timeout_ms: Option<u32>) -> Result<Vec<u8>, crate::ReadError> {
+        self.0.read(max, timeout_ms).map_err(|error| match error {
+            process::ReadError::Closed => crate::ReadError::Closed,
+            process::ReadError::Timeout => crate::ReadError::Timeout,
+            process::ReadError::Other(error) => crate::ReadError::Other(error),
+        })
+    }
+
+    fn error_tail(&mut self) -> String {
+        self.0.error_tail()
+    }
+
+    fn wait(&mut self, timeout_ms: Option<u32>) -> Option<i32> {
+        self.0.wait(timeout_ms)
+    }
+
+    fn kill(&mut self) {
+        self.0.kill();
+    }
+}
+
+/// A session: pen calls it through shared references.
+struct Compiler(RefCell<crate::Session<Process>>);
+
+impl GuestSession for Compiler {
+    fn open(program: types::Program) -> Result<compiler::Session, String> {
+        let mut settings_json = program.settings;
+        if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&settings_json)
+            && let Some(obj) = value.as_object_mut()
+            && let Some(std_raw) = obj.get("std").and_then(|v| v.as_str())
+        {
+            let resolved = crate::settings::resolve(&program.root, std_raw);
+            if let Ok(canonical) = files::canonical(&resolved) {
+                obj.insert("std".to_owned(), serde_json::Value::String(canonical));
+                if let Ok(updated) = serde_json::to_string(&value) {
+                    settings_json = updated;
+                }
+            }
+        }
+        let program = Program { root: program.root, entry: program.entry, settings: settings_json };
+        let session = crate::Session::open(&program, &process::cache_directory(), |name, args, env| {
+            process::spawn(name, args, env).map(Process)
+        })?;
+        log::write(Level::Info, &format!("Squid compiler {} opened {}", session.identity(), session.entry()));
+        Ok(compiler::Session::new(Compiler(RefCell::new(session))))
+    }
+
+    fn build(&self, overlays: Vec<types::Overlay>) -> Result<BuildResult, String> {
+        let overlays: Vec<Overlay> =
+            overlays.into_iter().map(|overlay| Overlay { path: overlay.path, contents: overlay.contents }).collect();
+        let mut spawn =
+            |name: &str, args: &[String], env: &[(String, String)]| process::spawn(name, args, env).map(Process);
+        Ok(match self.0.borrow_mut().build_with_host(&overlays, &mut Granted, &mut HostGuest, &mut spawn)? {
+            Build::Built(wasm) => BuildResult::Built(wasm),
+            Build::Rejected(diagnostics) => BuildResult::Rejected(
+                diagnostics
+                    .into_iter()
+                    .map(|diagnostic| types::Diagnostic {
+                        file: diagnostic.file,
+                        stage: diagnostic.stage,
+                        code: diagnostic.code,
+                        start: diagnostic.start,
+                        end: diagnostic.end,
+                        message: diagnostic.message,
+                        details: diagnostic.details,
+                        fix: diagnostic.fix,
+                        doc: diagnostic.doc,
+                    })
+                    .collect(),
+            ),
+        })
+    }
+
+    fn watched(&self) -> Vec<String> {
+        self.0.borrow().watched().to_vec()
+    }
+
+    fn close(&self) -> Result<(), String> {
+        self.0.borrow_mut().close()
+    }
+}

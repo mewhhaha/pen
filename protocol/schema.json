@@ -347,7 +347,7 @@
     {
       "name": "TestDriverOp",
       "constant": "TEST_DRIVER_OP",
-      "doc": "Version-1 native session test commands. Available only to a separate test guest in pen test-blot --session.",
+      "doc": "Version-1 native session test commands. Available only to a separate test guest in pen test-squid --session.",
       "values": [
         "launch",
         "step",
@@ -1615,7 +1615,7 @@
       {
         "tag": 100,
         "name": "Game",
-        "doc": "One of the game's own events, which its pen.json `protocol` declares: its tag there, and up to three values. Hosts send them only to a game that declares them, whose generated pen/extensions.blot decodes them; pen's own bindings leave them out.",
+        "doc": "One of the game's own events, which its pen.json `protocol` declares: its tag there, and up to three values. Hosts send them only to a game that declares them, whose generated pen/extensions.sq decodes them; pen's own bindings leave them out.",
         "game": true,
         "fields": {
           "event": {

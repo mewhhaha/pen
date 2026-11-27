@@ -12,7 +12,7 @@ built for. `pen new` makes the smallest checkout that has all of it.
 
 pen takes a directory as a checkout when it has `pen.json` and either its
 configured `compiler.entry` (e.g. `"compiler": { "plugin": "rust", "entry":
-"Cargo.toml" }`) or `src/main.blot` (`--project DIR` names one; otherwise the
+"Cargo.toml" }`) or `src/main.sq` (`--project DIR` names one; otherwise the
 current directory or one above it). Prebuilt bundles (`game.wasm` + `assets/`)
 need no checkout or plugin at all: `pen --game DIR`, `pen build --game DIR`,
 and `pen build --web --game DIR` run, package, and export them directly.
@@ -20,13 +20,13 @@ and `pen build --web --game DIR` run, package, and export them directly.
 | File                          | Needed | What pen does with it                                                                                                                                                                                                                                                                                                     |
 | ----------------------------- | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `pen.json`                    | yes    | `game`: the name (data directory, executable) and title (window, assistive technology), else the directory's name. `plugins` and `compiler`: the compiler plugin that builds the game (`entry`, optional `devtools`, `settings`) and what it may read and run. `protocol`: the game's own events and sections ([the game's own events and sections](extensions.md)). `web`: optional browser export `mode` (`"2d"` / `"3d"`) or `features`. |
-| `compiler.entry` (`src/main.blot`) | yes | The program's entry, compiled by the chosen plugin into `.pen/runtime/game.wasm`.                                                                                                                                                                                                                                         |
+| `compiler.entry` (`src/main.sq`) | yes | The program's entry, compiled by the chosen plugin into `.pen/runtime/game.wasm`.                                                                                                                                                                                                                                         |
 | `src/assets/catalog.json`     | yes    | The meshes, materials and sounds the game names by index. Each list may be empty. `pen build` ships what the catalog reaches.                                                                                                                                                                                             |
 | `src/main.scene`              | no     | A saved scene the game starts from, if the program keeps scenes.                                                                                                                                                                                                                                                          |
 | `src/tunables.json`           | no     | Live-tunable constants, for `tune=` steps and the dev tools.                                                                                                                                                                                                                                                              |
-| `compiler.devtools` (`devtools/main.blot`) | no | A second program pen runs over the game as its dev tools. Without one there are none.                                                                                                                                                                                                                                     |
+| `compiler.devtools` (`devtools/main.sq`) | no | A second program pen runs over the game as its dev tools. Without one there are none.                                                                                                                                                                                                                                     |
 | `pipeline.json`               | no     | Asset recipes `pen dev` reruns as their sources change, run through `just` in the checkout.                                                                                                                                                                                                                               |
-| `tests/*`                     | no     | `pen test-guest` (alias `pen test-blot`) test modules, as the checkout's compiler plugin lays them out.                                                                                                                                                                                                                   |
+| `tests/*`                     | no     | `pen test-guest` (alias `pen test-squid`) test modules, as the checkout's compiler plugin lays them out.                                                                                                                                                                                                                   |
 | `tests/visual/scenarios.json` | no     | `pen test`'s golden-image scenarios.                                                                                                                                                                                                                                                                                      |
 
 pen keeps what it makes under `.pen/` (builds, packages, shots, test output). It
@@ -46,8 +46,8 @@ A game is a WebAssembly module speaking either:
    `pen:reset: (i32) -> i32`. Mods export `frame: (i32) -> i32`,
    `pen:allocate`, and `memory` with zero imports. See
    [examples/rust-guest](../examples/rust-guest/README.md).
-2. **Blot's guest ABI** (`blot:abi` custom section): exports `main`, which
-   takes the host capability (`externref`, `blot:host/1::call_array_f32_array_f32`)
+2. **Squid's guest ABI** (`squid:abi` custom section): exports `main`, which
+   takes the host capability (`externref`, `squid:host/1::call_array_f32_array_f32`)
    and returns `Unit`.
 
 `main` runs for as long as the game does. Each call to the host hands it a
@@ -84,7 +84,7 @@ The state payload and restore response are opaque by default. Optional
 application opts in through `src/assets/saved.json`. Pen does not infer Ink from
 a save's contents.
 
-The owned-storage loop in `ink/lib/pen/program.blot` takes explicit execution
+The owned-storage loop in `ink/lib/pen/program.sq` takes explicit execution
 and acknowledgement callbacks, access aliases and caller-owned incoming/outgoing
 buffers. It encodes before invocation-local owners close and copies numeric
 packets at the host boundary. Consult the current generated bindings and source
@@ -93,8 +93,8 @@ rather than restoring old `serve`/snapshot-world adapters.
 ## The packets
 
 pen's protocol is `protocol/schema.json`; `pen codegen` writes it into a
-checkout as Blot (`pen/protocol.blot`, `pen/types.blot`,
-`pen/protocol_render.blot`) and into pen as Rust.
+checkout as Squid (`pen/protocol.sq`, `pen/types.sq`,
+`pen/protocol_render.sq`) and into pen as Rust.
 
 - **Input**, each frame: the seconds since the last frame, the viewport's width
   and height, the events (keys by code, the pointer, the wheel, focus lost,
@@ -107,10 +107,10 @@ checkout as Blot (`pen/protocol.blot`, `pen/types.blot`,
   sections. Header flags ask pen to save, load, record a checkpoint for undo, or
   stop.
 
-`pen/frame.blot`'s `header` supplies fixed render defaults, lit from above.
+`pen/frame.sq`'s `header` supplies fixed render defaults, lit from above.
 A game supplies borrowed source pools to `encode_render_views`, or flat mesh
 draws and sounds to `encode_mesh_frame`, and the output packet buffer, which the
-encoder takes over (`own`) and returns. Keys arrive as codes: `pen/protocol.blot`
+encoder takes over (`own`) and returns. Keys arrive as codes: `pen/protocol.sq`
 names the named ones (`key_arrow_left`, `key_f1`...), and a key that types a
 character carries its code point (a letter, its capital's).
 
@@ -134,12 +134,12 @@ Taken away by this work:
 - **Preferences were exactly 14 numbers**, gdev's settings. A game now stores as
   many as it keeps, up to 256.
 - **Named keys were the ones gdev used** (F2, F6, F9, F10 but no other function
-  keys). F1 to F12 and Insert now travel, and the Blot bindings name every key's
+  keys). F1 to F12 and Insert now travel, and the Squid bindings name every key's
   code, which Ink kept a copy of by hand.
-- **The program loop lived in Ink** (`ink/lib/pen/program.blot`), with pen's
+- **The program loop lived in Ink** (`ink/lib/pen/program.sq`), with pen's
   operation numbers written out again. pen now generates it
-  (`pen/program.blot`), with a blank frame to start from (`pen/frame.blot`) and
-  the checks `pen test-blot` reads (`pen/check.blot`, which gdev keeps its own
+  (`pen/program.sq`), with a blank frame to start from (`pen/frame.sq`) and
+  the checks `pen test-squid` reads (`pen/check.sq`, which gdev keeps its own
   copy of). A game needs neither gdev nor Ink.
 - **A packet a game needed meant a change to pen's protocol.** A game now
   declares its own events and sections in its `pen.json`
@@ -157,7 +157,7 @@ Taken away by this work:
 Still there, for another lane or another day:
 
 - **The dev tools are the checkout's own program.** pen draws none of its own;
-  gdev's are a Blot program built on Ink and gdev's font, so a new game has no
+  gdev's are a Squid program built on Ink and gdev's font, so a new game has no
   console, diagnostics or timeline panel until it writes or borrows one. Time
   travel's keys, scripts and `pen packets` work without them.
 - **Numbers that spell gdev.** The render packet's magic is 0x474446 ("GDF"),
@@ -173,5 +173,5 @@ Still there, for another lane or another day:
   opens at, scaled to the viewport.
 - **Asset recipes run through `just`.** `pipeline.json` names recipes in the
   checkout's Justfile; a game without one has no recipes.
-- **The guest ABI is Blot's.** A module must carry Blot's `blot:abi` section;
-  another language writes it as Blot's compiler does.
+- **The guest ABI is Squid's.** A module must carry Squid's `squid:abi` section;
+  another language writes it as Squid's compiler does.

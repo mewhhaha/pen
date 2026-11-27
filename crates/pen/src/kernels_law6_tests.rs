@@ -1,32 +1,32 @@
 //! Phase 5 Law #6 integration tests (`tasks/CONCURRENCY_VNEXT.md:706`):
 //! Exercises ALL NINE mandatory Law #6 witnesses (a)-(i) against real compiled
-//! Blot guests, real `ink/services` + `ink/kernel_transport` + `ink/pen/host`,
+//! Squid guests, real `ink/services` + `ink/kernel_transport` + `ink/pen/host`,
 //! real `gdev/src/world/colony_paths` + `#kernel const plan_routes`, real
 //! `KernelService` (`KernelPool`), real `canonical_render_packet`, and real
 //! `pen_runtime::mods::splice`.
 
 use super::*;
 use crate::program::{Operation, Program};
-use blot_host::{GuestModule, engine};
 use pen_protocol::boundary::{MAX_EVENTS, canonical_render_packet, decode_frame, encode_frame, parse_catalog};
 use pen_protocol::{Catalog, Frame, GameEvent, ServiceRequest, Viewport, kernel_op, service, service_status};
 use pen_runtime::game::hash_render_packet;
 use pen_runtime::mods;
+use squid_host::{GuestModule, engine};
 use std::path::PathBuf;
 
 fn repo_paths() -> (PathBuf, PathBuf, PathBuf, PathBuf) {
     let pen = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let blot2 = pen.join("../blot2");
+    let squid_lang = pen.join("../squid-lang");
     let ink = pen.join("../ink");
     let gdev = pen.join("../gdev");
-    (blot2, pen, ink, gdev)
+    (squid_lang, pen, ink, gdev)
 }
 
-fn compile_blot_project(entry: &std::path::Path, extra_aliases: &[(&str, &std::path::Path)]) -> Vec<u8> {
-    let (blot2, _, ink, gdev) = repo_paths();
-    let blotc = blot2.join("compiler-goose/build/blotc-goose");
-    let prelude = blot2.join("std/prelude.blot");
-    let std_root = blot2.join("std").canonicalize().unwrap();
+fn compile_squid_project(entry: &std::path::Path, extra_aliases: &[(&str, &std::path::Path)]) -> Vec<u8> {
+    let (squid_lang, _, ink, gdev) = repo_paths();
+    let squidc = squid_lang.join("compiler-goose/build/squidc-goose");
+    let prelude = squid_lang.join("std/prelude.sq");
+    let std_root = squid_lang.join("std").canonicalize().unwrap();
     let ink_lib = ink.join("lib").canonicalize().unwrap();
     let gdev_pen = gdev.join("pen").canonicalize().unwrap();
     let gdev_src = gdev.join("src").canonicalize().unwrap();
@@ -35,7 +35,7 @@ fn compile_blot_project(entry: &std::path::Path, extra_aliases: &[(&str, &std::p
         std::process::id(),
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
     ));
-    let mut cmd = std::process::Command::new(&blotc);
+    let mut cmd = std::process::Command::new(&squidc);
     cmd.args([
         "build-project",
         entry.to_str().unwrap(),
@@ -54,10 +54,10 @@ fn compile_blot_project(entry: &std::path::Path, extra_aliases: &[(&str, &std::p
     for (prefix, root) in extra_aliases {
         cmd.args(["--alias", &format!("{prefix}={}", root.canonicalize().unwrap().display())]);
     }
-    let output = cmd.output().expect("spawn blotc-goose");
+    let output = cmd.output().expect("spawn squidc-goose");
     assert!(
         output.status.success(),
-        "blotc-goose build-project failed for {}:\nstdout: {}\nstderr: {}",
+        "squidc-goose build-project failed for {}:\nstdout: {}\nstderr: {}",
         entry.display(),
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
@@ -119,7 +119,7 @@ fn validate_old_pen_render_packet(packet: &[f32], catalog: &Catalog) -> Result<V
     Ok(decoded.render.services)
 }
 
-/// Shared Session-2 Blot guest wired directly to real `game/world/colony_paths`,
+/// Shared Session-2 Squid guest wired directly to real `game/world/colony_paths`,
 /// `ink/kernel_transport`, `ink/services`, `ink/pen/host`, and `#kernel const plan_routes`
 /// (with Save Schema 26 persistence and optional immutable pool initializer for Law #6e).
 fn write_law6_session_guest(dir: &std::path::Path, name: &str, pool_bias: f32) -> PathBuf {
@@ -519,17 +519,20 @@ fn drive_session_frames(
 }
 
 fn has_sibling_checkouts() -> bool {
-    let (blot2, _, ink, gdev) = repo_paths();
-    let blotc =
-        std::env::var_os("BLOTC").map(PathBuf::from).unwrap_or_else(|| blot2.join("compiler-goose/build/blotc-goose"));
-    if blotc.is_file()
-        && blot2.join("std/prelude.blot").is_file()
+    let (squid_lang, _, ink, gdev) = repo_paths();
+    let squidc = std::env::var_os("SQUIDC")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| squid_lang.join("compiler-goose/build/squidc-goose"));
+    if squidc.is_file()
+        && squid_lang.join("std/prelude.sq").is_file()
         && ink.join("lib").is_dir()
         && gdev.join("src").is_dir()
     {
         return true;
     }
-    crate::fixtures::missing("Law #6 kernel integration tests need blotc-goose and sibling blot2/ink/gdev checkouts");
+    crate::fixtures::missing(
+        "Law #6 kernel integration tests need squidc-goose and sibling squid-lang/ink/gdev checkouts",
+    );
     false
 }
 
@@ -545,10 +548,10 @@ fn law6_end_to_end_replay_old_pen_moment_hot_reload_mods_and_equivalence() {
     }
     let dir = std::env::temp_dir().join(format!("pen-law6-suite-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let v1_path = write_law6_session_guest(&dir, "law6_v1.blot", 0.0);
-    let v2_path = write_law6_session_guest(&dir, "law6_v2.blot", 1.0);
-    let v1_wasm = compile_blot_project(&v1_path, &[]);
-    let v2_wasm = compile_blot_project(&v2_path, &[]);
+    let v1_path = write_law6_session_guest(&dir, "law6_v1.sq", 0.0);
+    let v2_path = write_law6_session_guest(&dir, "law6_v2.sq", 1.0);
+    let v1_wasm = compile_squid_project(&v1_path, &[]);
+    let v2_wasm = compile_squid_project(&v2_path, &[]);
 
     let eng = engine().unwrap();
     let mod_v1 = GuestModule::new(&eng, &v1_wasm, None).unwrap();
@@ -775,7 +778,7 @@ fn gdev_main_wasm_plan_routes_kernel_runs_deterministically_across_worker_counts
     let project = crate::project::Project::find(Some(gdev.clone())).unwrap();
     let out_dir = std::env::temp_dir().join(format!("pen-law6-gdev-main-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&out_dir);
-    project.compile(&out_dir).expect("compile real gdev/src/main.blot through Pen project pipeline");
+    project.compile(&out_dir).expect("compile real gdev/src/main.sq through Pen project pipeline");
     let wasm = std::fs::read(out_dir.join("game.wasm")).unwrap();
     let _ = std::fs::remove_dir_all(&out_dir);
     let eng = engine().unwrap();
@@ -787,7 +790,7 @@ fn gdev_main_wasm_plan_routes_kernel_runs_deterministically_across_worker_counts
         .kernels
         .iter()
         .find(|k| k.name == "plan_routes")
-        .expect("gdev/src/main.blot must declare #kernel const plan_routes");
+        .expect("gdev/src/main.sq must declare #kernel const plan_routes");
 
     // Canonical WireCtx with a central wall & round obstacle.
     let wire_ctx: Vec<f32> = vec![

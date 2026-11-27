@@ -1,11 +1,11 @@
 // CPU qualification of the scaffold and Bounce; no renderer or desktop window.
-// Build pen-codegen first. BLOTC and PEN_CODEGEN may select matching candidates.
+// Build pen-codegen first. SQUIDC and PEN_CODEGEN may select matching candidates.
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createZigProjectCompiler } from "../../blot2/host/zig_project_client.ts";
-import { instantiateGuest } from "../../blot2/host/guest.ts";
+import { createZigProjectCompiler } from "../../squid-lang/host/zig_project_client.ts";
+import { instantiateGuest } from "../../squid-lang/host/guest.ts";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const blot = resolve(root, "../blot2");
+const squid = resolve(root, "../squid-lang");
 await Deno.mkdir(resolve(root, "target"), { recursive: true });
 const work = await Deno.makeTempDir({
   dir: resolve(root, "target"),
@@ -40,19 +40,19 @@ for (
 ) {
   const tests: string[] = [];
   for await (const entry of Deno.readDir(resolve(project, "tests"))) {
-    if (entry.isFile && entry.name.endsWith(".blot")) tests.push(entry.name);
+    if (entry.isFile && entry.name.endsWith(".sq")) tests.push(entry.name);
   }
   tests.sort();
   const imports: Record<string, string> = { "pen/": resolve(project, "pen") + "/" };
   if (needsInk) imports["ink/"] = inkLib + "/";
   for (const test of [...tests, null]) {
-    const fixture = resolve(project, "src/test_fixture.blot");
+    const fixture = resolve(project, "src/test_fixture.sq");
     const compiler = await createZigProjectCompiler({
-      executable: Deno.env.get("BLOTC") ??
-        resolve(blot, "compiler-goose/build/blotc-goose"),
-      entry: test ? fixture : resolve(project, "src/main.blot"),
-      prelude: resolve(blot, "std/prelude.blot"),
-      stdRoot: resolve(blot, "std"),
+      executable: Deno.env.get("SQUIDC") ??
+        resolve(squid, "compiler-goose/build/squidc-goose"),
+      entry: test ? fixture : resolve(project, "src/main.sq"),
+      prelude: resolve(squid, "std/prelude.sq"),
+      stdRoot: resolve(squid, "std"),
       imports,
       nativeAssets: { roots: [resolve(project, "src")] },
       cacheDirectory: false,

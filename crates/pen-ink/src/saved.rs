@@ -3,7 +3,7 @@
 //! version by version, as typed fields, and the host brings a section saved
 //! with an older layout to the build's when the game's own code cannot.
 //!
-//! A state is the save format of ink's `persist.blot` (gdev's README,
+//! A state is the save format of ink's `persist.sq` (gdev's README,
 //! "Saved state"): `magic, schema, section_count`, then per saved type `key,
 //! version, width, length` and its lanes. Restoring, the game says what it
 //! made of each section (the restore report, `report.rs`); a section it had

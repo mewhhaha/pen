@@ -1,7 +1,7 @@
-//! The Blot a game needs besides its packets' codecs: the program loop pen
-//! runs it through (`program.blot`), a fixed render header for it to
-//! start from (`frame.blot`) and the checks its tests report to `pen
-//! test-blot` (`check.blot`), so that a game builds on pen's bindings
+//! The Squid a game needs besides its packets' codecs: the program loop pen
+//! runs it through (`program.sq`), a fixed render header for it to
+//! start from (`frame.sq`) and the checks its tests report to `pen
+//! test-squid` (`check.sq`), so that a game builds on pen's bindings
 //! alone.
 use crate::model::*;
 use serde_json::Value;
@@ -11,12 +11,12 @@ use serde_json::Value;
 pub const PROGRAM_MAGIC: u32 = 4_670_544;
 pub const PROGRAM_VERSION: u32 = 2;
 
-const PROGRAM: &str = include_str!("program.blot");
-const CHECK: &str = include_str!("check.blot");
+const PROGRAM: &str = include_str!("program.sq");
+const CHECK: &str = include_str!("check.sq");
 
 /// The session driver's library uses operation codes generated from the schema.
 pub fn testing(header: &[String]) -> String {
-    under(header, include_str!("testing.blot"))
+    under(header, include_str!("testing.sq"))
 }
 
 fn under(header: &[String], body: &str) -> String {
@@ -26,20 +26,20 @@ fn under(header: &[String], body: &str) -> String {
     out.join("\n")
 }
 
-/// `program.blot` under `header`'s lines.
+/// `program.sq` under `header`'s lines.
 pub fn program(header: &[String]) -> String {
     let body =
         PROGRAM.replace("${MAGIC}", &PROGRAM_MAGIC.to_string()).replace("${VERSION}", &PROGRAM_VERSION.to_string());
     under(header, &body)
 }
 
-/// `check.blot`, the checks of `pen test-blot`'s report format, under
+/// `check.sq`, the checks of `pen test-squid`'s report format, under
 /// `header`'s lines.
 pub fn check(header: &[String]) -> String {
     under(header, CHECK)
 }
 
-/// A Blot F32 literal; a negative one in parentheses.
+/// A Squid F32 literal; a negative one in parentheses.
 fn float(value: f64) -> String {
     let text = if value.fract() == 0.0 { format!("{value:.1}") } else { value.to_string() };
     if value < 0.0 { format!("({text})") } else { text }
@@ -76,7 +76,7 @@ fn blank(field: &Value) -> String {
     }
 }
 
-/// `frame.blot`: the identity matrix and a fixed header with schema defaults.
+/// `frame.sq`: the identity matrix and a fixed header with schema defaults.
 pub fn frame(model: &Model, header: &[String]) -> String {
     let mut out = header.to_vec();
     out.extend(

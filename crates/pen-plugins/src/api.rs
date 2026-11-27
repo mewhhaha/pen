@@ -140,14 +140,14 @@ mod tests {
     fn components_name_the_version_they_were_built_for() {
         let host = format!("{PACKAGE}/log@{VERSION}");
         let names = |list: &[&str]| list.iter().map(|name| name.to_string()).collect::<Vec<_>>();
-        assert!(check_names("blot", ["wasi:io/streams@0.2.6", host.as_str()]).is_ok());
+        assert!(check_names("squid", ["wasi:io/streams@0.2.6", host.as_str()]).is_ok());
         let error =
-            |list: &[&str]| check_names("blot", names(list).iter().map(String::as_str)).unwrap_err().to_string();
+            |list: &[&str]| check_names("squid", names(list).iter().map(String::as_str)).unwrap_err().to_string();
         let old = error(&["pen:plugin/log@0.1.0", "pen:plugin/compiler@0.1.0"]);
         assert_eq!(
             old,
             format!(
-                "plugin blot was built for pen:plugin@0.1.0, and this pen hosts {VERSION}: rebuild it against \
+                "plugin squid was built for pen:plugin@0.1.0, and this pen hosts {VERSION}: rebuild it against \
                  wit/pen-plugin.wit (wit/CHANGELOG.md says what changed)"
             )
         );

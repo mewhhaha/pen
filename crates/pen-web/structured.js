@@ -1,4 +1,4 @@
-// ../blot2/host/cleanup_data.ts
+// ../squid-lang/host/cleanup_data.ts
 var keys = "id,tag,floating,reference,child,row_words,leaf_words,children,fields,variants,name";
 var tags = /* @__PURE__ */ new Set([
   "unit",
@@ -17,7 +17,7 @@ function fail() {
   throw new Error("Invalid closed cleanup data schema");
 }
 function readDataSchemas(module) {
-  const sections = WebAssembly.Module.customSections(module, "blot:cleanup_data");
+  const sections = WebAssembly.Module.customSections(module, "squid:cleanup_data");
   if (sections.length === 0) return void 0;
   if (sections.length !== 1 || sections[0].byteLength > 1048576) fail();
   const text = new TextDecoder("utf-8", {
@@ -415,7 +415,7 @@ function copyData(memory, nodes, root, word) {
   return copy(root, word, 0);
 }
 
-// ../blot2/host/resource_journal.ts
+// ../squid-lang/host/resource_journal.ts
 var ResourceTokens = class {
   #next = 1;
   #live = 0;
@@ -688,7 +688,7 @@ var ResourceJournal = class {
   }
 };
 
-// ../blot2/host/task_runtime.ts
+// ../squid-lang/host/task_runtime.ts
 var TaskError = class extends Error {
   code;
   constructor(code, message) {
@@ -1205,7 +1205,7 @@ var TaskRuntime = class {
   }
 };
 
-// ../blot2/host/task_guest.ts
+// ../squid-lang/host/task_guest.ts
 var taskImports = [
   [
     "open",
@@ -1275,12 +1275,12 @@ var taskImports = [
 ];
 function taskExports(count) {
   const names = [
-    "blot:task_context/create",
-    "blot:task_context/save",
-    "blot:task_context/restore",
-    "blot:task_context/drop",
-    "blot:task_retain",
-    "blot:task_release"
+    "squid:task_context/create",
+    "squid:task_context/save",
+    "squid:task_context/restore",
+    "squid:task_context/drop",
+    "squid:task_retain",
+    "squid:task_release"
   ];
   for (let id = 0; id < count; id++) {
     for (const role of [
@@ -1288,7 +1288,7 @@ function taskExports(count) {
       "move_captures",
       "move_result"
     ]) {
-      names.push(`blot:task_${role}/${id}`);
+      names.push(`squid:task_${role}/${id}`);
     }
   }
   return names;
@@ -1411,7 +1411,7 @@ var TaskGuest = class {
         const results = this.journal();
         resources.begin();
         results.begin();
-        const native = this.#call("blot:task_context/create", 1);
+        const native = this.#call("squid:task_context/create", 1);
         const entry = {
           native,
           group: group >>> 0,
@@ -1424,11 +1424,11 @@ var TaskGuest = class {
           capturesLive: true,
           closed: false
         };
-        this.#call("blot:task_retain", captures);
+        this.#call("squid:task_retain", captures);
         let moved = false;
         let published;
         try {
-          this.#move(parent.resources, resources, `blot:task_move_captures/${descriptor}`, captures);
+          this.#move(parent.resources, resources, `squid:task_move_captures/${descriptor}`, captures);
           moved = true;
           const id = this.#runtime.spawn(group >>> 0, {
             run: (context) => {
@@ -1437,13 +1437,13 @@ var TaskGuest = class {
               entry.entered = true;
               context.cleanup(() => this.#retire(entry));
               this.ownership.enter();
-              const fn = this.#hooks[`blot:task_start/${descriptor}`];
+              const fn = this.#hooks[`squid:task_start/${descriptor}`];
               const publish = (result) => {
                 this.#activate(entry);
                 try {
-                  this.#move(resources, results, `blot:task_move_result/${descriptor}`, result);
+                  this.#move(resources, results, `squid:task_move_result/${descriptor}`, result);
                 } catch (cause) {
-                  this.#call("blot:task_release", result);
+                  this.#call("squid:task_release", result);
                   throw cause;
                 }
                 return result >>> 0;
@@ -1462,7 +1462,7 @@ var TaskGuest = class {
             dropResult: (result) => {
               this.select(results);
               try {
-                this.#call("blot:task_release", result);
+                this.#call("squid:task_release", result);
                 this.cleanup(() => results.finish());
               } finally {
                 this.select(this.#owner().resources);
@@ -1477,7 +1477,7 @@ var TaskGuest = class {
         } catch (cause) {
           if (published !== void 0) this.#runtime.rollbackSpawn(published);
           if (moved) {
-            this.#move(resources, parent.resources, `blot:task_move_captures/${descriptor}`, captures);
+            this.#move(resources, parent.resources, `squid:task_move_captures/${descriptor}`, captures);
           }
           this.#retire(entry);
           throw cause;
@@ -1493,10 +1493,10 @@ var TaskGuest = class {
         const publish = (result2) => {
           this.#activate(owner);
           try {
-            this.#move(entry.results, owner.resources, `blot:task_move_result/${entry.descriptor}`, result2);
+            this.#move(entry.results, owner.resources, `squid:task_move_result/${entry.descriptor}`, result2);
           } catch (cause) {
             try {
-              this.#call("blot:task_release", result2);
+              this.#call("squid:task_release", result2);
             } finally {
               this.cleanup(() => entry.results.finish());
             }
@@ -1543,7 +1543,7 @@ var TaskGuest = class {
           try {
             for (let index = 0; index < count; index++) {
               const entry = entries[index];
-              this.#move(entry.results, owner.resources, `blot:task_move_result/${entry.descriptor}`, results[index]);
+              this.#move(entry.results, owner.resources, `squid:task_move_result/${entry.descriptor}`, results[index]);
               moved++;
             }
             for (const entry of entries) entry.results.finish();
@@ -1555,13 +1555,13 @@ var TaskGuest = class {
             for (let index = moved - 1; index >= 0; index--) {
               const entry = entries[index];
               try {
-                this.#move(owner.resources, entry.results, `blot:task_move_result/${entry.descriptor}`, results[index]);
+                this.#move(owner.resources, entry.results, `squid:task_move_result/${entry.descriptor}`, results[index]);
               } catch {
               }
             }
             for (let index = 0; index < count; index++) {
               try {
-                this.#call("blot:task_release", results[index]);
+                this.#call("squid:task_release", results[index]);
               } catch {
               }
               try {
@@ -1646,68 +1646,68 @@ var TaskGuest = class {
     };
     const signatures = [
       [
-        "blot:task_context/create",
+        "squid:task_context/create",
         1,
         true
       ],
       [
-        "blot:task_context/save",
+        "squid:task_context/save",
         1,
         true
       ],
       [
-        "blot:task_context/restore",
+        "squid:task_context/restore",
         1,
         true
       ],
       [
-        "blot:task_context/drop",
+        "squid:task_context/drop",
         1,
         true
       ],
       [
-        "blot:task_retain",
+        "squid:task_retain",
         1,
         false
       ],
       [
-        "blot:task_release",
+        "squid:task_release",
         1,
         false
       ]
     ];
     for (let id = 0; id < descriptors; id++) {
       signatures.push([
-        `blot:task_start/${id}`,
+        `squid:task_start/${id}`,
         1,
         true
       ]);
       signatures.push([
-        `blot:task_move_captures/${id}`,
+        `squid:task_move_captures/${id}`,
         1,
         false
       ]);
       signatures.push([
-        `blot:task_move_result/${id}`,
+        `squid:task_move_result/${id}`,
         1,
         false
       ]);
     }
     this.#hooks = typedTaskFunctions(exports, signatures);
-    this.#memory = exports["blot:memory"] instanceof WebAssembly.Memory ? exports["blot:memory"] : void 0;
+    this.#memory = exports["squid:memory"] instanceof WebAssembly.Memory ? exports["squid:memory"] : void 0;
   }
   #call(name, value) {
     return this.#hooks[name](value) >>> 0;
   }
   #activate(entry) {
     if (entry.closed) invalid("Task context has terminated");
-    this.#call("blot:task_context/restore", entry.native);
+    this.#call("squid:task_context/restore", entry.native);
     this.#active = entry;
     this.select(entry.resources);
   }
   begin(resources, asynchronous) {
     if (!this.#root) {
-      const native = this.#call("blot:task_context/create", 0);
+      const native = this.#call("squid:task_context/create", 0);
       this.#root = {
         id: 0,
         native,
@@ -1722,7 +1722,7 @@ var TaskGuest = class {
         closed: false
       };
       this.#entries.set(0, this.#root);
-      this.#call("blot:task_context/save", native);
+      this.#call("squid:task_context/save", native);
     }
     this.#active = this.#root;
     this.select(resources);
@@ -1790,14 +1790,14 @@ var TaskGuest = class {
       if (entry.capturesLive) {
         entry.capturesLive = false;
         attempt(() => {
-          this.#call("blot:task_release", entry.captures);
+          this.#call("squid:task_release", entry.captures);
         });
       }
       attempt(() => this.cleanup(() => entry.resources.finish()));
       attempt(() => this.ownership.leave(Number(failed)));
       entry.entered = false;
       attempt(() => {
-        this.#call("blot:task_context/drop", entry.native);
+        this.#call("squid:task_context/drop", entry.native);
       });
       entry.closed = true;
       if (entry.id !== void 0) this.#entries.delete(entry.id);
@@ -1819,7 +1819,7 @@ var TaskGuest = class {
   dispose() {
     if (!this.#root) return;
     this.#activate(this.#root);
-    this.#call("blot:task_context/drop", this.#root.native);
+    this.#call("squid:task_context/drop", this.#root.native);
     this.#root.closed = true;
     this.#entries.clear();
     this.#handles.clear();
@@ -1835,18 +1835,108 @@ var TaskGuest = class {
   }
 };
 
-// ../blot2/host/guest.ts
+// ../squid-lang/host/guest.ts
 var littleEndian = new Uint8Array(new Uint32Array([
   1
 ]).buffer)[0] === 1;
+var DEFAULT_TRANSPORT_BUDGET = 2097152;
+var KERNEL_FLAG_HAS_CONTEXT = 1 << 0;
+var KERNEL_FLAG_VARIABLE_OUTPUT = 1 << 1;
+var TRAP_SITE_OFFSET = 772;
+var TypedArrayProto = Object.getPrototypeOf(Uint8Array.prototype);
+var TypedArrayPrototypeIndexOf = TypedArrayProto.indexOf;
+var TypedArrayPrototypeBuffer = Object.getOwnPropertyDescriptor(TypedArrayProto, "buffer").get;
+var TypedArrayPrototypeByteOffset = Object.getOwnPropertyDescriptor(TypedArrayProto, "byteOffset").get;
+var TypedArrayPrototypeByteLength = Object.getOwnPropertyDescriptor(TypedArrayProto, "byteLength").get;
+var DataViewPrototypeBuffer = Object.getOwnPropertyDescriptor(DataView.prototype, "buffer").get;
+var DataViewPrototypeByteOffset = Object.getOwnPropertyDescriptor(DataView.prototype, "byteOffset").get;
+var DataViewPrototypeByteLength = Object.getOwnPropertyDescriptor(DataView.prototype, "byteLength").get;
+var ArrayBufferPrototypeByteLength = Object.getOwnPropertyDescriptor(ArrayBuffer.prototype, "byteLength").get;
+var Uint8ArrayPrototypeSet = Uint8Array.prototype.set;
 var scalarTypes = [
   "Unit",
   "U32",
   "Bool",
-  "F32"
+  "F32",
+  "U8",
+  "I32",
+  "U64",
+  "I64",
+  "F64"
 ];
 function isArrayType(type) {
-  return type === "Array U32" || type === "Array F32";
+  return typeof type === "string" && type.startsWith("Array ");
+}
+function scalarTypeFromTag(tag) {
+  switch (tag) {
+    case 0:
+      return "Unit";
+    case 1:
+      return "U32";
+    case 2:
+      return "Bool";
+    case 3:
+      return "F32";
+    case 14:
+      return "U8";
+    case 15:
+      return "I32";
+    case 16:
+      return "U64";
+    case 17:
+      return "I64";
+    case 18:
+      return "F64";
+    default:
+      return void 0;
+  }
+}
+function arrayTypeFromTag(tag) {
+  switch (tag) {
+    case 5:
+      return "Array U32";
+    case 6:
+      return "Array F32";
+    case 19:
+      return "Array U8";
+    case 20:
+      return "Array I32";
+    case 21:
+      return "Array U64";
+    case 22:
+      return "Array I64";
+    case 23:
+      return "Array F64";
+    default:
+      return void 0;
+  }
+}
+function arrayElementBytes(type) {
+  switch (type) {
+    case "Array U8":
+      return 1;
+    case "Array U32":
+    case "Array I32":
+    case "Array F32":
+      return 4;
+    case "Array U64":
+    case "Array I64":
+    case "Array F64":
+      return 8;
+  }
+}
+function wasmValTypeCode(type) {
+  switch (type) {
+    case "F32":
+      return 125;
+    case "F64":
+      return 124;
+    case "U64":
+    case "I64":
+      return 126;
+    default:
+      return 127;
+  }
 }
 var ownerBrand = Symbol("GuestOwner");
 var dataTypeBrand = Symbol("CleanupDataType");
@@ -1860,6 +1950,123 @@ var GuestError = class extends Error {
     this.name = "GuestError";
   }
 };
+var guestTrapMap = /* @__PURE__ */ new WeakMap();
+function formatGuestTrap(entry) {
+  switch (entry.kind) {
+    case "panic":
+      return entry.message ? `panic: "${entry.message}"` : "panic";
+    case "bounds":
+      return entry.message || "index out of bounds";
+    case "unreachable":
+      return entry.message ? `unreachable: ${entry.message}` : "unreachable";
+  }
+}
+function readTrapMetadata(wasm) {
+  const module = wasm instanceof WebAssembly.Module ? wasm : new WebAssembly.Module(wasm);
+  const sections = WebAssembly.Module.customSections(module, "squid:traps");
+  if (sections.length === 0) return void 0;
+  if (sections.length > 1) {
+    throw new GuestError("invalid_abi", "Duplicate squid:traps section");
+  }
+  const bytes = new Uint8Array(sections[0]);
+  if (bytes.length < 5) {
+    throw new GuestError("invalid_abi", "Truncated squid:traps section");
+  }
+  const version = bytes[0];
+  if (version !== 1) {
+    throw new GuestError("invalid_abi", `Unsupported squid:traps version ${version}`);
+  }
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  const count = view.getUint32(1, true);
+  let offset = 5;
+  if (count > Math.floor((bytes.length - offset) / 17)) {
+    throw new GuestError("invalid_abi", "Truncated squid:traps entries");
+  }
+  const decoder = new TextDecoder("utf-8", {
+    fatal: true,
+    ignoreBOM: true
+  });
+  const entries = [];
+  for (let i = 0; i < count; i++) {
+    if (bytes.length - offset < 17) {
+      throw new GuestError("invalid_abi", "Truncated squid:traps entry");
+    }
+    const kindByte = bytes[offset++];
+    let kind;
+    if (kindByte === 1) kind = "panic";
+    else if (kindByte === 2) kind = "bounds";
+    else if (kindByte === 3) kind = "unreachable";
+    else {
+      throw new GuestError("invalid_abi", `Invalid squid:traps kind ${kindByte}`);
+    }
+    const unit = view.getUint32(offset, true);
+    offset += 4;
+    const start = view.getUint32(offset, true);
+    offset += 4;
+    const end = view.getUint32(offset, true);
+    offset += 4;
+    const messageLen = view.getUint32(offset, true);
+    offset += 4;
+    if (messageLen > bytes.length - offset) {
+      throw new GuestError("invalid_abi", "Truncated squid:traps message");
+    }
+    const messageBytes = bytes.subarray(offset, offset + messageLen);
+    offset += messageLen;
+    let message;
+    try {
+      message = decoder.decode(messageBytes);
+    } catch (cause) {
+      throw new GuestError("invalid_abi", "Invalid UTF-8 in squid:traps", {
+        cause
+      });
+    }
+    entries.push(Object.freeze({
+      kind,
+      unit,
+      start,
+      end,
+      message
+    }));
+  }
+  if (offset !== bytes.length) {
+    throw new GuestError("invalid_abi", "Trailing bytes in squid:traps section");
+  }
+  return Object.freeze(entries);
+}
+function enrichGuestTrap(error, trapTable, memory) {
+  if (!(error instanceof WebAssembly.RuntimeError) || !trapTable || trapTable.length === 0 || !(memory instanceof WebAssembly.Memory) || memory.buffer.byteLength < TRAP_SITE_OFFSET + 4) {
+    return error;
+  }
+  const trapId = new DataView(memory.buffer).getUint32(TRAP_SITE_OFFSET, true);
+  if (trapId < 1 || trapId > trapTable.length) return error;
+  const entry = trapTable[trapId - 1];
+  const info = Object.freeze({
+    ...entry,
+    id: trapId,
+    formatted: formatGuestTrap(entry)
+  });
+  const enriched = new WebAssembly.RuntimeError(`${info.formatted} (${error.message})`);
+  Object.defineProperty(enriched, "cause", {
+    value: error,
+    enumerable: false,
+    writable: true,
+    configurable: true
+  });
+  if (error.stack !== void 0) {
+    try {
+      enriched.stack = error.stack;
+    } catch {
+    }
+  }
+  Object.defineProperty(enriched, "squidTrap", {
+    value: info,
+    enumerable: false,
+    writable: false,
+    configurable: false
+  });
+  guestTrapMap.set(enriched, info);
+  return enriched;
+}
 var AbiReader = class {
   bytes;
   owners;
@@ -1875,7 +2082,7 @@ var AbiReader = class {
   }
   byte() {
     if (this.#offset === this.bytes.length) {
-      throw new GuestError("invalid_abi", "Truncated blot:abi section");
+      throw new GuestError("invalid_abi", "Truncated squid:abi section");
     }
     return this.bytes[this.#offset++];
   }
@@ -1890,12 +2097,12 @@ var AbiReader = class {
         return value;
       }
     }
-    throw new GuestError("invalid_abi", "Non-canonical U32 in blot:abi section");
+    throw new GuestError("invalid_abi", "Non-canonical U32 in squid:abi section");
   }
   name() {
     const length = this.count();
     if (length > this.bytes.length - this.#offset) {
-      throw new GuestError("invalid_abi", "Truncated export name in blot:abi");
+      throw new GuestError("invalid_abi", "Truncated export name in squid:abi");
     }
     const bytes = this.bytes.subarray(this.#offset, this.#offset + length);
     this.#offset += length;
@@ -1911,16 +2118,14 @@ var AbiReader = class {
     }
   }
   scalar(tag = this.byte()) {
-    const type = scalarTypes[tag];
+    const type = scalarTypeFromTag(tag);
     if (type === void 0) {
       throw new GuestError("invalid_abi", `Unknown scalar ABI tag ${tag}`);
     }
     return type;
   }
   value(tag = this.byte()) {
-    if (tag === 5) return "Array U32";
-    if (tag === 6) return "Array F32";
-    return this.scalar(tag);
+    return arrayTypeFromTag(tag) ?? this.scalar(tag);
   }
   publicValue(tag = this.byte()) {
     if (tag !== 8 && tag !== 9) return this.value(tag);
@@ -2001,20 +2206,227 @@ var AbiReader = class {
     }
     return this.publicValue(tag);
   }
+  u64Le() {
+    if (this.bytes.length - this.#offset < 8) {
+      throw new GuestError("invalid_abi", "Truncated u64 in custom section");
+    }
+    const view = new DataView(this.bytes.buffer, this.bytes.byteOffset + this.#offset, 8);
+    this.#offset += 8;
+    return view.getBigUint64(0, true);
+  }
   end() {
     if (this.#offset !== this.bytes.length) {
-      throw new GuestError("invalid_abi", "Trailing bytes in blot:abi section");
+      throw new GuestError("invalid_abi", "Trailing bytes in squid:abi section");
     }
   }
 };
+var wireSchemaKinds = [
+  "Unit",
+  "FlatFixed",
+  "VarU32",
+  "VarF32"
+];
+function valueTypeFromTag(tag) {
+  const type = arrayTypeFromTag(tag) ?? scalarTypeFromTag(tag);
+  if (type === void 0) {
+    throw new GuestError("invalid_abi", `Unknown value ABI tag ${tag}`);
+  }
+  return type;
+}
+function parseWireSchema(reader, transportBudget) {
+  const kindByte = reader.byte();
+  const kind = wireSchemaKinds[kindByte];
+  if (kind === void 0) {
+    throw new GuestError("invalid_abi", `Unknown wire schema kind ${kindByte}`);
+  }
+  const wireTagCode = reader.byte();
+  const wireTag = valueTypeFromTag(wireTagCode);
+  const stride = reader.count();
+  const wordTags = [];
+  if (kind === "Unit") {
+    if (wireTag !== "Unit" || stride !== 0) {
+      throw new GuestError("invalid_abi", "Malformed Unit wire schema");
+    }
+  } else if (kind === "FlatFixed") {
+    if (stride < 1 || stride * 4 + 4 > transportBudget) {
+      throw new GuestError("invalid_abi", `FlatFixed stride ${stride} exceeds transport budget ${transportBudget}`);
+    }
+    for (let i = 0; i < stride; i++) {
+      const tag = reader.scalar();
+      if (tag !== "U32" && tag !== "Bool" && tag !== "F32") {
+        throw new GuestError("invalid_abi", `FlatFixed word_tag must be U32, Bool, or F32, got ${tag}`);
+      }
+      wordTags.push(tag);
+    }
+    if (stride === 1) {
+      if (wireTag !== wordTags[0] && !isArrayType(wireTag)) {
+        throw new GuestError("invalid_abi", `1-word FlatFixed wire_tag ${wireTag} incompatible with ${wordTags[0]}`);
+      }
+    } else if (!isArrayType(wireTag)) {
+      throw new GuestError("invalid_abi", "Multi-word FlatFixed wire_tag must be an array");
+    }
+  } else if (kind === "VarU32") {
+    if (stride !== 0 || wireTag !== "Array U32") {
+      throw new GuestError("invalid_abi", "Malformed VarU32 wire schema");
+    }
+  } else if (kind === "VarF32") {
+    if (stride !== 0 || wireTag !== "Array U32" && wireTag !== "Array F32") {
+      throw new GuestError("invalid_abi", "Malformed VarF32 wire schema");
+    }
+  }
+  const schemaHash = reader.u64Le();
+  return Object.freeze({
+    kind,
+    wireTag,
+    wireTagCode,
+    stride,
+    wordTags: Object.freeze(wordTags),
+    schemaHash
+  });
+}
+function parseKernelsSection(payload, functionsByName) {
+  const reader = new AbiReader(payload);
+  const version = reader.count();
+  if (version !== 1) {
+    throw new GuestError("invalid_abi", `Unsupported squid:kernels version ${version}`);
+  }
+  const transportBudget = reader.count();
+  if (transportBudget < 8 || transportBudget % 4 !== 0) {
+    throw new GuestError("invalid_abi", `Invalid squid:kernels transport_budget ${transportBudget}`);
+  }
+  const count = reader.count();
+  const kernels = [];
+  const seen = /* @__PURE__ */ new Set();
+  for (let id = 0; id < count; id++) {
+    const name = reader.name();
+    if (seen.has(name)) {
+      throw new GuestError("invalid_abi", `Duplicate kernel ${name}`);
+    }
+    seen.add(name);
+    const flags = reader.byte();
+    if ((flags & ~3) !== 0) {
+      throw new GuestError("invalid_abi", `Kernel ${name} has unknown flags 0x${flags.toString(16)}`);
+    }
+    const hasContext = (flags & KERNEL_FLAG_HAS_CONTEXT) !== 0;
+    const variableOutput = (flags & KERNEL_FLAG_VARIABLE_OUTPUT) !== 0;
+    const inSchema = parseWireSchema(reader, transportBudget);
+    if (inSchema.kind !== "FlatFixed" || !isArrayType(inSchema.wireTag)) {
+      throw new GuestError("invalid_abi", `Kernel ${name} input must be FlatFixed array wire`);
+    }
+    const outSchema = parseWireSchema(reader, transportBudget);
+    if (variableOutput) {
+      if (outSchema.kind !== "VarU32" && outSchema.kind !== "VarF32" || outSchema.wireTag !== "Array U32") {
+        throw new GuestError("invalid_abi", `Variable-output kernel ${name} must have VarU32/VarF32 schema with Array U32 wire`);
+      }
+    } else if (outSchema.kind !== "FlatFixed" || !isArrayType(outSchema.wireTag)) {
+      throw new GuestError("invalid_abi", `Fixed-output kernel ${name} must have FlatFixed array wire`);
+    }
+    const entry = functionsByName.get(name);
+    if (!entry || entry.parameter !== inSchema.wireTag || entry.result !== outSchema.wireTag) {
+      throw new GuestError("invalid_abi", `Kernel ${name} signature mismatch against squid:abi`);
+    }
+    const ioSchemaHash = reader.u64Le();
+    const implHash = reader.u64Le();
+    const bindingHash = reader.u64Le();
+    let ctxSchema;
+    let ctxExport;
+    let clearExport;
+    if (hasContext) {
+      ctxSchema = parseWireSchema(reader, transportBudget);
+      if (ctxSchema.kind === "Unit") {
+        throw new GuestError("invalid_abi", `Kernel ${name} context schema cannot be Unit`);
+      }
+      ctxExport = reader.name();
+      clearExport = reader.name();
+      const ctxFn = functionsByName.get(ctxExport);
+      if (!ctxFn || ctxFn.parameter !== ctxSchema.wireTag || ctxFn.result !== "Unit") {
+        throw new GuestError("invalid_abi", `Kernel ${name} ctx_export ${ctxExport} signature mismatch`);
+      }
+      const clearFn = functionsByName.get(clearExport);
+      if (!clearFn || clearFn.parameter !== "Unit" || clearFn.result !== "Unit") {
+        throw new GuestError("invalid_abi", `Kernel ${name} clear_export ${clearExport} signature mismatch`);
+      }
+    }
+    kernels.push(Object.freeze({
+      id,
+      name,
+      flags,
+      hasContext,
+      variableOutput,
+      inSchema,
+      outSchema,
+      ioSchemaHash,
+      implHash,
+      bindingHash,
+      ...hasContext ? {
+        ctxSchema,
+        ctxExport,
+        clearExport
+      } : {}
+    }));
+  }
+  reader.end();
+  return {
+    transportBudget,
+    kernels: Object.freeze(kernels)
+  };
+}
+function parseProcessesSection(payload, functionsByName) {
+  const reader = new AbiReader(payload);
+  const version = reader.count();
+  if (version !== 1) {
+    throw new GuestError("invalid_abi", `Unsupported squid:processes version ${version}`);
+  }
+  const transportBudget = reader.count();
+  if (transportBudget < 8 || transportBudget % 4 !== 0) {
+    throw new GuestError("invalid_abi", `Invalid squid:processes transport_budget ${transportBudget}`);
+  }
+  const count = reader.count();
+  const processes = [];
+  const seen = /* @__PURE__ */ new Set();
+  for (let i = 0; i < count; i++) {
+    const name = reader.name();
+    if (seen.has(name)) {
+      throw new GuestError("invalid_abi", `Duplicate process ${name}`);
+    }
+    seen.add(name);
+    const initExport = reader.name();
+    const stepExport = reader.name();
+    const configSchema = parseWireSchema(reader, transportBudget);
+    const cmdSchema = parseWireSchema(reader, transportBudget);
+    const replySchema = parseWireSchema(reader, transportBudget);
+    const initFn = functionsByName.get(initExport);
+    if (!initFn || initFn.parameter !== configSchema.wireTag || initFn.result !== "Unit") {
+      throw new GuestError("invalid_abi", `Process ${name} init_export ${initExport} signature mismatch`);
+    }
+    const stepFn = functionsByName.get(stepExport);
+    if (!stepFn || stepFn.parameter !== cmdSchema.wireTag || stepFn.result !== replySchema.wireTag) {
+      throw new GuestError("invalid_abi", `Process ${name} step_export ${stepExport} signature mismatch`);
+    }
+    processes.push(Object.freeze({
+      name,
+      initExport,
+      stepExport,
+      configSchema,
+      cmdSchema,
+      replySchema
+    }));
+  }
+  reader.end();
+  return {
+    transportBudget,
+    processes: Object.freeze(processes)
+  };
+}
+var compiledReceiptBrand = Symbol("CompiledModuleReceipt");
 function importModule(signature2) {
   if (signature2.dataSchema !== void 0) {
-    if (signature2.lifetime === "owned") return "blot:cleanup_data/2";
-    return "blot:cleanup_data/1";
+    if (signature2.lifetime === "owned") return "squid:cleanup_data/2";
+    return "squid:cleanup_data/1";
   }
-  if (signature2.lifetime === "owned") return "blot:cleanup/2";
-  if (signature2.kind === "cleanup") return "blot:cleanup/1";
-  return "blot:host/1";
+  if (signature2.lifetime === "owned") return "squid:cleanup/2";
+  if (signature2.kind === "cleanup") return "squid:cleanup/1";
+  return "squid:host/1";
 }
 function importKey(signature2) {
   return `${importModule(signature2)}/${importName(signature2)}`;
@@ -2024,9 +2436,9 @@ function importName(signature2) {
   return `call_${signature2.parameter.toLowerCase().replaceAll(" ", "_")}_${signature2.result.toLowerCase().replaceAll(" ", "_")}`;
 }
 function readGuestAbi(module) {
-  const sections = WebAssembly.Module.customSections(module, "blot:abi");
+  const sections = WebAssembly.Module.customSections(module, "squid:abi");
   if (sections.length !== 1) {
-    throw new GuestError("invalid_abi", "Expected exactly one blot:abi section");
+    throw new GuestError("invalid_abi", "Expected exactly one squid:abi section");
   }
   const reader = new AbiReader(new Uint8Array(sections[0]));
   const version = reader.count();
@@ -2059,11 +2471,11 @@ function readGuestAbi(module) {
     exports.set(name, kind);
   };
   if (countedOwnership) {
-    declare("blot:ownership_enter", "function");
-    declare("blot:ownership_leave", "function");
-    declare("blot:rc_roots", "global");
+    declare("squid:ownership_enter", "function");
+    declare("squid:ownership_leave", "function");
+    declare("squid:rc_roots", "global");
   }
-  const taskSections = WebAssembly.Module.customSections(module, "blot:tasks");
+  const taskSections = WebAssembly.Module.customSections(module, "squid:tasks");
   let taskCount;
   if (taskSections.length > 1) {
     throw new GuestError("invalid_abi", "Duplicate task feature section");
@@ -2100,8 +2512,8 @@ function readGuestAbi(module) {
     if (version === 7) publicOwners = (flags & 2) !== 0;
     reader.owners = publicOwners;
     if (publicOwners) {
-      declare("blot:owner_release", "function");
-      declare("blot:owner_token", "function");
+      declare("squid:owner_release", "function");
+      declare("squid:owner_token", "function");
     }
   }
   const functionCount = reader.count();
@@ -2115,9 +2527,9 @@ function readGuestAbi(module) {
     if (typeof parameter !== "string" && parameter.kind !== "owner") {
       signatures.add(importKey(parameter));
       if (parameter.lifetime === "owned") {
-        let binder = "blot:cleanup_bind/1";
+        let binder = "squid:cleanup_bind/1";
         if (parameter.dataSchema !== void 0) {
-          binder = "blot:cleanup_data_bind/1";
+          binder = "squid:cleanup_data_bind/1";
         }
         signatures.add(`${binder}/${importName(parameter)}`);
       }
@@ -2126,7 +2538,7 @@ function readGuestAbi(module) {
     if (typeof result2 !== "string" && result2.fresh !== void 0) {
       throw new GuestError("invalid_abi", "Owner results cannot declare fresh arguments");
     }
-    if (typeof parameter !== "string" && parameter.kind === "owner" && parameter.fresh !== void 0) declare(`blot:owner_call/${name}`, "function");
+    if (typeof parameter !== "string" && parameter.kind === "owner" && parameter.fresh !== void 0) declare(`squid:owner_call/${name}`, "function");
     functions.push(Object.freeze({
       name,
       parameter,
@@ -2155,7 +2567,7 @@ function readGuestAbi(module) {
       cause
     });
   }
-  const multiplicity = WebAssembly.Module.customSections(module, "blot:multiplicity");
+  const multiplicity = WebAssembly.Module.customSections(module, "squid:multiplicity");
   if (multiplicity.length > 1) {
     throw new GuestError("invalid_abi", "Duplicate multiplicity section");
   }
@@ -2188,12 +2600,12 @@ function readGuestAbi(module) {
     usage.end();
   }
   if (version === 5 || version >= 6 && resources !== 0 || functions.some((fn) => typeof fn.parameter === "string" && isArrayType(fn.parameter) || typeof fn.result === "string" && isArrayType(fn.result) || typeof fn.parameter !== "string" && fn.parameter.kind === "owner" && fn.parameter.fresh !== void 0 && isArrayType(fn.parameter.fresh) || typeof fn.parameter !== "string" && fn.parameter.kind !== "owner" && (fn.parameter.dataSchema !== void 0 || isArrayType(fn.parameter.parameter) || isArrayType(fn.parameter.result)))) {
-    declare("blot:memory", "memory");
-    declare("blot:allocate", "function");
-    declare("blot:reset", "function");
+    declare("squid:memory", "memory");
+    declare("squid:allocate", "function");
+    declare("squid:reset", "function");
   }
   if (countedOwnership && (signatures.size !== 0 || taskCount !== void 0)) {
-    declare("blot:rc_host_refs", "global");
+    declare("squid:rc_host_refs", "global");
   }
   if (resources !== 0) {
     for (let index = 0; index < resources; index++) {
@@ -2201,8 +2613,8 @@ function readGuestAbi(module) {
       declare(resourceExport(index, true), "function");
     }
   }
-  if (taskCount !== void 0 && !exports.has("blot:memory")) {
-    declare("blot:memory", "memory");
+  if (taskCount !== void 0 && !exports.has("squid:memory")) {
+    declare("squid:memory", "memory");
   }
   const expectedTaskImports = /* @__PURE__ */ new Set();
   if (taskCount !== void 0) {
@@ -2221,7 +2633,15 @@ function readGuestAbi(module) {
     transferImports.add("drain");
   }
   const actualExports = WebAssembly.Module.exports(module);
-  const ownership = WebAssembly.Module.customSections(module, "blot:ownership");
+  const invocation = WebAssembly.Module.customSections(module, "squid:invocation");
+  if (invocation.length !== 0) {
+    const versionBytes = new Uint8Array(invocation[0]);
+    if (version !== 8 || invocation.length !== 1 || versionBytes.length !== 1 || versionBytes[0] !== 1) {
+      throw new GuestError("invalid_abi", "Invalid invocation finish section");
+    }
+    declare("squid:finish_invocation", "function");
+  }
+  const ownership = WebAssembly.Module.customSections(module, "squid:ownership");
   if (version === 8 && ownership.length !== 0) {
     throw new GuestError("invalid_abi", "Data-stack ABI cannot declare counted ownership");
   }
@@ -2232,8 +2652,8 @@ function readGuestAbi(module) {
     const state = new Uint8Array(ownership[0]);
     if (state.length !== 3 || state[0] !== 1 && state[0] !== 2 || state[1] > state[0] || state[2] > 7 || state[1] !== 0 !== (state[2] === 0) || countedOwnership !== (state[0] === 2 && state[1] === 2)) throw new GuestError("invalid_abi", "Invalid ownership section");
     if (state[2] !== 1) {
-      if (actualExports.some((entry) => entry.name === "blot:allocation")) {
-        declare("blot:allocation", "function");
+      if (actualExports.some((entry) => entry.name === "squid:allocation")) {
+        declare("squid:allocation", "function");
       }
       for (const counter of [
         "leases",
@@ -2241,11 +2661,11 @@ function readGuestAbi(module) {
         "releases",
         "destroyed"
       ]) {
-        declare(`blot:rc_${counter}`, "global");
+        declare(`squid:rc_${counter}`, "global");
       }
     }
   }
-  const cycles = WebAssembly.Module.customSections(module, "blot:cycles");
+  const cycles = WebAssembly.Module.customSections(module, "squid:cycles");
   if (cycles.length > 1) {
     throw new GuestError("invalid_abi", "Duplicate cycle section");
   }
@@ -2260,13 +2680,13 @@ function readGuestAbi(module) {
       "edges",
       "bytes"
     ]) {
-      declare(`blot:cycle_${counter}`, "global");
+      declare(`squid:cycle_${counter}`, "global");
     }
   }
   if (countedOwnership && ownership.length !== 1) {
     throw new GuestError("invalid_abi", "Missing root ownership section");
   }
-  const memoryProfile = WebAssembly.Module.customSections(module, "blot:memory-profile");
+  const memoryProfile = WebAssembly.Module.customSections(module, "squid:memory-profile");
   if (version === 8 && memoryProfile.length !== 0) {
     throw new GuestError("invalid_abi", "Data-stack ABI cannot declare a counted memory profile");
   }
@@ -2275,18 +2695,25 @@ function readGuestAbi(module) {
   }
   if (memoryProfile.length === 1) {
     for (let word = 0; word < 8; word++) {
-      declare(`blot:profile_identity_${word}`, "global");
+      declare(`squid:profile_identity_${word}`, "global");
     }
-    if (!exports.has("blot:memory")) declare("blot:memory", "memory");
+    if (!exports.has("squid:memory")) declare("squid:memory", "memory");
+  }
+  const trapsSections = WebAssembly.Module.customSections(module, "squid:traps");
+  if (trapsSections.length > 1) {
+    throw new GuestError("invalid_abi", "Duplicate traps section");
+  }
+  if (trapsSections.length === 1 && !exports.has("squid:memory") && actualExports.some((entry) => entry.name === "squid:memory" && entry.kind === "memory")) {
+    declare("squid:memory", "memory");
   }
   if (actualExports.length !== exports.size || actualExports.some((entry) => exports.get(entry.name) !== entry.kind)) {
-    throw new GuestError("invalid_abi", "Wasm exports differ from blot:abi");
+    throw new GuestError("invalid_abi", "Wasm exports differ from squid:abi");
   }
   for (const entry of WebAssembly.Module.imports(module)) {
-    if (entry.module === "blot:task/1" && entry.kind === "function" && expectedTaskImports.delete(entry.name)) continue;
-    if (entry.module === "blot:resource/1" && entry.kind === "function" && resourceImports.delete(entry.name)) continue;
-    if (entry.module === "blot:resource/2" && entry.kind === "function" && transferImports.delete(entry.name)) continue;
-    if (entry.module !== "blot:host/1" && entry.module !== "blot:cleanup/1" && entry.module !== "blot:cleanup/2" && entry.module !== "blot:cleanup_bind/1" && entry.module !== "blot:cleanup_data/1" && entry.module !== "blot:cleanup_data/2" && entry.module !== "blot:cleanup_data_bind/1" || entry.kind !== "function" || !signatures.delete(`${entry.module}/${entry.name}`)) {
+    if (entry.module === "squid:task/1" && entry.kind === "function" && expectedTaskImports.delete(entry.name)) continue;
+    if (entry.module === "squid:resource/1" && entry.kind === "function" && resourceImports.delete(entry.name)) continue;
+    if (entry.module === "squid:resource/2" && entry.kind === "function" && transferImports.delete(entry.name)) continue;
+    if (entry.module !== "squid:host/1" && entry.module !== "squid:cleanup/1" && entry.module !== "squid:cleanup/2" && entry.module !== "squid:cleanup_bind/1" && entry.module !== "squid:cleanup_data/1" && entry.module !== "squid:cleanup_data/2" && entry.module !== "squid:cleanup_data_bind/1" || entry.kind !== "function" || !signatures.delete(`${entry.module}/${entry.name}`)) {
       throw new GuestError("invalid_abi", `Unexpected Wasm import ${entry.module}/${entry.name}`);
     }
   }
@@ -2299,6 +2726,51 @@ function readGuestAbi(module) {
   }
   if (signatures.size !== 0) {
     throw new GuestError("invalid_abi", "Missing generic callback import");
+  }
+  const kernelsSections = WebAssembly.Module.customSections(module, "squid:kernels");
+  if (kernelsSections.length > 1) {
+    throw new GuestError("invalid_abi", "Duplicate squid:kernels section");
+  }
+  if (kernelsSections.length === 1 && version !== 8) {
+    throw new GuestError("invalid_abi", "squid:kernels requires ABI 8");
+  }
+  const processesSections = WebAssembly.Module.customSections(module, "squid:processes");
+  if (processesSections.length > 1) {
+    throw new GuestError("invalid_abi", "Duplicate squid:processes section");
+  }
+  if (processesSections.length === 1 && version !== 8) {
+    throw new GuestError("invalid_abi", "squid:processes requires ABI 8");
+  }
+  const functionsByName = new Map(functions.map((fn) => [
+    fn.name,
+    fn
+  ]));
+  const hostInternal = [];
+  let kernels;
+  let processes;
+  let transportBudget;
+  if (kernelsSections.length === 1) {
+    const parsed = parseKernelsSection(new Uint8Array(kernelsSections[0]), functionsByName);
+    transportBudget = parsed.transportBudget;
+    kernels = parsed.kernels;
+    for (const kernel of kernels) {
+      if (kernel.ctxExport !== void 0) hostInternal.push(kernel.ctxExport);
+      if (kernel.clearExport !== void 0) {
+        hostInternal.push(kernel.clearExport);
+      }
+    }
+  }
+  if (processesSections.length === 1) {
+    const parsed = parseProcessesSection(new Uint8Array(processesSections[0]), functionsByName);
+    if (transportBudget !== void 0 && transportBudget !== parsed.transportBudget) {
+      throw new GuestError("invalid_abi", `squid:kernels transport_budget (${transportBudget}) != squid:processes transport_budget (${parsed.transportBudget})`);
+    }
+    transportBudget = parsed.transportBudget;
+    processes = parsed.processes;
+    for (const proc of processes) {
+      hostInternal.push(proc.initExport);
+      hostInternal.push(proc.stepExport);
+    }
   }
   const result = {
     version,
@@ -2321,6 +2793,31 @@ function readGuestAbi(module) {
       publicOwners
     });
   }
+  if (invocation.length !== 0) {
+    Object.assign(result, {
+      invocationFinish: true
+    });
+  }
+  if (kernels !== void 0) {
+    Object.assign(result, {
+      kernels
+    });
+  }
+  if (processes !== void 0) {
+    Object.assign(result, {
+      processes
+    });
+  }
+  if (transportBudget !== void 0) {
+    Object.assign(result, {
+      transportBudget
+    });
+  }
+  if (hostInternal.length > 0) {
+    Object.assign(result, {
+      hostInternal: Object.freeze(hostInternal)
+    });
+  }
   if (dataSchemas) abiDataSchemas.set(result, dataSchemas);
   return Object.freeze(result);
 }
@@ -2332,16 +2829,37 @@ function scalarToWasm(type, value, code, label) {
     case "Bool":
       if (typeof value === "boolean") return value ? 1 : 0;
       break;
+    case "U8":
+      if (typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 255) return value;
+      break;
     case "U32":
       if (typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 4294967295) return value;
       break;
+    case "I32":
+      if (typeof value === "number" && Number.isInteger(value) && value >= -2147483648 && value <= 2147483647) return value;
+      break;
+    case "U64":
+      if (typeof value === "bigint" && value >= 0n && value <= 0xFFFFFFFFFFFFFFFFn) return BigInt.asIntN(64, value);
+      break;
+    case "I64":
+      if (typeof value === "bigint" && value >= -0x8000000000000000n && value <= 0x7FFFFFFFFFFFFFFFn) return value;
+      break;
     case "F32":
       if (typeof value === "number") return Math.fround(value);
+      break;
+    case "F64":
+      if (typeof value === "number") return value;
       break;
   }
   throw new GuestError(code, `${label} must be ${type}`);
 }
 function scalarFromWasm(type, value) {
+  if (type === "U64" || type === "I64") {
+    if (typeof value !== "bigint") {
+      throw new GuestError("invalid_abi", `Wasm ${type} value is not a bigint`);
+    }
+    return type === "U64" ? BigInt.asUintN(64, value) : BigInt.asIntN(64, value);
+  }
   if (typeof value !== "number") {
     throw new GuestError("invalid_abi", `Wasm ${type} value is not a number`);
   }
@@ -2352,61 +2870,174 @@ function scalarFromWasm(type, value) {
     case "Bool":
       if (value === 0 || value === 1) return value === 1;
       break;
+    case "U8":
+      if (Number.isInteger(value) && value >= 0 && value <= 255) return value;
+      break;
     case "U32":
       if (Number.isInteger(value) && value >= -2147483648 && value <= 2147483647) {
         return value >>> 0;
       }
       break;
+    case "I32":
+      if (Number.isInteger(value) && value >= -2147483648 && value <= 2147483647) {
+        return value | 0;
+      }
+      break;
     case "F32":
       return Math.fround(value);
+    case "F64":
+      return value;
   }
   throw new GuestError("invalid_abi", `Non-canonical Wasm ${type} value`);
 }
-function arrayRange(arena, pointer, length) {
+function arrayRange(arena, pointer, length, elemBytes = 4) {
   if (typeof pointer !== "number" || !Number.isInteger(pointer) || pointer < -2147483648 || pointer > 4294967295) {
     throw new GuestError("invalid_abi", "Array lies outside the guest arena");
   }
   const address = pointer >>> 0;
-  if (address < 4 || address % 4 !== 0 || address > arena.memory.buffer.byteLength - 4 || length > (arena.memory.buffer.byteLength - address - 4) / 4) {
+  if (address < 4 || address % 4 !== 0 || address > arena.memory.buffer.byteLength - 4 || length > (arena.memory.buffer.byteLength - address - 4) / elemBytes) {
     throw new GuestError("invalid_abi", "Array lies outside the guest arena");
   }
   return address;
 }
-function arrayToWasm(arena, type, argument, name, code = "invalid_argument") {
-  if (!(type === "Array U32" ? argument instanceof Uint32Array : argument instanceof Float32Array)) {
-    throw new GuestError(code, `${name} argument must be ${type === "Array U32" ? "Uint32Array" : "Float32Array"}`);
+function arrayClassName(type) {
+  switch (type) {
+    case "Array U8":
+      return "Uint8Array";
+    case "Array U32":
+      return "Uint32Array";
+    case "Array I32":
+      return "Int32Array";
+    case "Array F32":
+      return "Float32Array";
+    case "Array U64":
+      return "BigUint64Array";
+    case "Array I64":
+      return "BigInt64Array";
+    case "Array F64":
+      return "Float64Array";
+  }
+}
+function isMatchingTypedArray(type, value) {
+  switch (type) {
+    case "Array U8":
+      return value instanceof Uint8Array;
+    case "Array U32":
+      return value instanceof Uint32Array;
+    case "Array I32":
+      return value instanceof Int32Array;
+    case "Array F32":
+      return value instanceof Float32Array;
+    case "Array U64":
+      return value instanceof BigUint64Array;
+    case "Array I64":
+      return value instanceof BigInt64Array;
+    case "Array F64":
+      return value instanceof Float64Array;
+  }
+}
+function arrayToWasm(arena, type, argument, name, code = "invalid_argument", batch) {
+  if (!isMatchingTypedArray(type, argument)) {
+    throw new GuestError(code, `${name} argument must be ${arrayClassName(type)}`);
   }
   const values = argument;
-  const length = values.length;
-  const byteLength = length * 4;
-  if (length >= 1073741823) {
+  const elemBytes = arrayElementBytes(type);
+  const prefix = batch?.prefix;
+  const prefixLength = prefix?.length ?? 0;
+  const length = prefixLength + values.length;
+  const payloadBytes = length * elemBytes;
+  if (payloadBytes > 4294967288) {
     throw new GuestError(code, `${name} array byte count exceeds the Wasm32 address range`);
   }
-  const pointer = arrayRange(arena, arena.allocate((length + 1) * 4), length);
+  const allocBytes = payloadBytes + 4 + (4 - (payloadBytes & 3) & 3);
+  const pointer = arrayRange(arena, arena.allocate(allocBytes), length, elemBytes);
   const view = new DataView(arena.memory.buffer);
   view.setUint32(pointer, length, true);
-  if (littleEndian && length > 32 && values.buffer instanceof ArrayBuffer) {
-    new Uint8Array(arena.memory.buffer, pointer + 4, byteLength).set(new Uint8Array(values.buffer, values.byteOffset, byteLength));
-  } else {
-    const input = type === "Array U32" ? values : new Uint32Array(values.buffer, values.byteOffset, length);
-    for (let index = 0; index < length; index++) {
-      view.setUint32(pointer + 4 + index * 4, input[index], true);
+  batch?.observeCopy?.("guestInput", payloadBytes);
+  if (prefixLength && prefix) copyArrayWords(view, pointer + 4, prefix);
+  const dataStart = pointer + 4 + prefixLength * 4;
+  if (elemBytes === 1) {
+    const bytes = values;
+    if (bytes.buffer instanceof ArrayBuffer) {
+      new Uint8Array(view.buffer, dataStart, bytes.length).set(bytes);
+    } else {
+      for (let index = 0; index < bytes.length; index++) {
+        view.setUint8(dataStart + index, bytes[index]);
+      }
     }
+  } else if (elemBytes === 4) {
+    const words = values instanceof Uint32Array ? values : new Uint32Array(values.buffer, values.byteOffset, values.length);
+    copyArrayWords(view, dataStart, words);
+  } else {
+    const words = values instanceof BigUint64Array ? values : new BigUint64Array(values.buffer, values.byteOffset, values.length);
+    copyArrayWords64(view, dataStart, words);
   }
   return pointer;
 }
-function arrayFromWasm(arena, type, result) {
-  const pointer = arrayRange(arena, result, 0);
+function copyArrayWords(view, start, words) {
+  const { length, byteLength } = words;
+  if (littleEndian && length > 32 && words.buffer instanceof ArrayBuffer) {
+    new Uint8Array(view.buffer, start, byteLength).set(new Uint8Array(words.buffer, words.byteOffset, byteLength));
+  } else {
+    for (let index = 0; index < length; index++) {
+      view.setUint32(start + index * 4, words[index], true);
+    }
+  }
+}
+function copyArrayWords64(view, start, words) {
+  const { length, byteLength } = words;
+  if (littleEndian && length > 16 && words.buffer instanceof ArrayBuffer) {
+    new Uint8Array(view.buffer, start, byteLength).set(new Uint8Array(words.buffer, words.byteOffset, byteLength));
+  } else {
+    for (let index = 0; index < length; index++) {
+      view.setBigUint64(start + index * 8, words[index], true);
+    }
+  }
+}
+function allocateTypedArray(type, length) {
+  switch (type) {
+    case "Array U8":
+      return new Uint8Array(length);
+    case "Array U32":
+      return new Uint32Array(length);
+    case "Array I32":
+      return new Int32Array(length);
+    case "Array F32":
+      return new Float32Array(length);
+    case "Array U64":
+      return new BigUint64Array(length);
+    case "Array I64":
+      return new BigInt64Array(length);
+    case "Array F64":
+      return new Float64Array(length);
+  }
+}
+function arrayFromWasm(arena, type, result, batch) {
+  const elemBytes = arrayElementBytes(type);
+  const pointer = arrayRange(arena, result, 0, elemBytes);
   const view = new DataView(arena.memory.buffer);
   const length = view.getUint32(pointer, true);
-  arrayRange(arena, pointer, length);
-  const values = type === "Array U32" ? new Uint32Array(length) : new Float32Array(length);
-  if (littleEndian && length > 32) {
+  arrayRange(arena, pointer, length, elemBytes);
+  const payloadBytes = length * elemBytes;
+  batch?.observeCopy?.("guestPack", payloadBytes);
+  if (batch && length !== batch.resultLength) {
+    throw new GuestError("invalid_abi", "Numeric batch result has the wrong length");
+  }
+  const values = allocateTypedArray(type, length);
+  batch?.observeCopy?.("guestOutput", payloadBytes);
+  if (elemBytes === 1) {
+    values.set(new Uint8Array(arena.memory.buffer, pointer + 4, length));
+  } else if (littleEndian && length > (elemBytes === 8 ? 16 : 32)) {
     new Uint8Array(values.buffer).set(new Uint8Array(arena.memory.buffer, pointer + 4, values.byteLength));
-  } else {
-    const output = type === "Array U32" ? values : new Uint32Array(values.buffer);
+  } else if (elemBytes === 4) {
+    const output = values instanceof Uint32Array ? values : new Uint32Array(values.buffer);
     for (let index = 0; index < length; index++) {
       output[index] = view.getUint32(pointer + 4 + index * 4, true);
+    }
+  } else {
+    const output = values instanceof BigUint64Array ? values : new BigUint64Array(values.buffer);
+    for (let index = 0; index < length; index++) {
+      output[index] = view.getBigUint64(pointer + 4 + index * 8, true);
     }
   }
   return values;
@@ -2414,8 +3045,8 @@ function arrayFromWasm(arena, type, result) {
 var capabilityOwners = /* @__PURE__ */ new WeakMap();
 var publicOwnerStates = /* @__PURE__ */ new WeakMap();
 function resourceExport(index, drop) {
-  if (drop) return `blot:resource_drop/${index}`;
-  return `blot:resource_cleanup/${index}`;
+  if (drop) return `squid:resource_drop/${index}`;
+  return `squid:resource_cleanup/${index}`;
 }
 function resourceU32(value) {
   const bytes = [];
@@ -2457,8 +3088,7 @@ function resourceModule(sections) {
   ]));
 }
 function typedCleanupImport(signature2, callback) {
-  let parameter = 127;
-  if (signature2.parameter === "F32") parameter = 125;
+  const parameter = wasmValTypeCode(signature2.parameter);
   let handle = 111;
   if (signature2.lifetime === "owned") handle = 127;
   let parameters = [
@@ -2655,6 +3285,7 @@ function resourceAdapters(instance, count) {
 async function instantiateGuest(bytes, options = {}) {
   const module = bytes instanceof WebAssembly.Module ? bytes : await WebAssembly.compile(bytes);
   const abi = readGuestAbi(module);
+  const trapTable = readTrapMetadata(module);
   const dataSchemas = abiDataSchemas.get(abi);
   const functions = new Map(abi.functions.map((fn) => [
     fn.name,
@@ -2844,13 +3475,13 @@ async function instantiateGuest(bytes, options = {}) {
   let tasks;
   let initializing = true;
   const modules = {
-    "blot:host/1": imports,
-    "blot:cleanup/1": cleanupImports,
-    "blot:cleanup/2": ownedCleanupImports,
-    "blot:cleanup_bind/1": cleanupBindImports,
-    "blot:cleanup_data/1": dataCleanupImports,
-    "blot:cleanup_data/2": ownedDataCleanupImports,
-    "blot:cleanup_data_bind/1": dataBindImports
+    "squid:host/1": imports,
+    "squid:cleanup/1": cleanupImports,
+    "squid:cleanup/2": ownedCleanupImports,
+    "squid:cleanup_bind/1": cleanupBindImports,
+    "squid:cleanup_data/1": dataCleanupImports,
+    "squid:cleanup_data/2": ownedDataCleanupImports,
+    "squid:cleanup_data_bind/1": dataBindImports
   };
   if (abi.taskDescriptorCount !== void 0) {
     const callbacks2 = {};
@@ -2871,11 +3502,11 @@ async function instantiateGuest(bytes, options = {}) {
       ].includes(name)) callbacks2[name] = new (requireAsync()).Suspending(invoke);
       else callbacks2[name] = invoke;
     }
-    modules["blot:task/1"] = typedTaskFunctions(callbacks2);
+    modules["squid:task/1"] = typedTaskFunctions(callbacks2);
   }
   const count = abi.resourceAdapterCount ?? 0;
   if (count !== 0) {
-    modules["blot:resource/1"] = typedResourceImports({
+    modules["squid:resource/1"] = typedResourceImports({
       reserve: () => {
         if (!resources) {
           throw new GuestError("invalid_abi", "Resource journal is not active");
@@ -2897,7 +3528,7 @@ async function instantiateGuest(bytes, options = {}) {
     });
   }
   if (abi.version === 5 || abi.version >= 6 && abi.resourceTransfer) {
-    modules["blot:resource/2"] = typedResourceImports({
+    modules["squid:resource/2"] = typedResourceImports({
       register_owned: (token, adapter, payload, callable, provider, owner) => {
         if (!resources) {
           throw new GuestError("invalid_abi", "Resource journal is not active");
@@ -2909,7 +3540,7 @@ async function instantiateGuest(bytes, options = {}) {
         callable >>>= 0;
         provider >>>= 0;
         let words;
-        const memory2 = instance.exports["blot:memory"];
+        const memory2 = instance.exports["squid:memory"];
         if (!(memory2 instanceof WebAssembly.Memory) || owner < 32 || owner % 4 !== 0 || owner > memory2.buffer.byteLength - 8) throw new GuestError("invalid_abi", "Invalid resource owner address");
         try {
           words = new Uint32Array(memory2.buffer);
@@ -2961,7 +3592,7 @@ async function instantiateGuest(bytes, options = {}) {
   if (count !== 0 || abi.taskDescriptorCount !== void 0) {
     let invalidate;
     if (abi.version === 5 || abi.version >= 6 && abi.resourceTransfer) {
-      const memory2 = instance.exports["blot:memory"];
+      const memory2 = instance.exports["squid:memory"];
       if (!(memory2 instanceof WebAssembly.Memory)) {
         throw new GuestError("invalid_abi", "Resource transfer requires owned memory");
       }
@@ -3010,8 +3641,8 @@ async function instantiateGuest(bytes, options = {}) {
   }
   let ownership;
   if (abi.version >= 3 && abi.version <= 7) {
-    const enter = instance.exports["blot:ownership_enter"];
-    const leave = instance.exports["blot:ownership_leave"];
+    const enter = instance.exports["squid:ownership_enter"];
+    const leave = instance.exports["squid:ownership_leave"];
     if (typeof enter !== "function" || typeof leave !== "function") {
       throw new GuestError("invalid_abi", "Missing ownership exports");
     }
@@ -3078,12 +3709,48 @@ async function instantiateGuest(bytes, options = {}) {
       });
     }
   }
+  let finishInvocation;
+  let reclaimedOwners;
+  if (abi.invocationFinish) {
+    const exit = instance.exports["squid:finish_invocation"];
+    if (typeof exit !== "function") {
+      throw new GuestError("invalid_abi", "Missing invocation finish hook");
+    }
+    try {
+      new WebAssembly.Instance(resourceModule([
+        [
+          1,
+          96,
+          0,
+          1,
+          127
+        ],
+        [
+          1,
+          ...resourceName("g"),
+          ...resourceName("f"),
+          0,
+          0
+        ]
+      ]), {
+        g: {
+          f: exit
+        }
+      });
+    } catch (cause) {
+      throw new GuestError("invalid_abi", "Invalid invocation finish signature", {
+        cause
+      });
+    }
+    finishInvocation = exit;
+  }
   let entered = false;
-  const memory = instance.exports["blot:memory"];
-  const allocate = instance.exports["blot:allocate"];
-  const reset = instance.exports["blot:reset"];
-  const profiling = WebAssembly.Module.customSections(module, "blot:memory-profile").length === 1;
-  if (memory !== void 0 && (allocate !== void 0 || reset !== void 0 || abi.taskDescriptorCount === void 0 && !profiling)) {
+  const memory = instance.exports["squid:memory"];
+  const allocate = instance.exports["squid:allocate"];
+  const reset = instance.exports["squid:reset"];
+  const profiling = WebAssembly.Module.customSections(module, "squid:memory-profile").length === 1;
+  const hasTraps = trapTable !== void 0;
+  if (memory !== void 0 && (allocate !== void 0 || reset !== void 0 || abi.taskDescriptorCount === void 0 && !profiling && !hasTraps)) {
     if (!(memory instanceof WebAssembly.Memory) || typeof allocate !== "function" || typeof reset !== "function") {
       throw new GuestError("invalid_abi", "Missing array arena exports");
     }
@@ -3096,7 +3763,12 @@ async function instantiateGuest(bytes, options = {}) {
   const valueTypes = [
     ...scalarTypes,
     "Array U32",
-    "Array F32"
+    "Array F32",
+    "Array U8",
+    "Array I32",
+    "Array U64",
+    "Array I64",
+    "Array F64"
   ];
   function createCapability(definition, asynchronous, cleanup) {
     idle();
@@ -3144,8 +3816,8 @@ async function instantiateGuest(bytes, options = {}) {
   let liveOwners;
   let pendingOwner;
   if (abi.publicOwners) {
-    const release = instance.exports["blot:owner_release"];
-    const token = instance.exports["blot:owner_token"];
+    const release = instance.exports["squid:owner_release"];
+    const token = instance.exports["squid:owner_token"];
     if (typeof release !== "function" || typeof token !== "function") {
       throw new GuestError("invalid_abi", "Missing public owner hooks");
     }
@@ -3194,12 +3866,14 @@ async function instantiateGuest(bytes, options = {}) {
       if (!ownerInput && typeof fn.result === "string") continue;
       let parameter = 127;
       if (typeof fn.parameter === "string") {
-        if (fn.parameter === "F32") parameter = 125;
+        parameter = wasmValTypeCode(fn.parameter);
       } else if (fn.parameter.kind === "owner") {
-        if (fn.parameter.fresh === "F32") parameter = 125;
+        if (fn.parameter.fresh !== void 0) {
+          parameter = wasmValTypeCode(fn.parameter.fresh);
+        }
       } else parameter = 111;
       let result = 127;
-      if (fn.result === "F32") result = 125;
+      if (typeof fn.result === "string") result = wasmValTypeCode(fn.result);
       const entries = [
         [
           fn.name,
@@ -3208,7 +3882,7 @@ async function instantiateGuest(bytes, options = {}) {
       ];
       if (ownerInput && fn.parameter.fresh !== void 0) {
         entries.push([
-          `blot:owner_call/${fn.name}`,
+          `squid:owner_call/${fn.name}`,
           127
         ]);
       }
@@ -3309,11 +3983,14 @@ async function instantiateGuest(bytes, options = {}) {
   if (abi.functions.some((fn) => fn.multiplicity === "once")) {
     consumedOnce = /* @__PURE__ */ new Set();
   }
-  function begin(name, argument, asynchronous) {
+  function begin(name, argument, asynchronous, batch) {
     idle();
     const fn = functions.get(name);
     if (!fn) {
       throw new GuestError("unknown_export", `Unknown function export ${name}`);
+    }
+    if (batch && (!isArrayType(fn.result) || fn.parameter !== "Array U32" || !Number.isSafeInteger(batch.resultLength) || batch.resultLength < 0)) {
+      throw new GuestError("invalid_argument", "Expected a fixed numeric array batch");
     }
     if (fn.multiplicity === "once" && consumedOnce.has(name)) {
       throw new GuestError("once_reused", `${name} has already been invoked`);
@@ -3333,7 +4010,7 @@ async function instantiateGuest(bytes, options = {}) {
         }
         value = owned.token;
         if (fn.parameter.fresh !== void 0) {
-          exportedName = `blot:owner_call/${name}`;
+          exportedName = `squid:owner_call/${name}`;
         }
         if (owned.usage === "unique") movedOwner = owned;
       } else {
@@ -3387,7 +4064,7 @@ async function instantiateGuest(bytes, options = {}) {
       arena?.reset(0);
       if (typeof fn.parameter === "string" && isArrayType(fn.parameter)) {
         if (!arena) throw new Error("Validated array export has no arena");
-        value = arrayToWasm(arena, fn.parameter, argument, name);
+        value = arrayToWasm(arena, fn.parameter, argument, name, "invalid_argument", batch);
       }
       if (argumentType !== void 0 && isArrayType(argumentType)) {
         if (!arena) throw new Error("Validated owner input has no arena");
@@ -3434,6 +4111,15 @@ async function instantiateGuest(bytes, options = {}) {
           failure = cause;
         }
       }
+      reclaimedOwners = void 0;
+      try {
+        reclaimedOwners = finishInvocation?.();
+      } catch (cause) {
+        if (!failed) {
+          failed = true;
+          failure = cause;
+        }
+      }
       try {
         arena?.reset(0);
       } catch (cause) {
@@ -3471,11 +4157,30 @@ async function instantiateGuest(bytes, options = {}) {
     pendingOwner = void 0;
     if (failed && !priorFailure) throw failure;
   }
+  function clearTrapSite() {
+    if (memory instanceof WebAssembly.Memory && memory.buffer.byteLength >= TRAP_SITE_OFFSET + 4) {
+      new DataView(memory.buffer).setUint32(TRAP_SITE_OFFSET, 0, true);
+    }
+  }
   return {
     abi,
+    lastReclaimedOwners: () => reclaimedOwners,
     memoryBytes: () => {
       if (memory instanceof WebAssembly.Memory) return memory.buffer.byteLength;
       return 0;
+    },
+    numericPacketCapacity(overrideBytes) {
+      idle();
+      if (abi.version !== 8 || !arena) {
+        throw new GuestError("invalid_abi", "Expected an ABI 8 numeric transport bank");
+      }
+      if (overrideBytes !== void 0) {
+        if (!Number.isSafeInteger(overrideBytes) || overrideBytes < 8 || overrideBytes % 4 !== 0) {
+          throw new RangeError("numericPacketCapacity override must be a safe positive multiple of 4");
+        }
+        return overrideBytes;
+      }
+      return abi.transportBudget ?? DEFAULT_TRANSPORT_BUDGET;
     },
     cleanupDataType(name) {
       idle();
@@ -3542,14 +4247,28 @@ async function instantiateGuest(bytes, options = {}) {
       }
       return createCapability(definition, true);
     },
-    call(name, argument) {
+    call(name, argument, batch) {
       if (options.asynchronous) {
         throw new GuestError("async_host_call", "An asynchronous guest requires callAsync()");
       }
-      const { fn, value, exported } = begin(name, argument, false);
+      const { fn, value, exported } = begin(name, argument, false, batch);
       let outcome = 1;
       try {
-        const result = publicResult(fn.result, exported(value));
+        if (batch?.observeCopy) {
+          const length = abi.version === 8 ? 0 : argument.length + (batch.prefix?.length ?? 0);
+          batch.observeCopy("guestUnpack", length * 4);
+        }
+        clearTrapSite();
+        let raw;
+        try {
+          raw = exported(value);
+        } catch (error) {
+          throw enrichGuestTrap(error, trapTable, memory);
+        }
+        let result;
+        if (batch) {
+          result = arrayFromWasm(arena, fn.result, raw, batch);
+        } else result = publicResult(fn.result, raw);
         outcome = 0;
         return result;
       } finally {
@@ -3568,7 +4287,14 @@ async function instantiateGuest(bytes, options = {}) {
       const { fn, value, exported } = begin(name, argument, true);
       let outcome = 1;
       try {
-        const result = publicResult(fn.result, await integration.promising(exported)(value));
+        clearTrapSite();
+        let raw;
+        try {
+          raw = await integration.promising(exported)(value);
+        } catch (error) {
+          throw enrichGuestTrap(error, trapTable, memory);
+        }
+        const result = publicResult(fn.result, raw);
         outcome = 0;
         return result;
       } finally {

@@ -1,5 +1,5 @@
 //! The development log, which the dev tools show in their console: the
-//! game's reports, the Blot compiler's output, new builds, asset reloads,
+//! game's reports, the Squid compiler's output, new builds, asset reloads,
 //! the asset pipeline's recipe runs and the session's time travel. Each line
 //! goes to stderr; builds with the `devtools` feature (the player runtime
 //! has none) also keep the last ones for the dev tools to read.
@@ -9,7 +9,7 @@
 pub enum Source {
     /// The game runtime's reports (`Host::report`).
     Game,
-    /// The Blot compiler watching the checkout (`pen dev`).
+    /// The Squid compiler watching the checkout (`pen dev`).
     #[cfg_attr(not(feature = "compiler"), allow(dead_code))]
     Build,
     /// New builds of the game: compiled, reloaded or refused.

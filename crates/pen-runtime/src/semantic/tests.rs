@@ -73,7 +73,7 @@ fn named_values_reasons_and_exact_identities_follow_the_timeline() {
         tick: "51".into(),
         object: id(0),
         system: "route".into(),
-        source: Some(Source { file: "src/żuraw.blot".into(), start: 17, end: u32::MAX }),
+        source: Some(Source { file: "src/żuraw.sq".into(), start: 17, end: u32::MAX }),
         reason: "destination full".into(),
     }]);
     seen.ran(2, &frame(&rejected), false);

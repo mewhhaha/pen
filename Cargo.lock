@@ -561,24 +561,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "blot-host"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytemuck",
- "libloading",
- "pen-plugins",
- "pen-protocol",
- "pen-runtime",
- "serde",
- "serde_json",
- "sha2",
- "wasm-encoder",
- "wasmparser",
- "wasmtime",
-]
-
-[[package]]
 name = "brotli"
 version = "9.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2915,7 +2897,6 @@ dependencies = [
  "anyhow",
  "arboard",
  "base64",
- "blot-host",
  "brotli",
  "cpal",
  "dirs",
@@ -2943,6 +2924,7 @@ dependencies = [
  "serde_json",
  "sha1_smol",
  "sha2",
+ "squid-host",
  "steamworks",
  "symphonia",
  "wasmtime",
@@ -3798,6 +3780,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d9571ea910ebd84c86af4b3ed27f9dbdc6ad06f17c5f96146b2b671e2976744f"
 dependencies = [
  "bitflags 2.13.2",
+]
+
+[[package]]
+name = "squid-host"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "libloading",
+ "pen-plugins",
+ "pen-protocol",
+ "pen-runtime",
+ "serde",
+ "serde_json",
+ "sha2",
+ "wasm-encoder",
+ "wasmparser",
+ "wasmtime",
 ]
 
 [[package]]

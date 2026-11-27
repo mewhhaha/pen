@@ -1,4 +1,4 @@
-//! Browser Pen `service::KERNEL` (code 15) host service (`blot2/tasks/CONCURRENCY_VNEXT.md` §5.3).
+//! Browser Pen `service::KERNEL` (code 15) host service (`squid-lang/tasks/CONCURRENCY_VNEXT.md` §5.3).
 //!
 //! Mirrors native `pen/src/kernels.rs` over `./kernels.js`'s `BrowserKernelPool`:
 //! - Unambiguous `request == 0` host→guest framing (`CAP`, `CTL`, `BATCH_ERR`, `BATCH_OK`)

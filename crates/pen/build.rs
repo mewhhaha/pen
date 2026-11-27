@@ -14,8 +14,8 @@ fn main() {
 
 /// What a game.cwasm must have been precompiled by for this runtime to load
 /// it: wasmtime's version (which its serialized modules must match) and a
-/// hash of what configures its engine, blot-host and the workspace's
-/// wasmtime features. Any change to blot-host or the ABI manifest parser
+/// hash of what configures its engine, squid-host and the workspace's
+/// wasmtime features. Any change to squid-host or the ABI manifest parser
 /// counts, which is cautious: a player built before it may run a guest
 /// differently too, or refuse its ABI version. The packed mesh codec also
 /// counts, as does compiled-game storage: a player must be able to read
@@ -23,7 +23,7 @@ fn main() {
 fn compatibility() -> String {
     let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("cargo sets CARGO_MANIFEST_DIR"));
     let workspace = manifest.join("../..");
-    let host = manifest.join("../blot-host");
+    let host = manifest.join("../squid-host");
     let abi = manifest.join("../pen-runtime/src/abi.rs");
     let packed_mesh = manifest.join("../pen-render/src/asset_store/packed.rs");
     let mesh_layout = manifest.join("../pen-render/src/asset_store/layout.rs");

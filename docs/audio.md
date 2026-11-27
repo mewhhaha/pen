@@ -26,7 +26,7 @@ peak. Existing captions, buses, looping, spatialization and save formats remain
 unchanged.
 
 For authored music, Ogg Opus usually offers a better loading-time tradeoff than
-reconstructing a score at runtime. A Blot catalog import currently names
+reconstructing a score at runtime. A Squid catalog import currently names
 `wind.sound` as `sounds.wind_sound`.
 
 ## Sounds placed in the world

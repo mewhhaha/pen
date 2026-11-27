@@ -128,8 +128,8 @@ impl Host for Shell<'_> {
     }
 
     fn report(&mut self, message: &str) {
-        // The runtime's word on a new build starts "Blot reload".
-        match message.strip_prefix("Blot reload") {
+        // The runtime's word on a new build starts "Squid reload".
+        match message.strip_prefix("Squid reload") {
             Some(rest) => say(self.log, log_source::RELOAD, !rest.starts_with("ed"), message),
             None => say(self.log, log_source::GAME, false, message),
         }

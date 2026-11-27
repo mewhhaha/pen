@@ -277,7 +277,7 @@ mod tests {
         // More, later: a directory beside it.
         std::fs::create_dir_all(directory.join("src")).unwrap();
         deep.extend(&[(&directory.join("src"), false)]).unwrap();
-        let main = directory.join("src/main.blot");
+        let main = directory.join("src/main.sq");
         std::fs::write(&main, "1").unwrap();
         wait(&assets, &main);
         drop(deep);
@@ -293,9 +293,9 @@ mod tests {
             deliver: Box::new(|_| {}),
         };
         let event =
-            notify::Event::new(notify::EventKind::Any).add_path(resolved.join("src/a.blot")).add_path("/else/b".into());
+            notify::Event::new(notify::EventKind::Any).add_path(resolved.join("src/a.sq")).add_path("/else/b".into());
         let spelled = route.spelled(&event).unwrap();
-        assert_eq!(spelled.paths, [PathBuf::from("/link/game/src/a.blot"), PathBuf::from("/else/b")]);
+        assert_eq!(spelled.paths, [PathBuf::from("/link/game/src/a.sq"), PathBuf::from("/else/b")]);
         let elsewhere = notify::Event::new(notify::EventKind::Any).add_path("/else/b".into());
         assert!(route.spelled(&elsewhere).is_none());
     }

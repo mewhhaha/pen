@@ -383,7 +383,7 @@ mod tests {
         std::fs::write(root.join("src/assets/catalog.json"), r#"{"meshes": []}"#).unwrap();
         std::fs::write(root.join("src/assets/a b.png"), "png").unwrap();
         std::fs::write(root.join("src/main.scene"), "scene").unwrap();
-        std::fs::write(root.join("src/main.blot"), "source").unwrap();
+        std::fs::write(root.join("src/main.sq"), "source").unwrap();
         let tunables =
             r#"{ "tunables": [{ "name": "camera.zoom_speed", "default": 0.001, "min": 0.0002, "max": 0.005 }] }"#;
         std::fs::write(root.join("src/tunables.json"), tunables).unwrap();
@@ -430,7 +430,7 @@ mod tests {
         // A game without saved types: the page asks whatever.
         let saved = ("200 OK", "application/json", pen_runtime::state::OPAQUE_CONFIG.into());
         assert_eq!(answer(&get("/assets/saved.json")), saved);
-        assert_eq!(answer(&get("/../src/main.blot")).0, "400 Bad Request");
+        assert_eq!(answer(&get("/../src/main.sq")).0, "400 Bad Request");
         // The checkout's sources are not served, not even through a link.
         assert_eq!(answer(&get("/escape.json")).0, "404 Not Found");
         let mut post = get("/game.wasm");
@@ -545,7 +545,7 @@ mod tests {
             "/c/.pen/web/.game.wasm.1.tmp",
             "/c/target/debug/pen",
             "/c/node_modules/x/index.js",
-            "/c/src/game.blot",
+            "/c/src/game.sq",
             "/c/src/.text.json",
             "/c/src/locales/.sv.json",
             "/c/src/locales/sv.json~",

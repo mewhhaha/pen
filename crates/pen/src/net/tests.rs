@@ -309,10 +309,10 @@ impl Link for Late {
 
 /// gdev, started as a session starts it: its scene, nothing saved.
 fn start(directory: &Path) -> (GameRuntime, Vec<u8>) {
-    let engine = blot_host::engine().unwrap();
+    let engine = squid_host::engine().unwrap();
     let wasm = std::fs::read(directory.join("game.wasm")).unwrap();
     let cache = std::env::temp_dir().join("pen-test-wasm");
-    let module = blot_host::GuestModule::new(&engine, &wasm, Some(&cache)).unwrap();
+    let module = squid_host::GuestModule::new(&engine, &wasm, Some(&cache)).unwrap();
     let catalog = read_catalog(&directory.join("assets")).unwrap();
     let scene = snapshot::read(&directory.join("main.scene")).ok();
     let mut runtime = GameRuntime::new(&engine, module, catalog, &mut Null, None, scene).unwrap();

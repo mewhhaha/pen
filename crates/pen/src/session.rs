@@ -201,16 +201,23 @@ struct Shell<'a> {
     measuring: bool,
 }
 
-impl Host for Shell<'_> {
-    fn viewport(&self) -> Viewport {
-        Viewport { width: self.gpu.size.0.max(1), height: self.gpu.size.1.max(1) }
+fn to_retained_hint(delta: pen_runtime::game::FrameRetainedDelta<'_>) -> pen_render::RetainedHint<'_> {
+    pen_render::RetainedHint {
+        topology_epoch: delta.topology_epoch,
+        revision: delta.revision,
+        range: delta.range,
+        dirty_slots: delta.dirty_slots,
+        topology_changed: delta.topology_changed,
     }
+}
 
-    fn validate(&self, frame: &RenderFrame) -> Result<()> {
-        pen_render::validate_frame(frame)
-    }
-
-    fn render(&mut self, frame: &RenderFrame, catalog: &Catalog) -> Result<()> {
+impl Shell<'_> {
+    fn render_with_retained(
+        &mut self,
+        frame: &RenderFrame,
+        catalog: &Catalog,
+        retained: Option<pen_render::RetainedHint<'_>>,
+    ) -> Result<()> {
         let started = self.measuring.then(Instant::now);
         self.gpu.draw_timings = Default::default();
         self.preferences.apply(&mut self.gpu.renderer)?;
@@ -248,7 +255,7 @@ impl Host for Shell<'_> {
                 timings: &mut gpu.draw_timings,
             };
             let mut target = CaptureTarget { output, texture: texture.clone(), view: view.clone() };
-            gpu.renderer.submit_validated(frame, catalog, &mut target)?;
+            gpu.renderer.submit_validated_retained(frame, catalog, &mut target, retained.clone())?;
         }
         let clean_texture = clean_capture.map(|(texture, _)| texture);
         let overlay_texture = if separate_overlay_pass || (!need_clean_texture && has_overlay_shots) {
@@ -267,7 +274,7 @@ impl Host for Shell<'_> {
                     timings: &mut gpu.draw_timings,
                 };
                 let mut target = CaptureTarget { output, texture: texture.clone(), view };
-                gpu.renderer.submit_validated(frame, catalog, &mut target)?;
+                gpu.renderer.submit_validated_retained(frame, catalog, &mut target, retained.clone())?;
                 Some(texture)
             } else {
                 let output = Output {
@@ -280,7 +287,7 @@ impl Host for Shell<'_> {
                     timings: &mut gpu.draw_timings,
                 };
                 let mut target = SurfaceTarget { output, texture: None };
-                gpu.renderer.submit_validated(frame, catalog, &mut target)?;
+                gpu.renderer.submit_validated_retained(frame, catalog, &mut target, retained.clone())?;
                 target.present();
                 None
             }
@@ -298,7 +305,7 @@ impl Host for Shell<'_> {
                 timings: &mut gpu.draw_timings,
             };
             let mut target = SurfaceTarget { output, texture: None };
-            gpu.renderer.submit_validated(frame, catalog, &mut target)?;
+            gpu.renderer.submit_validated_retained(frame, catalog, &mut target, retained.clone())?;
             target.present();
             None
         } else {
@@ -354,6 +361,28 @@ impl Host for Shell<'_> {
             self.preferences.store(preferences)?;
         }
         Ok(())
+    }
+}
+
+impl Host for Shell<'_> {
+    fn viewport(&self) -> Viewport {
+        Viewport { width: self.gpu.size.0.max(1), height: self.gpu.size.1.max(1) }
+    }
+
+    fn validate(&self, frame: &RenderFrame) -> Result<()> {
+        pen_render::validate_frame(frame)
+    }
+
+    fn validate_incremental(
+        &self,
+        frame: &RenderFrame,
+        retained: Option<pen_runtime::game::FrameRetainedDelta<'_>>,
+    ) -> Result<()> {
+        pen_render::validate_frame_incremental(frame, retained.map(to_retained_hint))
+    }
+
+    fn render(&mut self, frame: &RenderFrame, catalog: &Catalog) -> Result<()> {
+        self.render_with_retained(frame, catalog, None)
     }
 
     fn report(&mut self, message: &str) {
@@ -1928,7 +1957,11 @@ impl Session {
         let mut state_replaced = false;
         let render_and_follow = (|| -> Result<pen_runtime::game::DrawTimings> {
             let mut shell = shell!(self, window);
-            shell.render(&rendered, self.runtime.catalog())?;
+            shell.render_with_retained(
+                &rendered,
+                self.runtime.catalog(),
+                self.runtime.retained_delta().map(to_retained_hint),
+            )?;
             let draw_timings = shell.gpu.draw_timings;
             if let Some(fault) = shell.gpu.take_fault() {
                 return Err(anyhow!(fault));

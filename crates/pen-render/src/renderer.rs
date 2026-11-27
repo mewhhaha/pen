@@ -28,6 +28,7 @@ mod particles;
 pub(crate) mod readback;
 mod reflections;
 mod resolution;
+mod retained;
 mod ribbons;
 #[cfg(test)]
 mod shadow_tests;
@@ -80,7 +81,7 @@ pub(crate) use particles::pipeline as particle_pipeline;
 pub(crate) use ribbons::pipeline as ribbon_pipeline;
 pub use shadows::SHADOWS_WGSL;
 pub(crate) use timing::{GpuTimer, Span};
-pub use validate::validate_frame;
+pub use validate::{validate_frame, validate_frame_incremental};
 pub use wired_passes::{
     ENV_FOLIAGE_EXT_TAG, ENV_TERRAIN_EXT_TAG, ENV_WATER_EXT_TAG, EnvironmentFoliage, EnvironmentScene,
     EnvironmentTerrain, GPU_PARTICLES_EXT_TAG, GpuParticleScene, JFA_OUTLINE_EXT_TAG, JfaOutlineScene,
@@ -916,6 +917,10 @@ pub(crate) struct State {
     meshlet_dag_outputs: Vec<crate::meshlet_dag::MeshletDagTwoPhaseOutput>,
     instance_data: Vec<f32>,
     instance_uploads: instance_upload::Uploads,
+    retained_gpu: retained::RetainedGpuTable,
+    asset_revision: u64,
+    checked_retained_epoch: u64,
+    checked_catalog_len: (usize, usize),
     last_stats: RenderStats,
     // Timestamps around the frame's passes, where the device has them, and
     // whether the host wants them.
@@ -1330,6 +1335,10 @@ impl State {
             meshlet_dag_outputs: Vec::new(),
             instance_data: vec![0.0; 20],
             instance_uploads: instance_upload::Uploads::default(),
+            retained_gpu: retained::RetainedGpuTable::default(),
+            asset_revision: 1,
+            checked_retained_epoch: 0,
+            checked_catalog_len: (0, 0),
             last_stats: RenderStats::default(),
             timer: timing::GpuTimer::new(&device, &queue),
             timing: false,
@@ -1795,6 +1804,7 @@ impl State {
             return;
         }
         self.context.set_depth_mode(mode);
+        self.asset_revision += 1;
         self.particles = None;
         self.ribbons = None;
         self.decals = None;

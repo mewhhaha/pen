@@ -262,6 +262,7 @@ impl Screen {
         game: &RenderFrame,
         overlay: Option<&RenderFrame>,
         catalog: &Catalog,
+        retained: Option<pen_render::RetainedHint<'_>>,
     ) -> Result<(f64, DrawTimings)> {
         self.canvas.timings = DrawTimings::default();
         let pacing = Instant::now();
@@ -276,7 +277,7 @@ impl Screen {
         if overlay.is_some() && self.overlay.is_none() {
             self.overlay = Some(self.renderer.share(self.assets.clone().into())?);
         }
-        self.renderer.submit_validated(game, catalog, &mut self.canvas)?;
+        self.renderer.submit_validated_retained(game, catalog, &mut self.canvas, retained)?;
         #[cfg(feature = "devtools")]
         if let (Some(overlay), Some(renderer)) = (overlay, &mut self.overlay) {
             renderer.prepare_sprites(&overlay.sprites, catalog)?;

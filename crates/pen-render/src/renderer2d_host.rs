@@ -114,6 +114,10 @@ pub fn validate_frame(frame: &RenderFrame) -> Result<()> {
     Ok(())
 }
 
+pub fn validate_frame_incremental(frame: &RenderFrame, _retained: Option<crate::RetainedHint<'_>>) -> Result<()> {
+    validate_frame(frame)
+}
+
 impl State2d {
     pub fn new(device: wgpu::Device, queue: wgpu::Queue, options: RendererOptions) -> Result<Self> {
         let sprite_group = sprite_group_layout(&device);
@@ -616,6 +620,16 @@ impl State2d {
         frame: &RenderFrame,
         catalog: &Catalog,
         target: &mut dyn RenderTarget,
+    ) -> Result<()> {
+        self.submit_validated_retained(frame, catalog, target, None)
+    }
+
+    pub fn submit_validated_retained(
+        &mut self,
+        frame: &RenderFrame,
+        catalog: &Catalog,
+        target: &mut dyn RenderTarget,
+        _retained: Option<crate::RetainedHint<'_>>,
     ) -> Result<()> {
         self.drain_inbox();
         let size = target.size();

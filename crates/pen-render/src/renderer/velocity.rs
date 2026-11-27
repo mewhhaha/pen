@@ -32,6 +32,17 @@ const INSTANCE_MODEL_ATTRIBUTES: [wgpu::VertexAttribute; 4] = [
     wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 48, shader_location: 6 },
 ];
 
+const INSTANCE_MOVING_ATTRIBUTES: [wgpu::VertexAttribute; 8] = [
+    wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 0, shader_location: 3 },
+    wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 16, shader_location: 4 },
+    wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 32, shader_location: 5 },
+    wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 48, shader_location: 6 },
+    wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 64, shader_location: 7 },
+    wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 80, shader_location: 8 },
+    wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 96, shader_location: 9 },
+    wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 112, shader_location: 10 },
+];
+
 const SKIN_ATTRIBUTES: [wgpu::VertexAttribute; 2] = [
     wgpu::VertexAttribute { format: wgpu::VertexFormat::Uint16x4, offset: 0, shader_location: 9 },
     wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 8, shader_location: 10 },
@@ -40,6 +51,7 @@ const SKIN_ATTRIBUTES: [wgpu::VertexAttribute; 2] = [
 struct Pipelines {
     plain: wgpu::RenderPipeline,
     instanced: wgpu::RenderPipeline,
+    instanced_moving: wgpu::RenderPipeline,
     skinned: wgpu::RenderPipeline,
     camera_uniform: wgpu::Buffer,
     camera_group: wgpu::BindGroup,
@@ -57,6 +69,11 @@ pub(super) struct Velocity {
     draw_group: Option<wgpu::BindGroup>,
     draw_data: Vec<f32>,
     motion_slots: Vec<(usize, u32)>,
+    moving_capacity: usize,
+    moving_buffer: Option<wgpu::Buffer>,
+    moving_entries: Vec<(usize, usize, usize)>,
+    moving_data: Vec<f32>,
+    moving_runs: Vec<(usize, u32, u32)>,
     /// 2-slot caches matching double-buffered `Skinning` ring buffers.
     skin_both: [Option<SkinBothEntry>; 2],
     skin_both_next: usize,
@@ -78,6 +95,11 @@ impl Velocity {
             draw_group: None,
             draw_data: Vec::new(),
             motion_slots: Vec::new(),
+            moving_capacity: 0,
+            moving_buffer: None,
+            moving_entries: Vec::new(),
+            moving_data: Vec::new(),
+            moving_runs: Vec::new(),
             skin_both: [None, None],
             skin_both_next: 0,
             skin_same: [None, None],
@@ -206,6 +228,11 @@ impl Velocity {
             step_mode: wgpu::VertexStepMode::Instance,
             attributes: &INSTANCE_MODEL_ATTRIBUTES,
         });
+        let inst_moving_buf = Some(wgpu::VertexBufferLayout {
+            array_stride: 128,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &INSTANCE_MOVING_ATTRIBUTES,
+        });
         let skin_buf = Some(wgpu::VertexBufferLayout {
             array_stride: SKIN_VERTEX_BYTES,
             step_mode: wgpu::VertexStepMode::Vertex,
@@ -219,6 +246,12 @@ impl Velocity {
         );
         let instanced =
             make("velocity instanced", &[Some(&camera_layout)], "vertex_instanced", &[pos_buf.clone(), inst_buf]);
+        let instanced_moving = make(
+            "velocity instanced moving",
+            &[Some(&camera_layout)],
+            "vertex_instanced_moving",
+            &[pos_buf.clone(), inst_moving_buf],
+        );
         let skinned = make(
             "velocity skinned",
             &[Some(&camera_layout), Some(&draw_layout), Some(&skin_layout)],
@@ -236,8 +269,29 @@ impl Velocity {
             layout: &camera_layout,
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: camera_uniform.as_entire_binding() }],
         });
-        self.pipelines =
-            Some(Pipelines { plain, instanced, skinned, camera_uniform, camera_group, draw_layout, skin_layout });
+        self.pipelines = Some(Pipelines {
+            plain,
+            instanced,
+            instanced_moving,
+            skinned,
+            camera_uniform,
+            camera_group,
+            draw_layout,
+            skin_layout,
+        });
+    }
+
+    fn ensure_moving_buffer(&mut self, device: &wgpu::Device, count: usize) {
+        if count <= self.moving_capacity && self.moving_buffer.is_some() {
+            return;
+        }
+        self.moving_capacity = count.next_power_of_two().max(16);
+        self.moving_buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("velocity moving instances"),
+            size: self.moving_capacity as u64 * 128,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }));
     }
 
     fn ensure_draw_buffer(&mut self, device: &wgpu::Device, count: usize) {
@@ -368,6 +422,41 @@ impl Velocity {
                 bytemuck::cast_slice(&self.draw_data[..slot_count * stride_floats]),
             );
 
+            // Gather moving single-LOD instanced draws so they render first with exact
+            // (curr, prev) transforms and win `DepthCompare::Less` over their batch entry.
+            self.moving_entries.clear();
+            self.moving_runs.clear();
+            for (motion_idx, motion) in frame.motions.iter().enumerate() {
+                let draw_idx = motion.draw as usize;
+                let Some(placement) = scratch.placements.get(draw_idx) else { continue };
+                let Some(batch) = drawing.batches.get(placement.batch as usize) else { continue };
+                let Some(draw) = frame.draws.get(draw_idx) else { continue };
+                if draw.transform != motion.previous {
+                    self.moving_entries.push((batch.mesh, draw_idx, motion_idx));
+                }
+            }
+            if !self.moving_entries.is_empty() {
+                crate::sort::sort_by_u64_key(&mut self.moving_entries, |&(mesh_slot, _, _)| mesh_slot as u64);
+                self.moving_data.clear();
+                self.moving_data.reserve(self.moving_entries.len() * 32);
+                let mut i = 0;
+                while i < self.moving_entries.len() {
+                    let mesh_slot = self.moving_entries[i].0;
+                    let first = u32::try_from(self.moving_data.len() / 32).unwrap_or(0);
+                    let mut count = 0u32;
+                    while i < self.moving_entries.len() && self.moving_entries[i].0 == mesh_slot {
+                        let (_, draw_idx, motion_idx) = self.moving_entries[i];
+                        self.moving_data.extend_from_slice(&frame.draws[draw_idx].transform);
+                        self.moving_data.extend_from_slice(&frame.motions[motion_idx].previous);
+                        count += 1;
+                        i += 1;
+                    }
+                    self.moving_runs.push((mesh_slot, first, count));
+                }
+                self.ensure_moving_buffer(device, self.moving_data.len() / 32);
+                queue.write_buffer(self.moving_buffer.as_ref().unwrap(), 0, bytemuck::cast_slice(&self.moving_data));
+            }
+
             // Prepare skinned velocity bind groups if any skinned buffers are live (2-slot cache for double-buffered skins).
             let [curr_skin_buf, prev_skin_buf] = skinning.buffers();
             let mut active_skin_same: Option<usize> = None;
@@ -470,6 +559,23 @@ impl Velocity {
                 ..Default::default()
             });
             pass.set_bind_group(0, &pipelines.camera_group, &[]);
+
+            if !self.moving_runs.is_empty()
+                && let Some(moving_buf) = &self.moving_buffer
+            {
+                pass.set_pipeline(&pipelines.instanced_moving);
+                pass.set_vertex_buffer(1, moving_buf.slice(..));
+                for &(mesh_slot, first, count) in &self.moving_runs {
+                    let Some(GpuAsset::Mesh(mesh)) = drawing.assets.current(mesh_slot) else { continue };
+                    if mesh.instances.is_some() {
+                        continue;
+                    }
+                    let lod = &mesh.lods[0];
+                    pass.set_vertex_buffer(0, mesh.vertices.slice(..));
+                    pass.set_index_buffer(mesh.indices.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(lod.first..lod.first + lod.count, 0, first..first + count);
+                }
+            }
 
             let mut next_slot_cursor = 0usize;
             for &idx in &scratch.opaque {

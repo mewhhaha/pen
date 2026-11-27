@@ -1,4 +1,4 @@
-use super::super::{GpuAsset, RtMeshSource, Scratch, Shape, Source, State};
+use super::super::{GpuAsset, Scratch, Shape, Source, State};
 use crate::ddgi::{DDGI_PACKED_HEADER_VEC4S, DdgiFrameParams, DdgiGridConfig, DdgiVolume};
 use crate::matrix::{IDENTITY, invert};
 use crate::ray_tracing::{GpuBlasPool, MAX_RT_LOCAL_LIGHTS, RtLocalLight, TlasInstance};
@@ -6,7 +6,6 @@ use crate::restir::RESTIR_MAX_LIGHTS;
 use anyhow::Result;
 use pen_protocol::RenderFrame;
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
 
 /// Resolves sky zenith/horizon colors for DDGI and RT miss rays.
 /// Falls back to `frame.ambient` (and subtle sky gradient when `physical_sky` is active) whenever
@@ -128,6 +127,7 @@ impl State {
         encoder: &mut wgpu::CommandEncoder,
         frame: &RenderFrame,
         scratch: &Scratch,
+        retained: Option<&crate::RetainedHint<'_>>,
     ) -> Result<bool> {
         self.wired.ddgi_active_this_frame = false;
         if (frame.quality.ray_tracing == 0 || !crate::ray_tracing::TlasRayTracer::supported(&self.device))
@@ -135,49 +135,37 @@ impl State {
         {
             return Ok(false);
         }
+        // Fast path: unchanged retained-only scene with identical assets and solids needs zero work.
+        if let Some(hint) = retained
+            && !hint.topology_changed
+            && hint.topology_epoch != 0
+            && hint.topology_epoch == self.wired.tlas_retained_epoch
+            && hint.revision == self.wired.tlas_retained_revision
+            && self.wired.tlas_asset_revision == self.asset_revision
+            && self.wired.tlas_solids_revision == self.solids_revision
+            && hint.range.start == 0
+            && hint.range.end == frame.draws.len()
+            && frame.insets.is_empty()
+            && self.wired.tlas_gpu.is_some()
+        {
+            return Ok(true);
+        }
         let device = &self.device;
         let pool = self.wired.blas_pool.get_or_insert_with(|| GpuBlasPool::new(device));
-        let mut instances: Vec<TlasInstance> = Vec::new();
+        let mut instances = std::mem::take(&mut self.wired.tlas_instances_scratch);
+        instances.clear();
         let mut world_min = [f32::INFINITY; 3];
         let mut world_max = [f32::NEG_INFINITY; 3];
 
-        let mut push_inst = |pool: &mut GpuBlasPool,
-                             source: &Arc<RtMeshSource>,
-                             transform: [f32; 16],
-                             m: &crate::asset_store::Material,
-                             draw_params: Option<[f32; 4]>|
-         -> Result<()> {
-            let Some(bi) = pool.ensure_blas_with(device, encoder, source.id, || source.triangles())? else {
-                return Ok(());
-            };
-            if !transform.iter().all(|v| v.is_finite()) {
-                return Ok(());
-            }
-            let is_affine = transform[3] == 0.0 && transform[7] == 0.0 && transform[11] == 0.0 && transform[15] == 1.0;
-            let det3 = transform[0] * (transform[5] * transform[10] - transform[6] * transform[9])
-                - transform[4] * (transform[1] * transform[10] - transform[2] * transform[9])
-                + transform[8] * (transform[1] * transform[6] - transform[2] * transform[5]);
-            if !(is_affine && det3.is_finite() && det3.abs() > 1e-12)
-                && !invert(&transform).iter().all(|v| v.is_finite())
-            {
-                return Ok(());
-            }
-            let (bmin, bmax) = pool.blas_bounds(bi);
-            for &x in &[bmin[0], bmax[0]] {
-                for &y in &[bmin[1], bmax[1]] {
-                    for &z in &[bmin[2], bmax[2]] {
-                        let wx = transform[0] * x + transform[4] * y + transform[8] * z + transform[12];
-                        let wy = transform[1] * x + transform[5] * y + transform[9] * z + transform[13];
-                        let wz = transform[2] * x + transform[6] * y + transform[10] * z + transform[14];
-                        world_min[0] = world_min[0].min(wx);
-                        world_min[1] = world_min[1].min(wy);
-                        world_min[2] = world_min[2].min(wz);
-                        world_max[0] = world_max[0].max(wx);
-                        world_max[1] = world_max[1].max(wy);
-                        world_max[2] = world_max[2].max(wz);
-                    }
-                }
-            }
+        struct MatShade {
+            albedo: [f32; 3],
+            emissive: [f32; 3],
+            base_metallic: f32,
+            base_roughness: f32,
+            pbr_params: bool,
+            clearcoat_cap: Option<f32>,
+        }
+        let material_shade = |m: &crate::asset_store::Material| -> MatShade {
             #[allow(clippy::cast_possible_truncation, reason = "clamped finite material color")]
             let base_rgb = m.bounce_color.unwrap_or([m.color[0], m.color[1], m.color[2]]);
             #[allow(clippy::cast_possible_truncation, reason = "clamped finite material color")]
@@ -195,10 +183,9 @@ impl State {
             } else {
                 [0.0; 3]
             };
-            #[allow(clippy::cast_possible_truncation, reason = "finite material parameters")]
             let pbr_params = super::super::thin_gbuffer::uses_pbr_parameters(m);
             #[allow(clippy::cast_possible_truncation, reason = "finite material parameters")]
-            let (mut metallic, mut roughness) = if pbr_params {
+            let (base_metallic, base_roughness) = if pbr_params {
                 match m.instance_parameters {
                     Some(p) => {
                         let met = (p[0] as f32).clamp(0.0, 1.0);
@@ -210,7 +197,48 @@ impl State {
             } else {
                 (0.0, 0.85)
             };
-            if pbr_params && let Some(p) = draw_params {
+            let clearcoat_cap = (m.surface.clearcoat > 0.0).then(|| m.surface.clearcoat_roughness.clamp(0.04, 0.35));
+            MatShade { albedo, emissive, base_metallic, base_roughness, pbr_params, clearcoat_cap }
+        };
+
+        let mut push_inst_blas = |bi: u32,
+                                  bmin: [f32; 3],
+                                  bmax: [f32; 3],
+                                  transform: [f32; 16],
+                                  shade: &MatShade,
+                                  draw_params: Option<[f32; 4]>| {
+            if !transform.iter().all(|v| v.is_finite()) {
+                return;
+            }
+            let is_affine = transform[3] == 0.0 && transform[7] == 0.0 && transform[11] == 0.0 && transform[15] == 1.0;
+            let det3 = transform[0] * (transform[5] * transform[10] - transform[6] * transform[9])
+                - transform[4] * (transform[1] * transform[10] - transform[2] * transform[9])
+                + transform[8] * (transform[1] * transform[6] - transform[2] * transform[5]);
+            if !(is_affine && det3.is_finite() && det3.abs() > 1e-12)
+                && !invert(&transform).iter().all(|v| v.is_finite())
+            {
+                return;
+            }
+            for &x in &[bmin[0], bmax[0]] {
+                for &y in &[bmin[1], bmax[1]] {
+                    for &z in &[bmin[2], bmax[2]] {
+                        let wx = transform[0] * x + transform[4] * y + transform[8] * z + transform[12];
+                        let wy = transform[1] * x + transform[5] * y + transform[9] * z + transform[13];
+                        let wz = transform[2] * x + transform[6] * y + transform[10] * z + transform[14];
+                        world_min[0] = world_min[0].min(wx);
+                        world_min[1] = world_min[1].min(wy);
+                        world_min[2] = world_min[2].min(wz);
+                        world_max[0] = world_max[0].max(wx);
+                        world_max[1] = world_max[1].max(wy);
+                        world_max[2] = world_max[2].max(wz);
+                    }
+                }
+            }
+            let mut metallic = shade.base_metallic;
+            let mut roughness = shade.base_roughness;
+            if shade.pbr_params
+                && let Some(p) = draw_params
+            {
                 if p[0].is_finite() {
                     metallic = p[0].clamp(0.0, 1.0);
                 }
@@ -218,16 +246,15 @@ impl State {
                     roughness = p[1].clamp(0.04, 1.0);
                 }
             }
-            if m.surface.clearcoat > 0.0 {
-                roughness = roughness.min(m.surface.clearcoat_roughness.clamp(0.04, 0.35));
+            if let Some(cap) = shade.clearcoat_cap {
+                roughness = roughness.min(cap);
             }
             let mut inst = TlasInstance::new(bi, transform);
-            inst.albedo = albedo;
-            inst.emissive = emissive;
+            inst.albedo = shade.albedo;
+            inst.emissive = shade.emissive;
             inst.roughness = roughness;
             inst.metallic = metallic;
             instances.push(inst);
-            Ok(())
         };
 
         let mut batch_draws: Option<Vec<Vec<usize>>> = None;
@@ -235,12 +262,14 @@ impl State {
         for &ready_idx in &scratch.opaque {
             let entry = &scratch.ready[ready_idx];
             let item = &scratch.items[entry.item];
-            let mat = &entry.material.material;
+            let shade = material_shade(&entry.material.material);
             match item.shape {
                 Shape::Mesh(_) => {
                     if let Some(GpuAsset::Mesh(mesh)) = entry.mesh.and_then(|slot| self.assets.current(slot))
                         && let Some(src) = &mesh.rt_source
+                        && let Some(bi) = pool.ensure_blas_with(device, encoder, src.id, || src.triangles())?
                     {
+                        let (bmin, bmax) = pool.blas_bounds(bi);
                         let draw_params = match item.source {
                             Source::Draw(idx) => frame.draws.get(idx).and_then(|d| d.parameters),
                             Source::Inset(inset_idx, idx) => frame
@@ -250,21 +279,25 @@ impl State {
                                 .and_then(|d| d.parameters),
                             Source::World => None,
                         };
-                        push_inst(pool, src, *item.transform(frame), mat, draw_params)?;
+                        push_inst_blas(bi, bmin, bmax, *item.transform(frame), &shade, draw_params);
                     }
                 }
                 Shape::Solid(idx) => {
                     if let Some(solid) = self.solid_meshes.get(idx)
                         && let Some(src) = &solid.rt_source
+                        && let Some(bi) = pool.ensure_blas_with(device, encoder, src.id, || src.triangles())?
                     {
-                        push_inst(pool, src, IDENTITY, mat, None)?;
+                        let (bmin, bmax) = pool.blas_bounds(bi);
+                        push_inst_blas(bi, bmin, bmax, IDENTITY, &shade, None);
                     }
                 }
                 Shape::Batch(batch_idx) => {
                     let batch = &scratch.batches[batch_idx];
                     if let Some(GpuAsset::Mesh(mesh)) = self.assets.current(batch.mesh)
                         && let Some(src) = &mesh.rt_source
+                        && let Some(bi) = pool.ensure_blas_with(device, encoder, src.id, || src.triangles())?
                     {
+                        let (bmin, bmax) = pool.blas_bounds(bi);
                         let by_batch = batch_draws.get_or_insert_with(|| {
                             let mut grouped = vec![Vec::new(); scratch.batches.len()];
                             for (draw_idx, placement) in scratch.placements.iter().enumerate() {
@@ -277,7 +310,7 @@ impl State {
                         if let Some(draw_indices) = by_batch.get(batch_idx) {
                             for &draw_idx in draw_indices {
                                 if let Some(draw) = frame.draws.get(draw_idx) {
-                                    push_inst(pool, src, draw.transform, mat, draw.parameters)?;
+                                    push_inst_blas(bi, bmin, bmax, draw.transform, &shade, draw.parameters);
                                 }
                             }
                         }
@@ -287,8 +320,11 @@ impl State {
         }
 
         if instances.is_empty() {
+            self.wired.tlas_instances_scratch = instances;
             self.wired.tlas_gpu = None;
             self.wired.tlas_bounds = None;
+            self.wired.tlas_retained_epoch = 0;
+            self.wired.tlas_retained_revision = 0;
             return Ok(false);
         }
 
@@ -314,7 +350,22 @@ impl State {
             self.wired.tlas_gpu = Some(pool.snapshot_scene());
             self.wired.tlas_hash = scene_hash;
         }
+        self.wired.tlas_instances_scratch = instances;
         self.wired.tlas_bounds = Some((world_min, world_max));
+        if let Some(hint) = retained
+            && hint.topology_epoch != 0
+            && hint.range.start == 0
+            && hint.range.end == frame.draws.len()
+            && frame.insets.is_empty()
+        {
+            self.wired.tlas_retained_epoch = hint.topology_epoch;
+            self.wired.tlas_retained_revision = hint.revision;
+            self.wired.tlas_asset_revision = self.asset_revision;
+            self.wired.tlas_solids_revision = self.solids_revision;
+        } else {
+            self.wired.tlas_retained_epoch = 0;
+            self.wired.tlas_retained_revision = 0;
+        }
         Ok(true)
     }
 

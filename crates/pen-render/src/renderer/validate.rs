@@ -3,11 +3,36 @@
 // their fields.
 use anyhow::{Result, ensure};
 use pen_protocol::boundary::{MAX_DRAW_EXTRA, MAX_FIELD};
-use pen_protocol::{Exposure, Grade, Matrix, RenderFrame, Vector};
+use pen_protocol::{Draw, Exposure, Grade, Matrix, RenderFrame, Vector};
 
 use crate::matrix::narrow;
 
+fn validate_draw(draw: &Draw) -> Result<()> {
+    validate_matrix(&draw.transform)?;
+    if let Some(parameters) = &draw.parameters {
+        ensure!(
+            parameters.iter().all(|value| value.is_finite()),
+            "draw parameters must contain four finite float32 values"
+        );
+    }
+    if let Some(extra) = &draw.extra {
+        ensure!(
+            extra.len() % 4 == 0 && extra.len() <= MAX_DRAW_EXTRA * 4 && extra.iter().all(|value| value.is_finite()),
+            "draw extra data must be up to 32 vectors of finite float32 values"
+        );
+    }
+    determinant_of(&draw.transform)?;
+    Ok(())
+}
+
 pub fn validate_frame(frame: &RenderFrame) -> Result<()> {
+    validate_frame_incremental(frame, None)
+}
+
+/// Validates `frame`, skipping already-validated unchanged retained draws inside
+/// `retained.range` when `!retained.topology_changed` and only checking
+/// `retained.dirty_slots` within that range.
+pub fn validate_frame_incremental(frame: &RenderFrame, retained: Option<crate::RetainedHint<'_>>) -> Result<()> {
     validate_matrix(&frame.view)?;
     validate_matrix(&frame.projection)?;
     crate::lights::validate(&frame.lights)?;
@@ -169,23 +194,28 @@ pub fn validate_frame(frame: &RenderFrame) -> Result<()> {
         [clear.r, clear.g, clear.b, clear.a].iter().all(|value| value.is_finite() && (0.0..=1.0).contains(value)),
         "clear color must have 0..1 channels"
     );
-    for draw in &frame.draws {
-        validate_matrix(&draw.transform)?;
-        if let Some(parameters) = &draw.parameters {
-            ensure!(
-                parameters.iter().all(|value| value.is_finite()),
-                "draw parameters must contain four finite float32 values"
-            );
+    match retained {
+        Some(hint)
+            if !hint.topology_changed && hint.range.start <= hint.range.end && hint.range.end <= frame.draws.len() =>
+        {
+            for draw in &frame.draws[..hint.range.start] {
+                validate_draw(draw)?;
+            }
+            let retained_slice = &frame.draws[hint.range.clone()];
+            for &slot in hint.dirty_slots {
+                if let Some(draw) = retained_slice.get(slot as usize) {
+                    validate_draw(draw)?;
+                }
+            }
+            for draw in &frame.draws[hint.range.end..] {
+                validate_draw(draw)?;
+            }
         }
-        if let Some(extra) = &draw.extra {
-            ensure!(
-                extra.len() % 4 == 0
-                    && extra.len() <= MAX_DRAW_EXTRA * 4
-                    && extra.iter().all(|value| value.is_finite()),
-                "draw extra data must be up to 32 vectors of finite float32 values"
-            );
+        _ => {
+            for draw in &frame.draws {
+                validate_draw(draw)?;
+            }
         }
-        determinant_of(&draw.transform)?;
     }
     for decal in &frame.decals {
         validate_matrix(&decal.transform)?;

@@ -169,8 +169,15 @@ impl Item {
 
 impl State {
     /// Checks that every asset the frame names is in the catalog and stays
-    /// inside the asset root, each once.
-    pub(super) fn check_names(&mut self, frame: &RenderFrame, catalog: &Catalog) -> Result<()> {
+    /// inside the asset root, each once. When unchanged retained metadata is
+    /// provided and the catalog dimensions match, skips re-checking the
+    /// already-validated retained slice.
+    pub(super) fn check_names(
+        &mut self,
+        frame: &RenderFrame,
+        catalog: &Catalog,
+        retained: Option<&crate::RetainedHint<'_>>,
+    ) -> Result<()> {
         self.checks += 1;
         let check = self.checks;
         let (meshes, materials) = (&mut self.checked_meshes, &mut self.checked_materials);
@@ -185,9 +192,35 @@ impl State {
             }
             Ok(())
         };
-        for draw in frame.draws.iter().chain(frame.insets.iter().flat_map(|inset| &inset.draws)) {
-            checked(&catalog.meshes, meshes, draw.mesh)?;
-            checked(&catalog.materials, materials, draw.material)?;
+        let catalog_len = (catalog.meshes.len(), catalog.materials.len());
+        let skip_retained = retained.filter(|hint| {
+            !hint.topology_changed
+                && hint.topology_epoch != 0
+                && hint.topology_epoch == self.checked_retained_epoch
+                && self.checked_catalog_len == catalog_len
+                && hint.range.start <= hint.range.end
+                && hint.range.end <= frame.draws.len()
+        });
+        if let Some(hint) = skip_retained {
+            for draw in frame.draws[..hint.range.start]
+                .iter()
+                .chain(&frame.draws[hint.range.end..])
+                .chain(frame.insets.iter().flat_map(|inset| &inset.draws))
+            {
+                checked(&catalog.meshes, meshes, draw.mesh)?;
+                checked(&catalog.materials, materials, draw.material)?;
+            }
+        } else {
+            for draw in frame.draws.iter().chain(frame.insets.iter().flat_map(|inset| &inset.draws)) {
+                checked(&catalog.meshes, meshes, draw.mesh)?;
+                checked(&catalog.materials, materials, draw.material)?;
+            }
+            if let Some(hint) = retained
+                && hint.topology_epoch != 0
+            {
+                self.checked_retained_epoch = hint.topology_epoch;
+                self.checked_catalog_len = catalog_len;
+            }
         }
         let named = frame.solids.iter().flat_map(|solid| solid.faces.iter().map(|face| face.material));
         let named = named
@@ -215,6 +248,515 @@ impl State {
         Ok(())
     }
 
+    fn grow_instances(&mut self, needed: usize) -> Result<()> {
+        if needed > self.instance_capacity {
+            self.instance_capacity = needed.next_power_of_two();
+            ensure!(
+                self.instance_capacity as u64 * 80 <= self.device.limits().max_buffer_size,
+                "instance list exceeds device buffer size"
+            );
+            self.instance_buffer = instance_buffer(&self.device, self.instance_capacity);
+            self.instance_data.resize(self.instance_capacity * 20, 0.0);
+            self.instance_uploads.invalidate();
+            self.retained_gpu.uploaded = false;
+        }
+        Ok(())
+    }
+
+    fn grow_draw_uniforms(&mut self, item_count: usize) -> Result<()> {
+        if item_count > self.capacity {
+            self.capacity = item_count.next_power_of_two();
+            ensure!(
+                self.capacity as u64 * self.stride <= self.device.limits().max_buffer_size,
+                "draw list exceeds device buffer size"
+            );
+            self.draw_uniform = uniform_buffer(&self.device, "draws", self.capacity as u64 * self.stride);
+            self.groups.clear();
+            self.uniform_data = vec![0.0; self.capacity * (self.stride / 4) as usize];
+        }
+        Ok(())
+    }
+
+    /// Checks whether `hint` is eligible for persistent GPU-slot retention (no posed, morphed,
+    /// or JFA-outlined draw falls inside `hint.range`).
+    fn retained_range_eligible(
+        &self,
+        frame: &RenderFrame,
+        hint: &crate::RetainedHint<'_>,
+        outline_scenes: &super::wired_passes::OutlineScenes,
+    ) -> bool {
+        if self.wired.in_secondary_camera
+            || hint.topology_epoch == 0
+            || hint.range.is_empty()
+            || hint.range.start > hint.range.end
+            || hint.range.end > frame.draws.len()
+        {
+            return false;
+        }
+        if frame.poses.iter().any(|p| p.inset == 0 && hint.range.contains(&(p.draw as usize)))
+            || frame.bone_matrices.iter().any(|b| b.inset == 0 && hint.range.contains(&(b.draw as usize)))
+            || frame.morph_weights.iter().any(|m| m.inset == 0 && hint.range.contains(&(m.draw as usize)))
+            || outline_scenes.iter().flatten().any(|s| s.targets.iter().any(|t| hint.range.contains(&t.draw_index)))
+        {
+            return false;
+        }
+        true
+    }
+
+    /// Builds `self.retained_gpu` for `hint.range`, assigning fixed persistent GPU slots
+    /// `[0 .. gpu_used)` to every GPU-culled retained batch.
+    fn build_retained_table(
+        &mut self,
+        frame: &RenderFrame,
+        catalog: &Catalog,
+        samples: u32,
+        hint: &crate::RetainedHint<'_>,
+        scratch: &mut Scratch,
+    ) -> Result<bool> {
+        scratch.chosen.clear();
+        scratch.choices.clear();
+        scratch.parameter_batches.clear();
+        scratch.batches.clear();
+        scratch.placements.clear();
+
+        let retained_draws = &frame.draws[hint.range.clone()];
+        let mut placements = Vec::with_capacity(retained_draws.len());
+        let mut last = ((u32::MAX, u32::MAX), u32::MAX);
+        let mut has_waiting = false;
+        for draw in retained_draws {
+            let placement = self.place_cached(draw, catalog, samples, scratch, false, false, &mut last)?;
+            if placement.batch == LEFT_OUT {
+                has_waiting = true;
+            }
+            placements.push(placement);
+        }
+        if has_waiting {
+            scratch.chosen.clear();
+            scratch.choices.clear();
+            scratch.parameter_batches.clear();
+            scratch.batches.clear();
+            return Ok(false);
+        }
+
+        scratch.gpu_order.clear();
+        for (i, batch) in scratch.batches.iter().enumerate() {
+            if batch.bounds.is_some()
+                && matches!(self.assets.current(batch.mesh), Some(GpuAsset::Mesh(_)))
+                && self.culling.takes(batch.count)
+            {
+                scratch.gpu_order.push(i);
+            }
+        }
+        crate::sort::sort_by_u64_key(&mut scratch.gpu_order, |&i| u64::from(!scratch.batches[i].count));
+
+        let mut persistent_firsts = vec![u32::MAX; scratch.batches.len()];
+        let mut gpu_used = 0u32;
+        for &batch_idx in &scratch.gpu_order {
+            let count = scratch.batches[batch_idx].count;
+            let Some(next) = gpu_used.checked_add(count) else { break };
+            persistent_firsts[batch_idx] = gpu_used;
+            gpu_used = next;
+        }
+        let gpu_reserved = if gpu_used > 0 { gpu_used.next_multiple_of(512) } else { 0 };
+
+        let mut batch_cursors = vec![0u32; scratch.batches.len()];
+        let mut gpu_slot = Vec::with_capacity(placements.len());
+        let mut non_gpu_indices = Vec::new();
+        for (r, placement) in placements.iter().enumerate() {
+            let b = placement.batch as usize;
+            if let Some(&first) = persistent_firsts.get(b)
+                && first != u32::MAX
+            {
+                let slot = first + batch_cursors[b];
+                batch_cursors[b] += 1;
+                gpu_slot.push(slot);
+            } else {
+                gpu_slot.push(u32::MAX);
+                #[allow(clippy::cast_possible_truncation, reason = "retained count <= MAX_DRAWS fits in u32")]
+                non_gpu_indices.push(r as u32);
+            }
+        }
+
+        let batches = scratch
+            .batches
+            .drain(..)
+            .enumerate()
+            .map(|(i, batch)| super::retained::RetainedBatchSpec {
+                mesh: batch.mesh,
+                material: batch.material,
+                pipeline: batch.pipeline,
+                bounds: batch.bounds,
+                casts: batch.casts,
+                count: batch.count,
+                persistent_first: persistent_firsts[i],
+            })
+            .collect();
+
+        let table = &mut self.retained_gpu;
+        table.topology_epoch = hint.topology_epoch;
+        table.last_revision = hint.revision;
+        table.samples = samples;
+        table.asset_revision = self.asset_revision;
+        table.gpu_culling_ready = self.culling.takes(u32::MAX);
+        table.range = hint.range.clone();
+        table.choices = std::mem::take(&mut scratch.choices);
+        table.placements = placements;
+        table.batches = batches;
+        table.gpu_slot = gpu_slot;
+        table.non_gpu_indices = non_gpu_indices;
+        table.gpu_used = gpu_used;
+        table.gpu_reserved = gpu_reserved;
+        table.uploaded = false;
+
+        scratch.chosen.clear();
+        scratch.parameter_batches.clear();
+        scratch.gpu_order.clear();
+        Ok(true)
+    }
+
+    /// Persistent retained-scene batching fast path: reuses cached `(mesh, material)` choices,
+    /// placements, and fixed GPU instance slots `[0 .. gpu_reserved)`, touching only dirty
+    /// retained slots and dynamic/immediate draws.
+    #[allow(clippy::too_many_arguments)]
+    fn batch_with_retained(
+        &mut self,
+        frame: &RenderFrame,
+        catalog: &Catalog,
+        samples: u32,
+        scratch: &mut Scratch,
+        stats: &mut RenderStats,
+        outline_scenes: &super::wired_passes::OutlineScenes,
+        needs_velocity: bool,
+        hint: &crate::RetainedHint<'_>,
+    ) -> Result<bool> {
+        let range = hint.range.clone();
+        // If velocity is active and any moving retained draw uses a multi-LOD mesh, fall back so
+        // velocity LOD stays identical to scene LOD. Single-LOD moving draws stay instanced.
+        if needs_velocity && !frame.motions.is_empty() {
+            for motion in &frame.motions {
+                let draw_idx = motion.draw as usize;
+                if range.contains(&draw_idx) {
+                    let r = draw_idx - range.start;
+                    let choice_idx = self.retained_gpu.placements[r].choice as usize;
+                    if self.retained_gpu.choices[choice_idx].levels > 1 {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+
+        scratch.choices.extend_from_slice(&self.retained_gpu.choices);
+        let retained_batch_count = self.retained_gpu.batches.len();
+        scratch.batches.reserve(retained_batch_count);
+        for spec in &self.retained_gpu.batches {
+            let gpu = if spec.persistent_first != u32::MAX {
+                let (Some(bounds), Some(GpuAsset::Mesh(mesh))) = (spec.bounds, self.assets.current(spec.mesh)) else {
+                    return Ok(false);
+                };
+                let view_mask = if spec.casts { scratch.views.all() } else { CAMERA | scratch.capture_bit };
+                let Some(added) = self.culling.add(&bounds, &mesh.lods, spec.persistent_first, spec.count, view_mask)
+                else {
+                    return Ok(false);
+                };
+                Some(added)
+            } else {
+                None
+            };
+            scratch.batches.push(InstanceBatch {
+                mesh: spec.mesh,
+                material: spec.material,
+                pipeline: spec.pipeline.clone(),
+                bounds: spec.bounds,
+                casts: spec.casts,
+                count: spec.count,
+                gpu,
+                first: spec.persistent_first,
+                written: if gpu.is_some() { spec.count } else { 0 },
+                ranges: Default::default(),
+            });
+        }
+
+        // Immediate prefix + cached retained middle + immediate suffix.
+        scratch.placements.reserve(frame.draws.len());
+        let mut last = ((u32::MAX, u32::MAX), u32::MAX);
+        for (index, draw) in frame.draws[..range.start].iter().enumerate() {
+            let alone =
+                scratch.posed(index) || scratch.morphed(index) || super::wired_passes::outlined(outline_scenes, index);
+            let moving = needs_velocity && scratch.has_motion(index);
+            let placement = self.place_cached(draw, catalog, samples, scratch, alone, moving, &mut last)?;
+            scratch.placements.push(placement);
+        }
+        scratch.placements.extend_from_slice(&self.retained_gpu.placements);
+        last = ((u32::MAX, u32::MAX), u32::MAX);
+        for (offset, draw) in frame.draws[range.end..].iter().enumerate() {
+            let index = range.end + offset;
+            let alone =
+                scratch.posed(index) || scratch.morphed(index) || super::wired_passes::outlined(outline_scenes, index);
+            let moving = needs_velocity && scratch.has_motion(index);
+            let placement = self.place_cached(draw, catalog, samples, scratch, alone, moving, &mut last)?;
+            scratch.placements.push(placement);
+        }
+
+        // Register any GPU-culled dynamic batches (from immediate draws) after `gpu_reserved`.
+        let gpu_reserved = self.retained_gpu.gpu_reserved;
+        let mut instance_count = gpu_reserved;
+        scratch.gpu_order.clear();
+        for i in retained_batch_count..scratch.batches.len() {
+            let batch = &scratch.batches[i];
+            if batch.bounds.is_some()
+                && matches!(self.assets.current(batch.mesh), Some(GpuAsset::Mesh(_)))
+                && self.culling.takes(batch.count)
+            {
+                scratch.gpu_order.push(i);
+            }
+        }
+        if scratch.gpu_order.len() > 1 {
+            crate::sort::sort_by_u64_key(&mut scratch.gpu_order, |&i| u64::from(!scratch.batches[i].count));
+        }
+        for i in 0..scratch.gpu_order.len() {
+            let index = scratch.gpu_order[i];
+            let batch = &mut scratch.batches[index];
+            let (Some(bounds), Some(GpuAsset::Mesh(mesh))) = (batch.bounds, self.assets.current(batch.mesh)) else {
+                continue;
+            };
+            let view_mask = if batch.casts { scratch.views.all() } else { CAMERA | scratch.capture_bit };
+            batch.gpu = self.culling.add(&bounds, &mesh.lods, instance_count, batch.count, view_mask);
+            if batch.gpu.is_some() {
+                batch.first = instance_count;
+                instance_count += batch.count;
+            }
+        }
+        let dyn_gpu_end =
+            if instance_count > gpu_reserved { instance_count.next_multiple_of(512) } else { gpu_reserved };
+        instance_count = dyn_gpu_end;
+
+        // CPU cull ONLY immediate draws and non-GPU-culled retained draws (skip all persistent GPU instances).
+        let cull_draw = |index: usize, draw: &Draw, scratch: &mut Scratch, stats: &mut RenderStats| {
+            let deformed = scratch.posed(index) || scratch.morphed(index);
+            let placement = &mut scratch.placements[index];
+            if placement.batch == LEFT_OUT {
+                return;
+            }
+            let batch = scratch.batches.get_mut(placement.batch as usize);
+            if batch.as_ref().is_some_and(|batch| batch.gpu.is_some()) {
+                return;
+            }
+            let choice = &scratch.choices[placement.choice as usize];
+            (placement.views, placement.lod) = if deformed {
+                (if choice.casts { scratch.views.all() } else { CAMERA | scratch.capture_bit }, 0)
+            } else {
+                seen(choice, draw, &scratch.views, &scratch.detail, scratch.capture_bit, stats)
+            };
+            if let Some(batch) = batch {
+                let mut mask = placement.views;
+                let lod = usize::from(placement.lod);
+                while mask != 0 {
+                    let view = mask.trailing_zeros() as usize;
+                    mask &= mask - 1;
+                    batch.ranges[view][lod].1 += 1;
+                }
+            }
+        };
+        for (index, draw) in frame.draws[..range.start].iter().enumerate() {
+            cull_draw(index, draw, scratch, stats);
+        }
+        for &r in &self.retained_gpu.non_gpu_indices {
+            let index = range.start + r as usize;
+            cull_draw(index, &frame.draws[index], scratch, stats);
+        }
+        for (offset, draw) in frame.draws[range.end..].iter().enumerate() {
+            let index = range.end + offset;
+            cull_draw(index, draw, scratch, stats);
+        }
+
+        // Assign CPU-culled batch ranges starting after `dyn_gpu_end`.
+        for single in [true, false] {
+            for view in 0..scratch.views.count() {
+                for batch in
+                    scratch.batches.iter_mut().filter(|batch| batch.gpu.is_none() && (batch.count == 1) == single)
+                {
+                    for range_slot in &mut batch.ranges[view] {
+                        let count = range_slot.1;
+                        *range_slot = (instance_count, 0);
+                        instance_count += count;
+                    }
+                }
+            }
+        }
+
+        let total_instances = instance_count as usize;
+        self.grow_instances(total_instances)?;
+
+        // Update persistent retained GPU slots [0 .. gpu_used) in O(K) (or 0 bytes when idle).
+        let gpu_used = self.retained_gpu.gpu_used;
+        if !self.retained_gpu.uploaded || hint.topology_changed {
+            for (r, &slot) in self.retained_gpu.gpu_slot.iter().enumerate() {
+                if slot == u32::MAX {
+                    continue;
+                }
+                let draw = &frame.draws[range.start + r];
+                let placement = &self.retained_gpu.placements[r];
+                let parameters = draw.parameters.unwrap_or(placement.parameters);
+                let at = slot as usize * 20;
+                self.instance_data[at..at + 16].copy_from_slice(&draw.transform);
+                self.instance_data[at + 16..at + 20].copy_from_slice(&parameters);
+            }
+            if gpu_used > 0 {
+                let slice = &self.instance_data[..gpu_used as usize * 20];
+                self.queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(slice));
+                stats.instance_upload_bytes += slice.len() as u64 * 4;
+                stats.instance_upload_calls += 1;
+            }
+            self.retained_gpu.uploaded = true;
+            self.instance_uploads.invalidate();
+        } else if hint.revision != self.retained_gpu.last_revision {
+            self.retained_gpu.dirty_gpu_slots.clear();
+            for &r in hint.dirty_slots {
+                let r_idx = r as usize;
+                let Some(&slot) = self.retained_gpu.gpu_slot.get(r_idx) else { continue };
+                if slot == u32::MAX {
+                    continue;
+                }
+                let draw = &frame.draws[range.start + r_idx];
+                let placement = &self.retained_gpu.placements[r_idx];
+                let parameters = draw.parameters.unwrap_or(placement.parameters);
+                let at = slot as usize * 20;
+                self.instance_data[at..at + 16].copy_from_slice(&draw.transform);
+                self.instance_data[at + 16..at + 20].copy_from_slice(&parameters);
+                self.retained_gpu.dirty_gpu_slots.push(slot);
+            }
+            for run in self.retained_gpu.coalesce_dirty_runs() {
+                let start_f = run.start as usize * 20;
+                let end_f = run.end as usize * 20;
+                self.queue.write_buffer(
+                    &self.instance_buffer,
+                    u64::from(run.start) * 80,
+                    bytemuck::cast_slice(&self.instance_data[start_f..end_f]),
+                );
+                stats.instance_upload_bytes += (end_f - start_f) as u64 * 4;
+                stats.instance_upload_calls += 1;
+            }
+        }
+        self.retained_gpu.last_revision = hint.revision;
+
+        // Write dynamic / immediate / CPU-culled instances into [gpu_reserved .. total_instances).
+        let write_dynamic = |index: usize, draw: &Draw, scratch: &mut Scratch, instance_data: &mut [f32]| {
+            let placement = scratch.placements[index];
+            let Some(batch) = scratch.batches.get_mut(placement.batch as usize) else { return };
+            let parameters = draw.parameters.unwrap_or(placement.parameters);
+            let mut write = |at: u32| {
+                let at = at as usize * 20;
+                instance_data[at..at + 16].copy_from_slice(&draw.transform);
+                instance_data[at + 16..at + 20].copy_from_slice(&parameters);
+            };
+            if batch.gpu.is_some() {
+                write(batch.first + batch.written);
+                batch.written += 1;
+                return;
+            }
+            let mut mask = placement.views;
+            let lod = usize::from(placement.lod);
+            while mask != 0 {
+                let view = mask.trailing_zeros() as usize;
+                mask &= mask - 1;
+                let (first, count) = &mut batch.ranges[view][lod];
+                write(*first + *count);
+                *count += 1;
+            }
+        };
+        for (index, draw) in frame.draws[..range.start].iter().enumerate() {
+            write_dynamic(index, draw, scratch, &mut self.instance_data);
+        }
+        for &r in &self.retained_gpu.non_gpu_indices {
+            let index = range.start + r as usize;
+            write_dynamic(index, &frame.draws[index], scratch, &mut self.instance_data);
+        }
+        for (offset, draw) in frame.draws[range.end..].iter().enumerate() {
+            let index = range.end + offset;
+            write_dynamic(index, draw, scratch, &mut self.instance_data);
+        }
+
+        // Diff & upload only the dynamic tail [gpu_reserved .. total_instances).
+        let dyn_start_f = gpu_reserved as usize * 20;
+        let dyn_end_f = total_instances * 20;
+        if dyn_end_f > dyn_start_f {
+            let dyn_slice = &self.instance_data[dyn_start_f..dyn_end_f];
+            let base_bytes = u64::from(gpu_reserved) * 80;
+            for upload_range in self.instance_uploads.changed(dyn_slice) {
+                self.queue.write_buffer(
+                    &self.instance_buffer,
+                    base_bytes + upload_range.start as u64 * 4,
+                    bytemuck::cast_slice(&dyn_slice[upload_range.clone()]),
+                );
+                stats.instance_upload_bytes += upload_range.len() as u64 * 4;
+                stats.instance_upload_calls += 1;
+            }
+        }
+
+        // Build draw items: solo draws (only immediate + non-GPU retained), batches, solids, insets.
+        let push_alone = |index: usize, draw: &Draw, scratch: &mut Scratch| {
+            let placement = scratch.placements[index];
+            if placement.batch == ALONE {
+                scratch.items.push(Item {
+                    material: draw.material,
+                    source: Source::Draw(index),
+                    shape: Shape::Mesh(draw.mesh),
+                    views: placement.views,
+                    lod: placement.lod,
+                });
+            }
+        };
+        for (index, draw) in frame.draws[..range.start].iter().enumerate() {
+            push_alone(index, draw, scratch);
+        }
+        for &r in &self.retained_gpu.non_gpu_indices {
+            let index = range.start + r as usize;
+            push_alone(index, &frame.draws[index], scratch);
+        }
+        for (offset, draw) in frame.draws[range.end..].iter().enumerate() {
+            let index = range.end + offset;
+            push_alone(index, draw, scratch);
+        }
+        for (index, batch) in scratch.batches.iter().enumerate() {
+            let view_mask = match batch.gpu {
+                Some(_) if batch.casts => scratch.views.all(),
+                Some(_) => CAMERA | scratch.capture_bit,
+                None => (0..scratch.views.count())
+                    .filter(|&view| batch.ranges[view].iter().any(|range_slot| range_slot.1 > 0))
+                    .fold(0, |views, view| views | 1 << view),
+            };
+            scratch.items.push(Item {
+                material: batch.material,
+                source: Source::World,
+                shape: Shape::Batch(index),
+                views: view_mask,
+                lod: 0,
+            });
+        }
+        for (index, solid) in self.solid_meshes.iter().enumerate() {
+            scratch.items.push(Item {
+                material: solid.material,
+                source: Source::World,
+                shape: Shape::Solid(index),
+                views: ALL_VIEWS,
+                lod: 0,
+            });
+        }
+        for (inset, drawn) in frame.insets.iter().enumerate() {
+            for (index, draw) in drawn.draws.iter().enumerate() {
+                scratch.items.push(Item {
+                    material: draw.material,
+                    source: Source::Inset(inset, index),
+                    shape: Shape::Mesh(draw.mesh),
+                    views: ALL_VIEWS,
+                    lod: 0,
+                });
+            }
+        }
+        self.grow_draw_uniforms(scratch.items.len())?;
+        Ok(true)
+    }
+
     /// Places the frame's draws, alone or in instanced batches, culls them
     /// (a batch of many instances on the GPU, the rest here: each draw into
     /// the views that see it, at the level of detail the camera picks for
@@ -232,6 +774,8 @@ impl State {
         scratch: &mut Scratch,
         stats: &mut RenderStats,
         outline_scenes: &super::wired_passes::OutlineScenes,
+        needs_velocity: bool,
+        retained: Option<&crate::RetainedHint<'_>>,
     ) -> Result<()> {
         let capture = self.capture.as_ref().map(|step| {
             let at = &step.probe.position;
@@ -243,14 +787,60 @@ impl State {
         scratch.group_poses(frame);
         scratch.group_morphs(frame);
         scratch.group_motions(frame);
+
+        if let Some(hint) = retained.as_ref()
+            && self.retained_range_eligible(frame, hint, outline_scenes)
+        {
+            let gpu_cull_ready = self.culling.takes(u32::MAX);
+            let mut ready = self.retained_gpu.matches(
+                hint.topology_epoch,
+                samples,
+                self.asset_revision,
+                gpu_cull_ready,
+                &hint.range,
+            );
+            if !ready {
+                ready = self.build_retained_table(frame, catalog, samples, hint, scratch)?;
+            }
+            if ready {
+                if self.batch_with_retained(
+                    frame,
+                    catalog,
+                    samples,
+                    scratch,
+                    stats,
+                    outline_scenes,
+                    needs_velocity,
+                    hint,
+                )? {
+                    return Ok(());
+                }
+                // Fall back cleanly if GPU culling storage limits were exceeded.
+                self.culling.begin(scratch.views, scratch.detail);
+                scratch.chosen.clear();
+                scratch.choices.clear();
+                scratch.parameter_batches.clear();
+                scratch.placements.clear();
+                scratch.batches.clear();
+                scratch.gpu_order.clear();
+                scratch.items.clear();
+            }
+        }
+
+        // Standard full-frame path (non-retained scenes, secondary cameras, or fallback).
+        if self.retained_gpu.gpu_reserved > 0 {
+            self.retained_gpu.invalidate_all();
+            self.instance_uploads.invalidate();
+        } else {
+            self.retained_gpu.uploaded = false;
+        }
         let mut last = ((u32::MAX, u32::MAX), u32::MAX);
         for (index, draw) in frame.draws.iter().enumerate() {
-            // A posed, morphed, or explicitly moving draw has per-draw matrices/deformations: drawn alone.
-            let alone = scratch.posed(index)
-                || scratch.morphed(index)
-                || scratch.has_motion(index)
-                || super::wired_passes::outlined(outline_scenes, index);
-            let placement = self.place_cached(draw, catalog, samples, scratch, alone, &mut last)?;
+            // A posed, morphed, outlined, or multi-LOD moving draw (when velocity is active) draws alone.
+            let alone =
+                scratch.posed(index) || scratch.morphed(index) || super::wired_passes::outlined(outline_scenes, index);
+            let moving = needs_velocity && scratch.has_motion(index);
+            let placement = self.place_cached(draw, catalog, samples, scratch, alone, moving, &mut last)?;
             scratch.placements.push(placement);
         }
         // Batches of many instances cull on the GPU: their instances go first
@@ -337,16 +927,7 @@ impl State {
             }
         }
         let instance_count = instance_count as usize;
-        if instance_count > self.instance_capacity {
-            self.instance_capacity = instance_count.next_power_of_two();
-            ensure!(
-                self.instance_capacity as u64 * 80 <= self.device.limits().max_buffer_size,
-                "instance list exceeds device buffer size"
-            );
-            self.instance_buffer = instance_buffer(&self.device, self.instance_capacity);
-            self.instance_data = vec![0.0; self.instance_capacity * 20];
-            self.instance_uploads.invalidate();
-        }
+        self.grow_instances(instance_count)?;
         for (draw, placement) in frame.draws.iter().zip(&scratch.placements) {
             let Some(batch) = scratch.batches.get_mut(placement.batch as usize) else { continue };
             let parameters = draw.parameters.unwrap_or(placement.parameters);
@@ -430,17 +1011,7 @@ impl State {
                 stats.instance_upload_calls += 1;
             }
         }
-        let item_count = scratch.items.len();
-        if item_count > self.capacity {
-            self.capacity = item_count.next_power_of_two();
-            ensure!(
-                self.capacity as u64 * self.stride <= self.device.limits().max_buffer_size,
-                "draw list exceeds device buffer size"
-            );
-            self.draw_uniform = uniform_buffer(&self.device, "draws", self.capacity as u64 * self.stride);
-            self.groups.clear();
-            self.uniform_data = vec![0.0; self.capacity * (self.stride / 4) as usize];
-        }
+        self.grow_draw_uniforms(scratch.items.len())?;
         Ok(())
     }
 
@@ -479,6 +1050,7 @@ impl State {
     /// mesh and material, or, with instance parameters, of its mesh and
     /// render state: only the parameters may differ, which lets animation
     /// poses share one draw. Which views see it is worked out after.
+    #[allow(clippy::too_many_arguments, reason = "cached draw placement inputs")]
     pub(super) fn place_cached(
         &mut self,
         draw: &Draw,
@@ -486,6 +1058,7 @@ impl State {
         samples: u32,
         scratch: &mut Scratch,
         alone: bool,
+        moving_needs_single_lod: bool,
         last: &mut ((u32, u32), u32),
     ) -> Result<Placement> {
         let key = (draw.mesh, draw.material);
@@ -506,9 +1079,11 @@ impl State {
             c
         };
         let placement = Placement { batch: ALONE, choice, parameters: [0.0; 4], views: 0, lod: 0 };
-        // A draw with its own uniform data draws alone, as one its caller
-        // says must.
-        if alone || draw.extra.as_ref().is_some_and(|extra| !extra.is_empty()) {
+        // A draw with its own uniform data, or a multi-LOD moving draw under velocity, draws alone.
+        if alone
+            || draw.extra.as_ref().is_some_and(|extra| !extra.is_empty())
+            || (moving_needs_single_lod && scratch.choices[choice as usize].levels > 1)
+        {
             return Ok(placement);
         }
         Ok(match scratch.choices[choice as usize].batch {

@@ -3,6 +3,31 @@ use anyhow::{Result, bail, ensure};
 use pen_protocol::boundary::{MAX_DRAWS, MAX_MOTIONS};
 use pen_protocol::{Draw, Matrix, Motion, RenderFrame};
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Globally unique topology epoch counter so restores/reloads never alias a prior scene's epoch.
+static NEXT_TOPOLOGY_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+fn next_topology_epoch() -> u64 {
+    NEXT_TOPOLOGY_EPOCH.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Compact delta metadata describing how the resolved `RenderFrame::draws` relates to
+/// the runtime's persistent retained instance table.
+#[derive(Clone, Debug)]
+pub struct RetainedDelta<'a> {
+    /// Nonzero globally-unique epoch bumped on reset, add, remove, reorder, or mesh/material swap.
+    pub topology_epoch: u64,
+    /// Monotonic revision bumped whenever any retained instance is modified.
+    pub revision: u64,
+    /// Slice `range` inside the resolved `RenderFrame::draws` occupied by retained draws.
+    pub range: Range<usize>,
+    /// Relative slot offsets (`0..range.len()`) modified in place on this frame when `!topology_changed`.
+    pub dirty_slots: &'a [u32],
+    /// True when the retained topology changed (reset, add, remove, reorder, or mesh/material swap).
+    pub topology_changed: bool,
+}
 
 #[derive(Clone, Copy)]
 pub(crate) struct RetainedEntry {
@@ -13,6 +38,14 @@ pub(crate) struct RetainedEntry {
 #[derive(Clone, Default)]
 pub(crate) struct Scene {
     started: bool,
+    topology_epoch: u64,
+    revision: u64,
+    last_range: Range<usize>,
+    last_topology_changed: bool,
+    /// Relative slot indices (`0..ordered.len()`) modified in place on the last frame.
+    dirty_slots: Vec<u32>,
+    /// Reusable buffer for rollback of `dirty_slots`.
+    dirty_scratch: Vec<u32>,
     /// Sorted by `(order, id)`, parallel with `ordered`.
     entries: Vec<RetainedEntry>,
     /// Draws in `(order, id)` order, ready to splice into `RenderFrame::draws`.
@@ -27,13 +60,61 @@ pub(crate) struct Scene {
     rollback_scratch: Vec<(usize, Draw)>,
 }
 
+#[derive(Clone)]
+pub(crate) struct MetaSnapshot {
+    started: bool,
+    topology_epoch: u64,
+    revision: u64,
+    last_range: Range<usize>,
+    last_topology_changed: bool,
+    dirty_slots: Vec<u32>,
+}
+
 pub(crate) enum SceneRollback {
-    None,
-    InPlace { prev_started: bool, changes: Vec<(usize, Draw)> },
-    Full { prev_started: bool, entries: Vec<RetainedEntry>, ordered: Vec<Draw>, pos_by_id: HashMap<u32, usize> },
+    None(MetaSnapshot),
+    InPlace { meta: MetaSnapshot, changes: Vec<(usize, Draw)> },
+    Full { meta: MetaSnapshot, entries: Vec<RetainedEntry>, ordered: Vec<Draw>, pos_by_id: HashMap<u32, usize> },
 }
 
 impl Scene {
+    fn snapshot_meta(&mut self) -> MetaSnapshot {
+        let mut dirty = std::mem::take(&mut self.dirty_scratch);
+        dirty.clear();
+        dirty.extend_from_slice(&self.dirty_slots);
+        MetaSnapshot {
+            started: self.started,
+            topology_epoch: self.topology_epoch,
+            revision: self.revision,
+            last_range: self.last_range.clone(),
+            last_topology_changed: self.last_topology_changed,
+            dirty_slots: dirty,
+        }
+    }
+
+    fn restore_meta(&mut self, meta: MetaSnapshot) {
+        self.started = meta.started;
+        self.topology_epoch = meta.topology_epoch;
+        self.revision = meta.revision;
+        self.last_range = meta.last_range;
+        self.last_topology_changed = meta.last_topology_changed;
+        let old = std::mem::replace(&mut self.dirty_slots, meta.dirty_slots);
+        self.dirty_scratch = old;
+    }
+
+    /// Returns the delta metadata for the most recently applied frame, when retained draws are active.
+    pub fn delta(&self) -> Option<RetainedDelta<'_>> {
+        if !self.started || self.topology_epoch == 0 {
+            return None;
+        }
+        Some(RetainedDelta {
+            topology_epoch: self.topology_epoch,
+            revision: self.revision,
+            range: self.last_range.clone(),
+            dirty_slots: &self.dirty_slots,
+            topology_changed: self.last_topology_changed,
+        })
+    }
+
     /// Applies retained updates in place and resolves `frame`. On any error,
     /// `self` is left unmodified. On `Ok(undo)`, if downstream renderer
     /// validation later rejects `frame`, call [`Self::rollback`] with `undo`.
@@ -43,16 +124,25 @@ impl Scene {
                 !frame.retained_reset && frame.instances.is_empty() && frame.instance_removals.is_empty(),
                 "retained updates require retained_enabled"
             );
+            let meta = self.snapshot_meta();
             if !self.started && self.entries.is_empty() {
-                return Ok(SceneRollback::None);
+                self.last_range = 0..0;
+                self.dirty_slots.clear();
+                self.last_topology_changed = false;
+                return Ok(SceneRollback::None(meta));
             }
             let undo = SceneRollback::Full {
-                prev_started: self.started,
+                meta,
                 entries: std::mem::take(&mut self.entries),
                 ordered: std::mem::take(&mut self.ordered),
                 pos_by_id: std::mem::take(&mut self.pos_by_id),
             };
             self.started = false;
+            self.topology_epoch = 0;
+            self.revision = self.revision.wrapping_add(1);
+            self.last_range = 0..0;
+            self.dirty_slots.clear();
+            self.last_topology_changed = true;
             return Ok(undo);
         }
         ensure!(self.started || frame.retained_reset, "first retained frame requires a reset");
@@ -63,7 +153,11 @@ impl Scene {
         self.moved_buf.clear();
 
         let undo = if !changed {
-            SceneRollback::None
+            let meta = self.snapshot_meta();
+            self.dirty_slots.clear();
+            self.last_topology_changed = false;
+            self.last_range = after..after + self.ordered.len();
+            SceneRollback::None(meta)
         } else if !frame.retained_reset && frame.instance_removals.is_empty() {
             // Check whether every update targets an existing ID with unchanged
             // order so we can patch in place in O(K) with zero sorting or cloning.
@@ -81,10 +175,13 @@ impl Scene {
                 }
             }
             if in_place_ok {
-                let prev_started = self.started;
+                let meta = self.snapshot_meta();
                 let mut changes = std::mem::take(&mut self.rollback_scratch);
                 changes.clear();
                 changes.reserve(frame.instances.len());
+                self.dirty_slots.clear();
+                self.dirty_slots.reserve(frame.instances.len());
+                let mut asset_changed = false;
                 for value in &frame.instances {
                     let id = value.id_low | (value.id_high << 16);
                     let pos = self.pos_by_id[&id];
@@ -92,6 +189,9 @@ impl Scene {
                     if prev_transform != value.transform {
                         let resolved = u32::try_from(after + pos)?;
                         self.moved_buf.push((resolved, prev_transform));
+                    }
+                    if self.ordered[pos].mesh != value.mesh || self.ordered[pos].material != value.material {
+                        asset_changed = true;
                     }
                     let new_draw = Draw {
                         mesh: value.mesh,
@@ -102,15 +202,26 @@ impl Scene {
                     };
                     let old_draw = std::mem::replace(&mut self.ordered[pos], new_draw);
                     changes.push((pos, old_draw));
+                    #[allow(clippy::cast_possible_truncation, reason = "pos < ordered.len() <= MAX_DRAWS")]
+                    self.dirty_slots.push(pos as u32);
                 }
                 if self.moved_buf.len() > 1 {
                     crate::sort::sort_by_u64_key(&mut self.moved_buf, |&(draw, _)| u64::from(draw));
                 }
+                if !self.started || self.topology_epoch == 0 || asset_changed {
+                    self.topology_epoch = next_topology_epoch();
+                    self.last_topology_changed = true;
+                } else {
+                    self.last_topology_changed = false;
+                }
                 self.started = true;
-                SceneRollback::InPlace { prev_started, changes }
+                self.revision = self.revision.wrapping_add(1);
+                self.last_range = after..after + self.ordered.len();
+                SceneRollback::InPlace { meta, changes }
             } else {
+                let meta = self.snapshot_meta();
                 let undo = SceneRollback::Full {
-                    prev_started: self.started,
+                    meta,
                     entries: self.entries.clone(),
                     ordered: self.ordered.clone(),
                     pos_by_id: self.pos_by_id.clone(),
@@ -119,19 +230,25 @@ impl Scene {
                     self.rollback(undo);
                     return Err(error);
                 }
+                self.topology_epoch = next_topology_epoch();
+                self.revision = self.revision.wrapping_add(1);
+                self.dirty_slots.clear();
+                self.last_topology_changed = true;
+                self.last_range = after..after + self.ordered.len();
                 undo
             }
         } else {
+            let meta = self.snapshot_meta();
             let undo = if frame.retained_reset {
                 SceneRollback::Full {
-                    prev_started: self.started,
+                    meta,
                     entries: std::mem::take(&mut self.entries),
                     ordered: std::mem::take(&mut self.ordered),
                     pos_by_id: std::mem::take(&mut self.pos_by_id),
                 }
             } else {
                 SceneRollback::Full {
-                    prev_started: self.started,
+                    meta,
                     entries: self.entries.clone(),
                     ordered: self.ordered.clone(),
                     pos_by_id: self.pos_by_id.clone(),
@@ -141,6 +258,11 @@ impl Scene {
                 self.rollback(undo);
                 return Err(error);
             }
+            self.topology_epoch = next_topology_epoch();
+            self.revision = self.revision.wrapping_add(1);
+            self.dirty_slots.clear();
+            self.last_topology_changed = true;
+            self.last_range = after..after + self.ordered.len();
             undo
         };
 
@@ -153,25 +275,35 @@ impl Scene {
 
     /// Recycles rollback scratch memory once a frame has been accepted.
     pub fn commit(&mut self, undo: SceneRollback) {
-        if let SceneRollback::InPlace { mut changes, .. } = undo {
-            changes.clear();
-            self.rollback_scratch = changes;
+        match undo {
+            SceneRollback::None(mut meta) | SceneRollback::Full { mut meta, .. } => {
+                meta.dirty_slots.clear();
+                self.dirty_scratch = meta.dirty_slots;
+            }
+            SceneRollback::InPlace { mut meta, mut changes } => {
+                meta.dirty_slots.clear();
+                self.dirty_scratch = meta.dirty_slots;
+                changes.clear();
+                self.rollback_scratch = changes;
+            }
         }
     }
 
     /// Reverts the scene to its state before the matching [`Self::apply`] call.
     pub fn rollback(&mut self, undo: SceneRollback) {
         match undo {
-            SceneRollback::None => {}
-            SceneRollback::InPlace { prev_started, mut changes } => {
-                self.started = prev_started;
+            SceneRollback::None(meta) => {
+                self.restore_meta(meta);
+            }
+            SceneRollback::InPlace { meta, mut changes } => {
+                self.restore_meta(meta);
                 for (pos, old_draw) in changes.drain(..).rev() {
                     self.ordered[pos] = old_draw;
                 }
                 self.rollback_scratch = changes;
             }
-            SceneRollback::Full { prev_started, entries, ordered, pos_by_id } => {
-                self.started = prev_started;
+            SceneRollback::Full { meta, entries, ordered, pos_by_id } => {
+                self.restore_meta(meta);
                 self.entries = entries;
                 self.ordered = ordered;
                 self.pos_by_id = pos_by_id;
@@ -437,5 +569,51 @@ mod tests {
         assert_eq!(check.draws.iter().map(|d| d.mesh).collect::<Vec<_>>(), [100, 200, 300]);
         assert_eq!(check.draws[0].transform[12], 1.0);
         assert_eq!(check.draws[2].transform[12], 3.0);
+    }
+
+    #[test]
+    fn retained_delta_tracks_epoch_revision_dirty_slots_and_rollback() {
+        let mut scene = Scene::default();
+        let mut init = frame(true, &[(10, 1, 100), (20, 2, 200), (30, 3, 300)]);
+        let undo0 = scene.apply(&mut init).unwrap();
+        scene.commit(undo0);
+        let d0 = scene.delta().unwrap();
+        assert!(d0.topology_changed);
+        assert_eq!(d0.range, 0..3);
+        let epoch0 = d0.topology_epoch;
+        let rev0 = d0.revision;
+
+        // Transform-only in-place update keeps topology_epoch, bumps revision, and lists only dirty slots.
+        let mut move_only = frame(false, &[(30, 3, 300)]);
+        move_only.instances[0].transform[12] = 9.0;
+        let undo1 = scene.apply(&mut move_only).unwrap();
+        let d1 = scene.delta().unwrap();
+        assert!(!d1.topology_changed);
+        assert_eq!(d1.topology_epoch, epoch0);
+        assert_eq!(d1.revision, rev0 + 1);
+        assert_eq!(d1.dirty_slots, &[2]);
+        scene.commit(undo1);
+
+        // Idle frame keeps both topology_epoch and revision with empty dirty_slots.
+        let mut idle = frame(false, &[]);
+        let undo2 = scene.apply(&mut idle).unwrap();
+        let d2 = scene.delta().unwrap();
+        assert!(!d2.topology_changed);
+        assert_eq!(d2.topology_epoch, epoch0);
+        assert_eq!(d2.revision, rev0 + 1);
+        assert!(d2.dirty_slots.is_empty());
+        scene.commit(undo2);
+
+        // Mesh swap bumps topology_epoch and sets topology_changed; rollback restores prior epoch/revision.
+        let mut swap_mesh = frame(false, &[(20, 2, 201)]);
+        let undo3 = scene.apply(&mut swap_mesh).unwrap();
+        let d3 = scene.delta().unwrap();
+        assert!(d3.topology_changed);
+        assert_ne!(d3.topology_epoch, epoch0);
+        scene.rollback(undo3);
+        let d_restored = scene.delta().unwrap();
+        assert_eq!(d_restored.topology_epoch, epoch0);
+        assert_eq!(d_restored.revision, rev0 + 1);
+        assert!(!d_restored.topology_changed);
     }
 }

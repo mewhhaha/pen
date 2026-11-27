@@ -157,6 +157,18 @@ mod volume;
 
 use pen_protocol::{Catalog, GameEvent, RenderFrame};
 
+/// Optional retained-scene delta metadata supplied by `pen-runtime` so the renderer
+/// can preserve persistent GPU instance slots and skip redundant validation, asset checks,
+/// batching, instance diffing, and TLAS rebuilds on unchanged retained draws.
+#[derive(Clone, Debug)]
+pub struct RetainedHint<'a> {
+    pub topology_epoch: u64,
+    pub revision: u64,
+    pub range: std::ops::Range<usize>,
+    pub dirty_slots: &'a [u32],
+    pub topology_changed: bool,
+}
+
 #[cfg(feature = "render-3d")]
 pub use area_lights::{
     AREA_LIGHTS_WGSL, AreaLight, AreaLightKind, AreaLightResources, LTC_LUT_SIZE, generate_ltc_luts,
@@ -301,9 +313,10 @@ pub use renderer::{
     EnvironmentTerrain, GPU_PARTICLES_EXT_TAG, GpuParticleScene, JFA_OUTLINE_EXT_TAG, JfaOutlineScene,
     JfaOutlineTarget, LINES_EXT_TAG, LineScene, NANITE_EXT_TAG, RENDER2D_EXT_TAG, RENDER2D_WORLD_EXT_TAG,
     RadianceCascades2dLayer, SHADOWS_WGSL, Scene2d, SpriteLayer2d, TilemapLayer2d, validate_frame,
+    validate_frame_incremental,
 };
 #[cfg(not(feature = "render-3d"))]
-pub use renderer2d_host::validate_frame;
+pub use renderer2d_host::{validate_frame, validate_frame_incremental};
 #[cfg(all(feature = "render-3d", feature = "simplify"))]
 pub use simplify::pack_mesh_with_lods;
 #[cfg(feature = "render-3d")]
@@ -509,6 +522,17 @@ impl Renderer {
         self.state.submit_validated(frame, catalog, target)
     }
 
+    /// Submits a validated frame with optional retained-scene delta metadata.
+    pub fn submit_validated_retained(
+        &mut self,
+        frame: &RenderFrame,
+        catalog: &Catalog,
+        target: &mut dyn RenderTarget,
+        retained: Option<RetainedHint<'_>>,
+    ) -> anyhow::Result<()> {
+        self.state.submit_validated_retained(frame, catalog, target, retained)
+    }
+
     pub fn prepare_sprites(&mut self, sprites: &[pen_protocol::Sprite], catalog: &Catalog) -> anyhow::Result<bool> {
         self.state.prepare_sprites(sprites, catalog)
     }
@@ -606,6 +630,17 @@ impl Renderer {
         target: &mut dyn RenderTarget,
     ) -> anyhow::Result<()> {
         self.state.submit_validated(frame, catalog, target)
+    }
+
+    /// Submits a validated frame with optional retained-scene delta metadata.
+    pub fn submit_validated_retained(
+        &mut self,
+        frame: &RenderFrame,
+        catalog: &Catalog,
+        target: &mut dyn RenderTarget,
+        retained: Option<RetainedHint<'_>>,
+    ) -> anyhow::Result<()> {
+        self.state.submit_validated_retained(frame, catalog, target, retained)
     }
 
     /// Starts loading what `sprites` draw with; whether it is all ready.

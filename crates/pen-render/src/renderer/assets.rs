@@ -330,6 +330,7 @@ impl State {
                         }
                     }
                 });
+                self.asset_revision += 1;
                 self.compiled_out(slot, revision, failure, now);
             }
             Message::BuiltIn { which, depth_mode, result } => self.built_ins.arrived(which, depth_mode, result),
@@ -906,6 +907,7 @@ impl State {
         if accepted {
             self.assets.set_gpu_bytes(slot, bytes);
             self.assets.touch(slot, self.frames);
+            self.asset_revision += 1;
         }
         self.retire(previous);
     }
@@ -946,6 +948,9 @@ impl State {
                 evicted += 1;
             }
         }
+        if evicted > 0 {
+            self.asset_revision += 1;
+        }
         evicted
     }
 
@@ -970,10 +975,14 @@ impl State {
     /// draws on.
     pub fn reload(&mut self, keys: &[String]) {
         self.assets.reload(keys);
+        self.asset_revision += 1;
+        self.checked_retained_epoch = 0;
     }
 
     pub fn reload_all(&mut self) {
         self.assets.reload_all();
+        self.asset_revision += 1;
+        self.checked_retained_epoch = 0;
     }
 
     /// Detail that arrived since the last frame settles in.

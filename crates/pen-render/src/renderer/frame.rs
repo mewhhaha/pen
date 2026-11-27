@@ -377,7 +377,7 @@ impl State {
     }
 
     pub fn submit(&mut self, frame: &RenderFrame, catalog: &Catalog, target: &mut dyn RenderTarget) -> Result<()> {
-        self.submit_inner(frame, catalog, target, true)
+        self.submit_inner(frame, catalog, target, true, None)
     }
 
     /// Submits a frame that the caller already verified with `validate_frame`,
@@ -388,7 +388,19 @@ impl State {
         catalog: &Catalog,
         target: &mut dyn RenderTarget,
     ) -> Result<()> {
-        self.submit_inner(frame, catalog, target, false)
+        self.submit_inner(frame, catalog, target, false, None)
+    }
+
+    /// Submits a validated frame with optional retained-scene delta metadata so unchanged
+    /// retained instances reuse persistent GPU slots and skip redundant work.
+    pub fn submit_validated_retained(
+        &mut self,
+        frame: &RenderFrame,
+        catalog: &Catalog,
+        target: &mut dyn RenderTarget,
+        retained: Option<crate::RetainedHint<'_>>,
+    ) -> Result<()> {
+        self.submit_inner(frame, catalog, target, false, retained)
     }
 
     fn submit_inner(
@@ -397,6 +409,7 @@ impl State {
         catalog: &Catalog,
         target: &mut dyn RenderTarget,
         validate: bool,
+        retained: Option<crate::RetainedHint<'_>>,
     ) -> Result<()> {
         // What a frame works out reuses the last one's memory.
         let mut scratch = std::mem::take(&mut self.scratch);
@@ -406,8 +419,9 @@ impl State {
         }
         let cache = self.context.cache.clone();
         let staging = self.frame_staging.clone();
-        let drawn = cache
-            .with_active(|| staging.with_active(|| self.draw_inner(frame, catalog, target, &mut scratch, validate)));
+        let drawn = cache.with_active(|| {
+            staging.with_active(|| self.draw_inner(frame, catalog, target, &mut scratch, validate, retained))
+        });
         self.scratch = scratch;
         if drawn.is_err() {
             #[cfg(feature = "render-rt")]
@@ -416,6 +430,8 @@ impl State {
                 self.wired.tlas_gpu = None;
                 self.wired.tlas_hash = 0;
                 self.wired.tlas_bounds = None;
+                self.wired.tlas_retained_epoch = 0;
+                self.wired.tlas_retained_revision = 0;
                 self.wired.rt_history = Default::default();
                 self.wired.sharc_needs_clear = true;
             }
@@ -430,11 +446,12 @@ impl State {
         target: &mut dyn RenderTarget,
         scratch: &mut Scratch,
         validate: bool,
+        retained: Option<crate::RetainedHint<'_>>,
     ) -> Result<()> {
         if validate {
             validate_frame(frame)?;
         }
-        self.check_names(frame, catalog)?;
+        self.check_names(frame, catalog, retained.as_ref())?;
         if let Some(detected) = crate::camera_precision::detect_depth_mode(&frame.projection) {
             self.set_depth_mode(detected);
         }
@@ -524,7 +541,21 @@ impl State {
         #[allow(clippy::cast_precision_loss, reason = "pixels")]
         let height = target.size().1 as f32 * scale;
         let jfa_scenes = self.gather_jfa_outlines(frame);
-        self.batch(frame, catalog, samples, height, scratch, &mut stats, &jfa_scenes)?;
+        let wants_taa = frame.quality.taa || reflected > 0 || frame.quality.upscale;
+        let wants_motion_blur =
+            frame.quality.effects && frame.motion_blur.strength > 0.0 && frame.motion_blur.max_radius > 0.0;
+        let needs_velocity = cfg!(feature = "render-taa") && (wants_taa || wants_motion_blur);
+        self.batch(
+            frame,
+            catalog,
+            samples,
+            height,
+            scratch,
+            &mut stats,
+            &jfa_scenes,
+            needs_velocity,
+            retained.as_ref(),
+        )?;
         let shadowed = self.light(frame) || reflected > 0;
         self.prepare_items(frame, catalog, samples, scratch)?;
         // Decals whose material and texture are ready, by material.
@@ -681,7 +712,7 @@ impl State {
         let oit_pipelines = self.prepare_oit_pipelines(frame, scratch, samples);
         #[cfg(feature = "render-rt")]
         let (rt_active, restir_di_active) = {
-            let tlas_ready = self.prepare_tlas_scene(&mut encoder, frame, scratch)?;
+            let tlas_ready = self.prepare_tlas_scene(&mut encoder, frame, scratch, retained.as_ref())?;
             if tlas_ready && frame.quality.ddgi && crate::ddgi::DdgiVolume::supported(&device) {
                 self.encode_ddgi_prepass(&mut encoder, frame)?;
             }

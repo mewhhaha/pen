@@ -201,6 +201,16 @@ pub(super) struct WiredPasses {
     #[cfg(feature = "render-rt")]
     pub tlas_bounds: Option<([f32; 3], [f32; 3])>,
     #[cfg(feature = "render-rt")]
+    pub tlas_retained_epoch: u64,
+    #[cfg(feature = "render-rt")]
+    pub tlas_retained_revision: u64,
+    #[cfg(feature = "render-rt")]
+    pub tlas_asset_revision: u64,
+    #[cfg(feature = "render-rt")]
+    pub tlas_solids_revision: u64,
+    #[cfg(feature = "render-rt")]
+    pub tlas_instances_scratch: Vec<crate::ray_tracing::TlasInstance>,
+    #[cfg(feature = "render-rt")]
     pub ray_tracer: Option<TlasRayTracer>,
     pub rt_history: RtHistory,
     #[cfg(feature = "render-rt")]

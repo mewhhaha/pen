@@ -51,6 +51,21 @@ fn project(curr_world: vec4f, prev_world: vec4f) -> VertexOut {
   return project(world, world);
 }
 
+@vertex fn vertex_instanced_moving(
+  @location(0) position: vec3f,
+  @location(3) c0: vec4f,
+  @location(4) c1: vec4f,
+  @location(5) c2: vec4f,
+  @location(6) c3: vec4f,
+  @location(7) p0: vec4f,
+  @location(8) p1: vec4f,
+  @location(9) p2: vec4f,
+  @location(10) p3: vec4f,
+) -> VertexOut {
+  let local = vec4f(position, 1.0);
+  return project(mat4x4f(c0, c1, c2, c3) * local, mat4x4f(p0, p1, p2, p3) * local);
+}
+
 @vertex fn vertex_skinned(
   @location(0) position: vec3f,
   @location(9) joints: vec4u,

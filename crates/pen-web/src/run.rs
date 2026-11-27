@@ -91,6 +91,16 @@ pub struct Shell<'a> {
     state_adapter: &'a Arc<dyn StateAdapter>,
 }
 
+fn to_retained_hint(delta: pen_runtime::game::FrameRetainedDelta<'_>) -> pen_render::RetainedHint<'_> {
+    pen_render::RetainedHint {
+        topology_epoch: delta.topology_epoch,
+        revision: delta.revision,
+        range: delta.range,
+        dirty_slots: delta.dirty_slots,
+        topology_changed: delta.topology_changed,
+    }
+}
+
 impl Host for Shell<'_> {
     fn viewport(&self) -> Viewport {
         self.viewport
@@ -98,6 +108,14 @@ impl Host for Shell<'_> {
 
     fn validate(&self, frame: &RenderFrame) -> Result<()> {
         pen_render::validate_frame(frame)
+    }
+
+    fn validate_incremental(
+        &self,
+        frame: &RenderFrame,
+        retained: Option<pen_runtime::game::FrameRetainedDelta<'_>>,
+    ) -> Result<()> {
+        pen_render::validate_frame_incremental(frame, retained.map(to_retained_hint))
     }
 
     /// A frame the runtime shows itself (a load's, a new build's) is drawn
@@ -503,7 +521,11 @@ impl Browser {
                 say(&mut self.log, log_source::GAME, true, message);
             }
         }
-        let (presented, draw_timings) = match self.screen.draw(&self.shown, overlay, &self.catalog).await {
+        let (presented, draw_timings) = match self
+            .screen
+            .draw(&self.shown, overlay, &self.catalog, self.game.retained_delta().map(to_retained_hint))
+            .await
+        {
             Ok(result) => result,
             Err(err) => {
                 self.fence_kernels();

@@ -11,9 +11,12 @@ use anyhow::{Result, bail, ensure};
 use pen_protocol::boundary::{decode_frame, decode_into, encode_frame, validate_state};
 use pen_protocol::{Catalog, Frame, GameEvent, RenderFrame, Viewport};
 
+use crate::instances::RetainedDelta;
 use crate::program::{Backend, Operation, Program, Unresponsive};
 use crate::snapshot::SavedState;
 use crate::state::{self, StateAdapter};
+
+pub use crate::instances::RetainedDelta as FrameRetainedDelta;
 
 const HISTORY_LIMIT: usize = 200;
 
@@ -22,6 +25,13 @@ pub trait Host {
     fn viewport(&self) -> Viewport;
     /// Rejects a frame the renderer could not draw.
     fn validate(&self, frame: &RenderFrame) -> Result<()>;
+    /// Incremental validation: unchanged retained draws inside `retained.range`
+    /// already passed validation on prior frames, so only immediate draws and
+    /// `retained.dirty_slots` need transform/parameter validation when `!topology_changed`.
+    fn validate_incremental(&self, frame: &RenderFrame, retained: Option<RetainedDelta<'_>>) -> Result<()> {
+        let _ = retained;
+        self.validate(frame)
+    }
     /// Draws (and plays) a frame whose asset IDs index `catalog`.
     fn render(&mut self, frame: &RenderFrame, catalog: &Catalog) -> Result<()>;
     fn report(&mut self, message: &str);
@@ -47,6 +57,10 @@ impl Host for Quiet<'_> {
 
     fn validate(&self, frame: &RenderFrame) -> Result<()> {
         self.0.validate(frame)
+    }
+
+    fn validate_incremental(&self, frame: &RenderFrame, retained: Option<RetainedDelta<'_>>) -> Result<()> {
+        self.0.validate_incremental(frame, retained)
     }
 
     fn render(&mut self, _frame: &RenderFrame, _catalog: &Catalog) -> Result<()> {
@@ -255,7 +269,7 @@ async fn evaluate_with_frame<P: Program>(
     ensure!(next.state.is_empty(), "program frame must keep its state inside the guest");
     game.discard_pending();
     let undo = game.instances.apply(&mut next.render)?;
-    if let Err(error) = host.validate(&next.render) {
+    if let Err(error) = host.validate_incremental(&next.render, game.instances.delta()) {
         game.instances.rollback(undo);
         return Err(error);
     }
@@ -429,6 +443,11 @@ impl<B: Backend> GameRuntime<B> {
         self.spare = Some(frame);
     }
 
+    /// Delta metadata for the most recently accepted retained scene, if active.
+    pub fn retained_delta(&self) -> Option<RetainedDelta<'_>> {
+        self.active.instances.delta()
+    }
+
     async fn record(&mut self) -> Result<()> {
         if !self.active.program.scenes() {
             return Ok(());
@@ -568,7 +587,7 @@ impl<B: Backend> GameRuntime<B> {
         let was_retained = frame.retained_enabled;
         let undo = self.active.instances.apply(&mut frame).map_err(|error| error.context(InvalidFrame))?;
         let decoded = self.measuring.then(Instant::now);
-        if let Err(error) = host.validate(&frame) {
+        if let Err(error) = host.validate_incremental(&frame, self.active.instances.delta()) {
             self.active.instances.rollback(undo);
             return Err(error.context(InvalidFrame));
         }

@@ -389,14 +389,6 @@ fn rcas_sharpen(
 ) {
   let dims = textureDimensions(rcas_in, 0);
   let sharp = clamp(rcas_u.params.x, 0.0, 1.0);
-  if (sharp <= 1e-4) {
-    if (id.x < dims.x && id.y < dims.y) {
-      let p = vec2i(id.xy);
-      let e_raw = max(textureLoad(rcas_in, p, 0).rgb, vec3f(0.0));
-      textureStore(rcas_out, p, vec4f(e_raw, 1.0));
-    }
-    return;
-  }
   // When hdr_knee > 0, map HDR [0, +inf) into [0, 1) per-channel so HDR peaks > 1.0 sharpen with anti-ringing.
   // When hdr_knee <= 0, operate directly in SDR [0, 1] without nonlinear Reinhard midtone distortion.
   let use_hdr = rcas_u.params.y > 0.0;
@@ -404,12 +396,14 @@ fn rcas_sharpen(
   let last = vec2i(dims) - vec2i(1);
   let tile_origin = vec2i(wid.xy * 8u) - vec2i(1);
   let lidx = lid.y * 8u + lid.x;
-  for (var slot = lidx; slot < 100u; slot += 64u) {
-    let lx = i32(slot % 10u);
-    let ly = i32(slot / 10u);
-    let gp = clamp(tile_origin + vec2i(lx, ly), vec2i(0), last);
-    let raw = max(textureLoad(rcas_in, gp, 0).rgb, vec3f(0.0));
-    wg_rcas[slot] = select(clamp(raw, vec3f(0.0), vec3f(1.0)), rcas_compress(raw, knee), use_hdr);
+  if (sharp > 1e-4) {
+    for (var slot = lidx; slot < 100u; slot += 64u) {
+      let lx = i32(slot % 10u);
+      let ly = i32(slot / 10u);
+      let gp = clamp(tile_origin + vec2i(lx, ly), vec2i(0), last);
+      let raw = max(textureLoad(rcas_in, gp, 0).rgb, vec3f(0.0));
+      wg_rcas[slot] = select(clamp(raw, vec3f(0.0), vec3f(1.0)), rcas_compress(raw, knee), use_hdr);
+    }
   }
   workgroupBarrier();
 
@@ -417,6 +411,11 @@ fn rcas_sharpen(
     return;
   }
   let p = vec2i(id.xy);
+  if (sharp <= 1e-4) {
+    let e_raw = max(textureLoad(rcas_in, p, 0).rgb, vec3f(0.0));
+    textureStore(rcas_out, p, vec4f(e_raw, 1.0));
+    return;
+  }
   let c_idx = (lid.y + 1u) * 10u + (lid.x + 1u);
   let e = wg_rcas[c_idx];
   let b = wg_rcas[c_idx - 10u];

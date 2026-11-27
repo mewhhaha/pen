@@ -17,6 +17,26 @@ use blot_host::{
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+fn has_blot_compiler() -> bool {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let blot = root.join("../../../blot2");
+    let compiler =
+        std::env::var_os("BLOTC").map(PathBuf::from).unwrap_or_else(|| blot.join("compiler-goose/build/blotc-goose"));
+    let prelude = blot.join("std/prelude.blot");
+    if compiler.is_file() && prelude.is_file() {
+        return true;
+    }
+    let required = std::env::var_os("PEN_REQUIRE_FIXTURES").is_some_and(|v| !v.is_empty() && v != "0");
+    assert!(
+        !required,
+        "phase4 concurrency tests require blotc-goose ({}) and {}, and PEN_REQUIRE_FIXTURES is set",
+        compiler.display(),
+        prelude.display()
+    );
+    eprintln!("skipping: phase4 concurrency tests require blotc-goose and sibling blot2 checkout");
+    false
+}
+
 fn compile_blot(source: &str) -> Result<Vec<u8>> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let blot = root.join("../../../blot2");
@@ -289,6 +309,9 @@ fn crafted_spin_cleanup_process_wasm() -> Vec<u8> {
 
 #[test]
 fn scalar_only_process_native_roundtrip_and_legacy_missing_memory_section_boundary() -> Result<()> {
+    if !has_blot_compiler() {
+        return Ok(());
+    }
     let wasm = compile_blot(
         r#"
 func s_init (x: U32): U32 => return x
@@ -373,6 +396,9 @@ io echo (xs: #[U32]): #[U32] => return copy xs
 
 #[test]
 fn kernel_pool_engine_admission_unticked_and_slow_ticking_condvar_wakeup() -> Result<()> {
+    if !has_blot_compiler() {
+        return Ok(());
+    }
     let wasm = compile_blot(
         r#"
 #kernel func double (x: U32): U32 => return @u32.mul x 2
@@ -478,6 +504,9 @@ fn kernel_pool_engine_admission_unticked_and_slow_ticking_condvar_wakeup() -> Re
 
 #[test]
 fn kernel_pool_prefix_errors_prepared_empty_bisection_precedence_and_chunking() -> Result<()> {
+    if !has_blot_compiler() {
+        return Ok(());
+    }
     let wasm = compile_blot(
         r#"
 func prep (ctx: #[U32]): #[U32] => return copy ctx
@@ -656,6 +685,9 @@ func var_row (n: U32): #[U32] =>
 
 #[test]
 fn kernel_pool_warm_worker_fragmentation_retry_monotonicity_and_zero_drift() -> Result<()> {
+    if !has_blot_compiler() {
+        return Ok(());
+    }
     let wasm = compile_blot(
         r#"
 // Witness (1) & (7): heap class fragmentation + pre-first-chunk replacement + fresh-no-retry
@@ -851,6 +883,9 @@ func run_ctx (ctx: #[U32]) -> (x: U32): U32 =>
 
 #[test]
 fn processes_law5_admission_mixed_fuel_overrun_precedence_and_parallel_equivalence() -> Result<()> {
+    if !has_blot_compiler() {
+        return Ok(());
+    }
     let wasm = compile_blot(
         r#"
 func fast_init (x: U32): U32 => return x

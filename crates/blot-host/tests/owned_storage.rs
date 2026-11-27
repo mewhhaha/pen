@@ -8,25 +8,35 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::OnceLock;
 
-fn fixture() -> Result<Vec<u8>> {
-    static BYTES: OnceLock<Result<Vec<u8>, String>> = OnceLock::new();
+fn fixture() -> Result<Option<Vec<u8>>> {
+    static BYTES: OnceLock<Result<Option<Vec<u8>>, String>> = OnceLock::new();
     BYTES
         .get_or_init(|| compile_fixture().map_err(|error| format!("{error:#}")))
         .clone()
         .map_err(|error| anyhow::anyhow!("{error}"))
 }
-fn compile_fixture() -> Result<Vec<u8>> {
+fn compile_fixture() -> Result<Option<Vec<u8>>> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let compiler = std::env::var_os("BLOTC")
         .map(PathBuf::from)
         .unwrap_or_else(|| root.join("../../../blot2/compiler-goose/build/blotc-goose"));
+    let prelude = root.join("../../../blot2/std/prelude.blot");
+    if !compiler.is_file() || !prelude.is_file() {
+        let required = std::env::var_os("PEN_REQUIRE_FIXTURES").is_some_and(|v| !v.is_empty() && v != "0");
+        assert!(
+            !required,
+            "owned_storage tests require blotc-goose and sibling blot2 checkout, and PEN_REQUIRE_FIXTURES is set"
+        );
+        eprintln!("skipping: owned_storage tests require blotc-goose and sibling blot2 checkout");
+        return Ok(None);
+    }
     let output = root.join("../../target/owned-storage.wasm");
     let result = Command::new(compiler)
         .args(["build"])
         .arg(root.join("tests/fixtures/owned_storage.blot"))
         .arg(&output)
         .arg("--prelude")
-        .arg(root.join("../../../blot2/std/prelude.blot"))
+        .arg(&prelude)
         .output()
         .context("compile owned-storage conformance fixture (BLOTC or sibling blot2)")?;
     ensure!(
@@ -35,12 +45,15 @@ fn compile_fixture() -> Result<Vec<u8>> {
         String::from_utf8_lossy(&result.stdout),
         String::from_utf8_lossy(&result.stderr)
     );
-    Ok(std::fs::read(output)?)
+    Ok(Some(std::fs::read(output)?))
 }
 #[test]
 fn owned_calls_preserve_copies_bounds_and_reuse_after_failure() -> Result<()> {
+    let Some(bytes) = fixture()? else {
+        return Ok(());
+    };
     let engine = blot_host::engine()?;
-    let module = GuestModule::new(&engine, &fixture()?, None)?;
+    let module = GuestModule::new(&engine, &bytes, None)?;
     let mut guest = Guest::new(&engine, &module)?;
     for _ in 0..20 {
         assert_eq!(guest.call("collected", Value::U32(3))?, Value::U32(48));
@@ -67,8 +80,11 @@ fn owned_calls_preserve_copies_bounds_and_reuse_after_failure() -> Result<()> {
 
 #[test]
 fn kernel_pool_batches_are_bounded_ordered_and_reusable() -> Result<()> {
+    let Some(bytes) = fixture()? else {
+        return Ok(());
+    };
     let engine = blot_host::engine()?;
-    let module = GuestModule::new(&engine, &fixture()?, None)?;
+    let module = GuestModule::new(&engine, &bytes, None)?;
     let cfg = KernelConfig {
         workers: 4,
         default_chunk_items: 8,
@@ -95,8 +111,11 @@ fn kernel_pool_batches_are_bounded_ordered_and_reusable() -> Result<()> {
 
 #[test]
 fn owned_capacity_failure_leaves_the_guest_reusable() -> Result<()> {
+    let Some(bytes) = fixture()? else {
+        return Ok(());
+    };
     let engine = blot_host::engine()?;
-    let module = GuestModule::new(&engine, &fixture()?, None)?;
+    let module = GuestModule::new(&engine, &bytes, None)?;
     // On-demand linear memory starts at 64 KiB: a 1 MiB sandbox starts cleanly,
     // runs small calls, rejects allocations past the cap, and stays reusable.
     let mut sandboxed = Guest::sandboxed(&engine, &module, blot_host::Limits { memory: 1 << 20 })?;

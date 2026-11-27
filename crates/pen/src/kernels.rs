@@ -1140,10 +1140,16 @@ mod tests {
     use pen_protocol::{Frame, Viewport};
 
     #[cfg(feature = "compiler")]
-    fn dummy_service_from_blot(source: &str) -> KernelService {
+    fn dummy_service_from_blot(source: &str) -> Option<KernelService> {
         let blot_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../blot2");
-        let blotc = blot_root.join("compiler-goose/build/blotc-goose");
+        let blotc = std::env::var_os("BLOTC")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| blot_root.join("compiler-goose/build/blotc-goose"));
         let prelude = blot_root.join("std/prelude.blot");
+        if !blotc.is_file() || !prelude.is_file() {
+            crate::fixtures::missing("kernel service Blot test needs blotc-goose and sibling blot2 checkout");
+            return None;
+        }
         let tmp = std::env::temp_dir().join(format!("pen-kernel-svc-test-{}.blot", std::process::id()));
         let wasm_path = tmp.with_extension("wasm");
         std::fs::write(&tmp, source).unwrap();
@@ -1157,7 +1163,7 @@ mod tests {
         let _ = std::fs::remove_file(&wasm_path);
         let engine = blot_host::engine().unwrap();
         let module = GuestModule::new(&engine, &wasm, None).unwrap();
-        KernelService::new_with_workers(engine, module, false, 2)
+        Some(KernelService::new_with_workers(engine, module, false, 2))
     }
 
     #[cfg(feature = "compiler")]
@@ -1195,7 +1201,9 @@ func prep (ctx: #[F32]) => #[ctx[0], ctx[1]]
 func run_item (ctx: #[F32]) -> (x: F32) => #[x + ctx[0], x + ctx[1]]
 #kernel const scale_ctx: Kernel [#[F32], F32, #[F32]] = { prepare: prep, run: run_item }
 "#;
-        let mut svc = dummy_service_from_blot(src);
+        let Some(mut svc) = dummy_service_from_blot(src) else {
+            return;
+        };
         let manifest = svc.kernels[0].clone();
         let frame = Frame { timestamp: 0.0, viewport: Viewport { width: 640, height: 480 }, events: vec![] };
         let mut input0 = encode_frame(&frame, 1.0 / 60.0, &[]).unwrap();

@@ -18,33 +18,46 @@ use wasmtime::Engine;
 
 const MEMORY: Limits = Limits { memory: 64 * 1024 * 1024 };
 
-fn fixture() -> &'static (Engine, GuestModule) {
-    static FIXTURE: OnceLock<(Engine, GuestModule)> = OnceLock::new();
-    FIXTURE.get_or_init(|| {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let blot = root.join("../../../blot2");
-        let compiler = std::env::var_os("BLOTC")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| blot.join("compiler-goose/build/blotc-goose"));
-        let output = root.join("../../target/returned-processes.wasm");
-        let built = Command::new(compiler)
-            .arg("build")
-            .arg(blot.join("benchmarks/language/process_replay.blot"))
-            .arg(&output)
-            .arg("--prelude")
-            .arg(blot.join("std/prelude.blot"))
-            .output()
-            .unwrap();
-        assert!(
-            built.status.success(),
-            "{}{}",
-            String::from_utf8_lossy(&built.stdout),
-            String::from_utf8_lossy(&built.stderr)
-        );
-        let engine = blot_host::engine().unwrap();
-        let module = GuestModule::new(&engine, &std::fs::read(output).unwrap(), None).unwrap();
-        (engine, module)
-    })
+fn fixture() -> Option<&'static (Engine, GuestModule)> {
+    static FIXTURE: OnceLock<Option<(Engine, GuestModule)>> = OnceLock::new();
+    FIXTURE
+        .get_or_init(|| {
+            let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            let blot = root.join("../../../blot2");
+            let compiler = std::env::var_os("BLOTC")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| blot.join("compiler-goose/build/blotc-goose"));
+            let source = blot.join("benchmarks/language/process_replay.blot");
+            let prelude = blot.join("std/prelude.blot");
+            if !compiler.is_file() || !source.is_file() || !prelude.is_file() {
+                let required = std::env::var_os("PEN_REQUIRE_FIXTURES").is_some_and(|v| !v.is_empty() && v != "0");
+                assert!(
+                    !required,
+                    "processes tests require blotc-goose and sibling blot2 checkout, and PEN_REQUIRE_FIXTURES is set"
+                );
+                eprintln!("skipping: processes tests require blotc-goose and sibling blot2 checkout");
+                return None;
+            }
+            let output = root.join("../../target/returned-processes.wasm");
+            let built = Command::new(compiler)
+                .arg("build")
+                .arg(&source)
+                .arg(&output)
+                .arg("--prelude")
+                .arg(&prelude)
+                .output()
+                .unwrap();
+            assert!(
+                built.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&built.stdout),
+                String::from_utf8_lossy(&built.stderr)
+            );
+            let engine = blot_host::engine().unwrap();
+            let module = GuestModule::new(&engine, &std::fs::read(output).unwrap(), None).unwrap();
+            Some((engine, module))
+        })
+        .as_ref()
 }
 
 fn policy(name: &str, step_work: u32, slots: usize, mailbox: usize, memory: Limits) -> ProcessPolicy {
@@ -93,7 +106,9 @@ fn apply(guest: &mut Guest, world: u32, values: &[u32]) -> Result<u32> {
 
 #[test]
 fn native_turns_replay_same_spawning_caller_and_world_at_every_tick() -> Result<()> {
-    let (engine, module) = fixture();
+    let Some((engine, module)) = fixture() else {
+        return Ok(());
+    };
     let host = Arc::new(Mutex::new(Processes::new(engine, module, vec![policy("planner", 1, 2, 1, MEMORY)])?));
     let handles: Arc<Mutex<Vec<ProcessHandle>>> = Arc::new(Mutex::new(Vec::new()));
     let log = Arc::new(Mutex::new(VecDeque::new()));
@@ -198,7 +213,9 @@ fn native_turns_replay_same_spawning_caller_and_world_at_every_tick() -> Result<
 
 #[test]
 fn native_lifecycle_preserves_the_first_terminal_outcome_with_one_slot() -> Result<()> {
-    let (engine, module) = fixture();
+    let Some((engine, module)) = fixture() else {
+        return Ok(());
+    };
     let mut host = Processes::new(
         engine,
         module,
@@ -248,7 +265,9 @@ fn native_lifecycle_preserves_the_first_terminal_outcome_with_one_slot() -> Resu
 
 #[test]
 fn native_deferred_turn_is_first_on_its_next_frame_serial_and_parallel() -> Result<()> {
-    let (engine, module) = fixture();
+    let Some((engine, module)) = fixture() else {
+        return Ok(());
+    };
     for parallel in [false, true] {
         let mut host = Processes::new(
             engine,

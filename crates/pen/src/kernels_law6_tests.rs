@@ -518,6 +518,21 @@ fn drive_session_frames(
     (recorded_inputs, canonical_hashes, final_save, telemetry, all_services)
 }
 
+fn has_sibling_checkouts() -> bool {
+    let (blot2, _, ink, gdev) = repo_paths();
+    let blotc =
+        std::env::var_os("BLOTC").map(PathBuf::from).unwrap_or_else(|| blot2.join("compiler-goose/build/blotc-goose"));
+    if blotc.is_file()
+        && blot2.join("std/prelude.blot").is_file()
+        && ink.join("lib").is_dir()
+        && gdev.join("src").is_dir()
+    {
+        return true;
+    }
+    crate::fixtures::missing("Law #6 kernel integration tests need blotc-goose and sibling blot2/ink/gdev checkouts");
+    false
+}
+
 #[test]
 #[allow(
     clippy::cast_possible_truncation,
@@ -525,6 +540,9 @@ fn drive_session_frames(
     reason = "test asserts non-negative wire tags and counts"
 )]
 fn law6_end_to_end_replay_old_pen_moment_hot_reload_mods_and_equivalence() {
+    if !has_sibling_checkouts() {
+        return;
+    }
     let dir = std::env::temp_dir().join(format!("pen-law6-suite-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let v1_path = write_law6_session_guest(&dir, "law6_v1.blot", 0.0);
@@ -750,6 +768,9 @@ fn law6_end_to_end_replay_old_pen_moment_hot_reload_mods_and_equivalence() {
 
 #[test]
 fn gdev_main_wasm_plan_routes_kernel_runs_deterministically_across_worker_counts() {
+    if !has_sibling_checkouts() {
+        return;
+    }
     let (_, _, _, gdev) = repo_paths();
     let project = crate::project::Project::find(Some(gdev.clone())).unwrap();
     let out_dir = std::env::temp_dir().join(format!("pen-law6-gdev-main-{}", std::process::id()));

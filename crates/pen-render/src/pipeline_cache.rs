@@ -1,3 +1,4 @@
+#![cfg_attr(not(feature = "render-3d"), allow(dead_code))]
 // Compiled pipelines kept on disk between runs, where the device can keep
 // them (Vulkan, with `Features::PIPELINE_CACHE`): a pipeline made with the
 // cache skips the driver's compile when an earlier run made the same one.

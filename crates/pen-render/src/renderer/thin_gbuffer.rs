@@ -3,10 +3,12 @@
 // so RT + TAA/FSR frames rasterize the opaque prepass only once.
 use pen_protocol::{Matrix, RenderFrame};
 
+#[cfg(feature = "render-taa")]
+use super::Source;
 use super::skinning::{self, Skinning};
 use super::timing::{GpuTimer, Span};
 use super::velocity::{SENTINEL, Velocity};
-use super::{Drawing, GpuAsset, ReadyEntry, Scratch, Shape, Source};
+use super::{Drawing, GpuAsset, ReadyEntry, Scratch, Shape};
 use crate::asset_store::{MESH_VERTEX_FLOATS, Material};
 use crate::camera_precision::DepthMode;
 use crate::matrix::{invert, multiply};

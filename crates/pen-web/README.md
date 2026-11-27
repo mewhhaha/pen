@@ -5,6 +5,12 @@ platform services, IndexedDB saves and the game's Blot dev tools, drawn through
 `pen-render` on WebGPU. A browser without WebGPU cannot run the game: the
 page says so.
 
+`pen build --web --web-compact` uses the compact browser host for static
+single-player games. It leaves out development reload, the dev tools
+program, netplay, video textures, GTEX texture recipes and the qualification
+API. Build it locally with `./build.sh OUTPUT --compact`. The release bundle
+contains both hosts.
+
 `pen-runtime` contains what native pen and the browser share: request
 validation and the frame protocol, the guest ABI manifest, transactional
 reload and restores, scenes and undo history, snapshots, time travel (the
@@ -46,6 +52,11 @@ Export a game beside these as `game.wasm`, `devtools.wasm` (optional),
 `game.json` (optional: its `title` names the page, its `name` the files the
 page hands over) and `assets/`. All URLs are relative, so exports work beneath
 a directory on static hosting.
+
+The static export's `game.json` has a `web` object with presence flags for
+`scene`, `devtools`, `saved`, `captions`, and `locales`. Startup fetches only
+the declared optional files. Manually hosted static pages can declare the
+same flags. `pen web` discovers the live checkout's files as it runs.
 
 `pen build --web` does that, then prepares the site for hosting
 (`crates/pen/src/web_export.rs`): a Brotli (quality 11) and a gzip copy beside

@@ -11,6 +11,10 @@ workspace = true
 [lib]
 crate-type = ["cdylib"]
 
+[features]
+# Static single-player games without dev tools, netplay or video textures.
+compact = ["pen-render/web-compact"]
+
 # The browser host builds for wasm32-unknown-unknown (build.sh, with the
 # workspace's `web` profile); for any other target the crate is empty, so
 # the workspace builds and lints as a whole.
@@ -22,6 +26,7 @@ pen-ink.workspace = true
 pen-render.workspace = true
 pen-simulation.workspace = true
 futures-channel = "0.3"
+futures-util = { version = "0.3", default-features = false, features = ["async-await-macro"] }
 js-sys = "0.3.106"
 serde_json = "1"
 # build.sh installs the wasm-bindgen CLI of the version Cargo.lock pins.

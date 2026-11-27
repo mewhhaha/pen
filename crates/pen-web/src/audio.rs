@@ -1181,6 +1181,7 @@ impl Audio {
     }
 }
 
+#[cfg(not(feature = "compact"))]
 pub async fn qualify() -> Result<()> {
     let canvas: HtmlCanvasElement = web_sys::window()
         .unwrap()

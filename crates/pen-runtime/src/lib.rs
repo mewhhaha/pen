@@ -37,3 +37,4 @@ pub mod timeline;
 pub mod touch;
 pub mod transport;
 pub mod voice;
+pub mod web;

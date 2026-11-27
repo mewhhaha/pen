@@ -51,6 +51,7 @@ jobs:
           )
           install -m 644 plugins/target/wasm32-wasip2/release/pen_plugin_blot.wasm bundle/plugins/blot.wasm
           sh crates/pen-web/build.sh "$PWD/bundle/web"
+          sh crates/pen-web/build.sh "$PWD/bundle/web-compact" --compact
           cp LICENSE THIRD_PARTY_NOTICES.md bundle/
           printf '%s\n' "$PEN_BUILD" > bundle/source-commit
       - name: Smoke check and publish
@@ -65,6 +66,7 @@ jobs:
           grep -F 'tool NAME [ARGS...]' bundle-help.txt
           test -s bundle/plugins/blot.wasm
           test -s bundle/web/pen_web_bg.wasm
+          test -s bundle/web-compact/pen_web_bg.wasm
           archive="pen-tools-$version-ubuntu-24.04-x86_64.tar.gz"
           tar -czf "$archive" -C bundle .
           sha256sum "$archive" > "$archive.sha256"

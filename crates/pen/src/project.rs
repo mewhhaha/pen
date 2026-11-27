@@ -122,6 +122,9 @@ pub struct Manifest {
     /// Whether this package also ships epoch-interrupted `workers.cwasm` + `workers.meta`.
     #[serde(default, skip_serializing_if = "is_false")]
     pub worker_deadlines: bool,
+    /// Optional startup files present in a static browser export.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web: Option<pen_runtime::web::WebFiles>,
 }
 
 impl Manifest {
@@ -937,8 +940,13 @@ fn package_into(source: GameSource, out: &Path, destination: &Path, options: Pac
         std::fs::write(game.join("workers.meta"), &meta)?;
     }
     std::fs::remove_file(game.join("game.wasm"))?;
-    Manifest { game: identity, runtime: Some(RUNTIME.to_owned()), worker_deadlines: options.worker_deadlines }
-        .write(game)?;
+    Manifest {
+        game: identity,
+        runtime: Some(RUNTIME.to_owned()),
+        worker_deadlines: options.worker_deadlines,
+        web: None,
+    }
+    .write(game)?;
     std::fs::copy(&runtime, &layout.executable)?;
     if let Some(library) = &steam {
         std::fs::copy(library, layout.libraries.join(library.file_name().unwrap()))?;
@@ -965,9 +973,10 @@ fn package_into(source: GameSource, out: &Path, destination: &Path, options: Pac
 /// The browser host's files, into `out`: PEN_WEB_HOST's, those `just
 /// install` put beside this executable, else built from this repository.
 #[cfg(feature = "compiler")]
-pub fn web_host(out: &Path) -> Result<()> {
-    let host = std::env::var_os("PEN_WEB_HOST").map(PathBuf::from).or_else(|| {
-        let beside = std::env::current_exe().ok()?.parent()?.join("web");
+pub fn web_host(out: &Path, compact: bool) -> Result<()> {
+    let (variable, directory) = if compact { ("PEN_WEB_COMPACT_HOST", "web-compact") } else { ("PEN_WEB_HOST", "web") };
+    let host = std::env::var_os(variable).map(PathBuf::from).or_else(|| {
+        let beside = std::env::current_exe().ok()?.parent()?.join(directory);
         beside.join("pen_web_bg.wasm").is_file().then_some(beside)
     });
     if let Some(host) = host {
@@ -984,8 +993,13 @@ pub fn web_host(out: &Path) -> Result<()> {
         }
     } else {
         let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../pen-web/build.sh");
-        ensure!(script.is_file(), "set PEN_WEB_HOST to a built pen-web host directory");
-        let status = Command::new("sh").arg(script).arg(out).status().context("building pen-web")?;
+        ensure!(script.is_file(), "set {variable} to a built pen-web host directory");
+        let mut build = Command::new("sh");
+        build.arg(script).arg(out);
+        if compact {
+            build.arg("--compact");
+        }
+        let status = build.status().context("building pen-web")?;
         ensure!(status.success(), "the browser host did not build");
     }
     Ok(())
@@ -995,7 +1009,8 @@ pub fn web_host(out: &Path) -> Result<()> {
 /// manifest as a complete static site, ready to host (`web_export`): its
 /// files precompressed and a service worker; and, given `zip`, as a ZIP.
 #[cfg(feature = "compiler")]
-pub fn export_web(project: &Project, out: &Path, zip: Option<&Path>, optimize: bool) -> Result<()> {
+pub fn export_web(project: &Project, out: &Path, zip: Option<&Path>, optimize: bool, compact: bool) -> Result<()> {
+    ensure!(!compact || project.devtools().is_none(), "--web-compact cannot include a dev tools program");
     let staging = crate::staging::Staging::new(&project.root, out)?;
     let site = &staging.directory;
     let PreparedGame { assets, .. } = prepare_game(&GameSource::Checkout(project), site, optimize)?;
@@ -1005,15 +1020,19 @@ pub fn export_web(project: &Project, out: &Path, zip: Option<&Path>, optimize: b
         shipping_wasm(&site.join("devtools.wasm"), optimize)?;
     }
     std::fs::copy(project.assets().join("catalog.json"), site.join("catalog.json"))?;
-    let saved = site.join("assets").join(pen_runtime::state::CONFIG_FILE);
-    if !saved.is_file() {
-        std::fs::write(&saved, pen_runtime::state::OPAQUE_CONFIG)?;
-    }
     if site.join("main.scene").is_file() {
         std::fs::rename(site.join("main.scene"), site.join("scene.bin"))?;
     }
-    Manifest { game: project.identity.clone(), runtime: None, worker_deadlines: false }.write(site)?;
-    web_host(site)?;
+    let assets_dir = site.join("assets");
+    let web = pen_runtime::web::WebFiles {
+        scene: site.join("scene.bin").is_file(),
+        devtools: site.join("devtools.wasm").is_file(),
+        saved: assets_dir.join(pen_runtime::state::CONFIG_FILE).is_file(),
+        captions: assets_dir.join("captions.json").is_file(),
+        locales: site.join("text.json").is_file(),
+    };
+    Manifest { game: project.identity.clone(), runtime: None, worker_deadlines: false, web: Some(web) }.write(site)?;
+    web_host(site, compact)?;
     notices(site)?;
     let hosting = crate::web_export::prepare(site)?;
     eprintln!("exported {}: {assets}; {hosting}; {:.1} MB in all", out.display(), size_of(site) as f64 / 1e6);
@@ -1059,7 +1078,8 @@ pub fn export_bundle(project: &Project, out: &Path) -> Result<()> {
     crate::reports::ship_config(&project.root, &staging.directory)?;
     let wasm = std::fs::read(staging.directory.join("game.wasm"))?;
     crate::scene_assets::write(&wasm, &project.assets(), &project.scene(), &staging.directory.join("assets"))?;
-    Manifest { game: project.identity.clone(), runtime: None, worker_deadlines: false }.write(&staging.directory)?;
+    Manifest { game: project.identity.clone(), runtime: None, worker_deadlines: false, web: None }
+        .write(&staging.directory)?;
     staging.publish()
 }
 
@@ -1218,7 +1238,7 @@ mod tests {
         // Without a manifest, after the directory.
         assert_eq!(bundle_identity(&bundle).unwrap(), Identity::named("gdev"));
         let salt = Identity { name: "salt".into(), title: "Salt!".into(), players: 1 };
-        let manifest = Manifest { game: salt, runtime: Some(RUNTIME.into()), worker_deadlines: false };
+        let manifest = Manifest { game: salt, runtime: Some(RUNTIME.into()), worker_deadlines: false, web: None };
         manifest.write(&bundle).unwrap();
         assert!(!std::fs::read_to_string(bundle.join("game.json")).unwrap().contains("players"), "one goes unsaid");
         let read = Manifest::read(&bundle).unwrap().unwrap();
@@ -1229,6 +1249,7 @@ mod tests {
             game: Identity { players: 2, ..manifest.game.clone() },
             runtime: None,
             worker_deadlines: false,
+            web: None,
         };
         pair.write(&bundle).unwrap();
         assert_eq!(bundle_identity(&bundle).unwrap().players, 2);
@@ -1255,7 +1276,9 @@ mod tests {
         std::fs::write(bundle.join("assets/fill.wgsl"), "").unwrap();
         let wasm = [&b"\0asm\x01\0\0\0\0\x0c\x08blot:abi"[..], &[2, 0, 0]].concat();
         std::fs::write(bundle.join("game.wasm"), &wasm).unwrap();
-        Manifest { game: Identity::named("gather"), runtime: None, worker_deadlines: false }.write(&bundle).unwrap();
+        Manifest { game: Identity::named("gather"), runtime: None, worker_deadlines: false, web: None }
+            .write(&bundle)
+            .unwrap();
         // A runtime: an x86-64 ELF header and this pen's mark.
         let mut runtime = vec![0u8; 64];
         runtime[..4].copy_from_slice(b"\x7fELF");

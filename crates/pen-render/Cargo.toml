@@ -12,6 +12,8 @@ workspace = true
 # Simpler levels of detail for meshes where assets are packaged
 # (`pack_mesh_with_lods`): pen's packaging has it, the browser host does not.
 simplify = ["dep:meshopt-rs"]
+# The compact browser host uses authored images and precomputed packed textures.
+web-compact = []
 
 [dependencies]
 anyhow.workspace = true

@@ -940,6 +940,13 @@ const OPTIONS: &[OptionSpec] = &[
         about: "the Rust browser host and the game as static files instead",
     },
     OptionSpec {
+        name: "--web-compact",
+        value: "",
+        commands: &["build"],
+        place: Place::Command,
+        about: "with --web, use the smaller static single-player host with precomputed textures",
+    },
+    OptionSpec {
         name: "--worker-deadlines",
         value: "",
         commands: &["build"],
@@ -2599,6 +2606,9 @@ fn run(words: impl IntoIterator<Item = String>) -> Result<()> {
             play(&args, Game::checkout(project), false, false, Some(&project.root), software)
         }
         "build" => {
+            let web = args.flag("--web");
+            let compact = args.flag("--web-compact");
+            ensure!(!compact || web, "--web-compact goes with --web");
             let options = project::PackageOptions {
                 optimize: !args.flag("--no-optimize"),
                 runtime: args.path("--runtime"),
@@ -2610,7 +2620,7 @@ fn run(words: impl IntoIterator<Item = String>) -> Result<()> {
             };
             // A bundle compiled already packages as it is, for another platform's runtime.
             if let Some(bundle) = &bundle {
-                ensure!(!args.flag("--web"), "pen build --web exports a checkout, not --game");
+                ensure!(!web, "pen build --web exports a checkout, not --game");
                 ensure!(!args.flag("--zip"), "--zip goes with --web");
                 let out = args.path("--out").context("pen build --game needs --out DIR")?;
                 return project::package(project::GameSource::Bundle(bundle), &out, options);
@@ -2623,10 +2633,9 @@ fn run(words: impl IntoIterator<Item = String>) -> Result<()> {
                 label: args.value("--label"),
             }
             .plan(project)?;
-            let web = args.flag("--web");
             let out = if web {
                 let out = args.path("--out").unwrap_or_else(|| project.root.join(".pen/web-export"));
-                project::export_web(project, &out, args.path("--zip").as_deref(), options.optimize)?;
+                project::export_web(project, &out, args.path("--zip").as_deref(), options.optimize, compact)?;
                 out
             } else {
                 ensure!(!args.flag("--zip"), "--zip goes with --web");

@@ -66,6 +66,7 @@ mod taa;
 #[cfg(test)]
 mod testing;
 mod texture;
+#[cfg(not(all(target_arch = "wasm32", feature = "web-compact")))]
 mod texture_recipe;
 pub mod tonemap;
 pub mod video;

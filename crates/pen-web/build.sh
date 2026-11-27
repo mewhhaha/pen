@@ -1,7 +1,8 @@
 #!/bin/sh
 # Builds the browser host as an ES module and its wasm:
 #   OUT/pen_web.js, OUT/pen_web_bg.wasm (and .d.ts typings)
-# OUT defaults to crates/pen-web/pkg. The crate builds in the workspace with
+# OUT defaults to crates/pen-web/pkg. Pass --compact after OUT for the
+# static single-player host. The crate builds in the workspace with
 # its `web` profile, into target/browser. The wasm-bindgen CLI must match the
 # wasm-bindgen version Cargo.lock pins; the first build installs it under
 # target/wasm-tools. wasm-opt (binaryen) shrinks the wasm further; without
@@ -10,13 +11,18 @@ set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
 out=${1:-$here/pkg}
+case ${2:-} in
+  --compact) set -- --features compact ;;
+  '') set -- ;;
+  *) echo "usage: $0 [OUT [--compact]]" >&2; exit 2 ;;
+esac
 version=$(awk '/^name = "wasm-bindgen"$/ { getline; gsub(/version = |"/, ""); print; exit }' "$root/Cargo.lock")
 [ -n "$version" ] || { echo "build.sh: Cargo.lock pins no wasm-bindgen" >&2; exit 1; }
 tools="$root/target/wasm-tools"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$root/target/browser}"
 
 rustup target list --installed | grep -qx wasm32-unknown-unknown || rustup target add wasm32-unknown-unknown
-cargo build --manifest-path "$root/Cargo.toml" -p pen-web --target wasm32-unknown-unknown --profile web
+cargo build --locked --manifest-path "$root/Cargo.toml" -p pen-web --target wasm32-unknown-unknown --profile web "$@"
 bindgen="$tools/bin/wasm-bindgen"
 if ! "$bindgen" --version 2>/dev/null | grep -q " $version\$"; then
   cargo install wasm-bindgen-cli --version "$version" --locked --root "$tools"

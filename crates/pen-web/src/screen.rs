@@ -107,7 +107,8 @@ pub struct Screen {
     pub adapter: String,
     pub renderer: Renderer,
     /// The dev tools' sprites, over the game's frame.
-    pub overlay: Renderer,
+    overlay: Option<Renderer>,
+    assets: String,
     pub canvas: Canvas,
     /// Completion fences in submission order, at most FRAMES_IN_FLIGHT.
     in_flight: VecDeque<oneshot::Receiver<()>>,
@@ -184,7 +185,6 @@ impl Screen {
             pipeline_cache: None,
         };
         let renderer = Renderer::new(device.clone(), queue.clone(), options)?;
-        let overlay = renderer.share(assets.into())?;
         let canvas = Canvas {
             element,
             queue,
@@ -195,7 +195,7 @@ impl Screen {
             pinned: None,
             timings: DrawTimings::default(),
         };
-        Ok(Self { adapter: name, renderer, overlay, canvas, in_flight: VecDeque::new() })
+        Ok(Self { adapter: name, renderer, overlay: None, assets, canvas, in_flight: VecDeque::new() })
     }
 
     /// Follows the canvas's size and the display's density: the backing
@@ -236,13 +236,20 @@ impl Screen {
         self.canvas.timings.pace_ms = pacing.elapsed().as_secs_f64() * 1000.0;
         let rendering = Instant::now();
         self.canvas.fit();
+        if !cfg!(feature = "compact") && overlay.is_some() && self.overlay.is_none() {
+            self.overlay = Some(self.renderer.share(self.assets.clone().into())?);
+        }
         self.renderer.submit(game, catalog, &mut self.canvas)?;
-        if let Some(overlay) = overlay {
-            self.overlay.prepare_sprites(&overlay.sprites, catalog)?;
+        if let (Some(overlay), Some(renderer)) = (overlay, &mut self.overlay) {
+            renderer.prepare_sprites(&overlay.sprites, catalog)?;
             if let Some(frame) = &self.canvas.frame {
                 let view = frame.texture.create_view(&Default::default());
-                self.overlay.overlay(&overlay.sprites, catalog, &view, self.canvas.size())?;
+                renderer.overlay(&overlay.sprites, catalog, &view, self.canvas.size())?;
             }
+        }
+        // The dev tools' asset events stay with their renderer.
+        if let Some(renderer) = &mut self.overlay {
+            let _ = renderer.take_events();
         }
         if let Some(frame) = self.canvas.frame.take() {
             let started = Instant::now();
@@ -262,6 +269,16 @@ impl Screen {
 
     /// Whether assets are still loading, streaming in or fading in.
     pub fn busy(&self) -> bool {
-        !self.renderer.quiet() || self.renderer.pending() > 0 || self.overlay.pending() > 0
+        !self.renderer.quiet() || self.renderer.pending() > 0 || self.overlay_pending() > 0
+    }
+
+    pub fn overlay_pending(&self) -> usize {
+        self.overlay.as_ref().map_or(0, Renderer::pending)
+    }
+
+    pub fn reload_overlay(&mut self) {
+        if let Some(renderer) = &mut self.overlay {
+            renderer.reload_all();
+        }
     }
 }

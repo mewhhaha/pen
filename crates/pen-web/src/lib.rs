@@ -15,7 +15,7 @@ mod files;
 mod input;
 #[cfg(target_arch = "wasm32")]
 mod kernels;
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", not(feature = "compact")))]
 pub mod net;
 #[cfg(target_arch = "wasm32")]
 mod preferences;
@@ -33,7 +33,7 @@ mod screen;
 mod services;
 #[cfg(target_arch = "wasm32")]
 mod tools;
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", not(feature = "compact")))]
 mod video;
 
 #[cfg(target_arch = "wasm32")]
@@ -41,15 +41,21 @@ use anyhow::Result;
 #[cfg(target_arch = "wasm32")]
 use js_sys::Uint8Array;
 #[cfg(target_arch = "wasm32")]
-use pen_protocol::{Catalog, GameEvent, RenderFrame, Viewport, service, service_status};
+use pen_protocol::{Catalog, RenderFrame, Viewport};
+#[cfg(all(target_arch = "wasm32", not(feature = "compact")))]
+use pen_protocol::{GameEvent, service, service_status};
 #[cfg(target_arch = "wasm32")]
 use pen_runtime::devtools::{Log, log_source};
 #[cfg(target_arch = "wasm32")]
 use pen_runtime::game::Host;
 #[cfg(target_arch = "wasm32")]
-use pen_runtime::snapshot::{self, SavedState};
+use pen_runtime::snapshot;
+#[cfg(all(target_arch = "wasm32", not(feature = "compact")))]
+use pen_runtime::snapshot::SavedState;
 #[cfg(target_arch = "wasm32")]
 use pen_runtime::state::{self, CONFIG_FILE, StateAdapter};
+#[cfg(target_arch = "wasm32")]
+use pen_runtime::web::WebFiles;
 #[cfg(target_arch = "wasm32")]
 use std::sync::Arc;
 #[cfg(target_arch = "wasm32")]
@@ -139,7 +145,7 @@ async fn load_locales() -> Result<Option<pen_runtime::locale::Locales>> {
 
 /// Fetches `path`, rejecting responses whose `Content-Length` or payload exceeds `max_bytes`
 /// before copying into Wasm linear memory.
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", not(feature = "compact")))]
 pub async fn fetch_bounded(path: &str, max_bytes: usize) -> Result<Vec<u8>> {
     let response: Response = JsFuture::from(web_sys::window().unwrap().fetch_with_str(path))
         .await
@@ -187,10 +193,9 @@ pub(crate) async fn load_state_adapter(assets: &str) -> Arc<dyn StateAdapter> {
 }
 
 /// Names the page after the game, as its `game.json` (`pen build --web`
-/// writes it) titles it; returns its name, which the files the page hands
-/// the player are named after.
+/// writes it) titles it, and reads the exported list of optional files.
 #[cfg(target_arch = "wasm32")]
-async fn manifest(manifest: &str, canvas: &HtmlCanvasElement) -> String {
+async fn manifest(manifest: &str, canvas: &HtmlCanvasElement) -> (String, Option<WebFiles>) {
     let game = fetch(manifest).await.ok().and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
     let field = |key: &str| {
         let value = game.as_ref()?.get(key)?.as_str()?;
@@ -200,7 +205,14 @@ async fn manifest(manifest: &str, canvas: &HtmlCanvasElement) -> String {
         web_sys::window().unwrap().document().unwrap().set_title(&title);
         let _ = canvas.set_attribute("aria-label", &title);
     }
-    field("name").unwrap_or_else(|| "game".to_owned())
+    let name = field("name").unwrap_or_else(|| "game".to_owned());
+    let files = game.and_then(|game| serde_json::from_value(game.get("web")?.clone()).ok());
+    (name, files)
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn optional_file(path: &str, present: bool) -> Option<Vec<u8>> {
+    if present { fetch(path).await.ok() } else { None }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -249,35 +261,76 @@ impl Host for Starting<'_> {
 #[wasm_bindgen]
 pub async fn start(canvas: HtmlCanvasElement, options: JsValue) -> Result<(), JsValue> {
     std::panic::set_hook(Box::new(|info| web_sys::console::error_1(&info.to_string().into())));
-    let path = |key: &str, default: &str| {
-        js_sys::Reflect::get(&options, &key.into())
-            .ok()
-            .and_then(|value| value.as_string())
-            .unwrap_or_else(|| default.into())
-    };
+    let string = |key: &str| js_sys::Reflect::get(&options, &key.into()).ok().and_then(|value| value.as_string());
+    let path = |key: &str, default: &str| string(key).unwrap_or_else(|| default.into());
     let flag =
         |key: &str| js_sys::Reflect::get(&options, &key.into()).ok().and_then(|value| value.as_bool()).unwrap_or(false);
-    let name = manifest(&path("manifest", "game.json"), &canvas).await;
-    let game = fetch(&path("game", "game.wasm")).await.map_err(failed)?;
-    let catalog: serde_json::Value =
-        serde_json::from_slice(&fetch(&path("catalog", "catalog.json")).await.map_err(failed)?).map_err(failed)?;
-    let catalog = pen_protocol::boundary::parse_catalog(&catalog).map_err(failed)?;
-    let scene = fetch(&path("scene", "scene.bin")).await.ok().and_then(|bytes| snapshot::decode(&bytes).ok());
-    let devtools = fetch(&path("devtools", "devtools.wasm")).await.ok();
     let assets = path("assets", "assets");
-    let state_adapter = load_state_adapter(&assets).await;
-    // The sounds' captions, if the assets have any.
-    let captions = match fetch(&format!("{assets}/captions.json")).await {
-        Ok(bytes) => pen_runtime::captions::Captions::parse(&String::from_utf8_lossy(&bytes)).unwrap_or_else(|error| {
+    let development = flag("development");
+    if cfg!(feature = "compact")
+        && (development || flag("qualify") || js_sys::Reflect::has(&options, &"netRelay".into()).unwrap_or(false))
+    {
+        return Err(failed("use the full browser host for development, qualification or netplay"));
+    }
+    let manifest_path = path("manifest", "game.json");
+    let game_path = path("game", "game.wasm");
+    let catalog_path = path("catalog", "catalog.json");
+    let scene_path = path("scene", "scene.bin");
+    let devtools_path = path("devtools", "devtools.wasm");
+    let captions_path = format!("{assets}/captions.json");
+    let content = async {
+        let (name, files) = manifest(&manifest_path, &canvas).await;
+        // A development page reads the current checkout. Exports already know what they ship.
+        let files = files.unwrap_or(WebFiles {
+            scene: development || string("scene").is_some(),
+            devtools: development || string("devtools").is_some(),
+            saved: development,
+            captions: development,
+            locales: development,
+        });
+        if cfg!(feature = "compact") && files.devtools {
+            return Err(failed("use the full browser host to run devtools.wasm"));
+        }
+        let saved = async { if files.saved { load_state_adapter(&assets).await } else { state::opaque() } };
+        let locales = async {
+            if !files.locales {
+                return None;
+            }
+            load_locales().await.unwrap_or_else(|error| {
+                web_sys::console::warn_1(&format!("the game's string tables: {error:#}").into());
+                None
+            })
+        };
+        let (scene, devtools, state_adapter, captions, locales) = futures_util::join!(
+            optional_file(&scene_path, files.scene),
+            optional_file(&devtools_path, files.devtools),
+            saved,
+            optional_file(&captions_path, files.captions),
+            locales,
+        );
+        Ok((name, scene, devtools, state_adapter, captions, locales))
+    };
+    let (game, catalog, screen, autosave, content) = futures_util::join!(
+        fetch(&game_path),
+        fetch(&catalog_path),
+        Screen::new(canvas.clone(), assets.clone()),
+        saves::read("pen.autosave"),
+        content,
+    );
+    let game = game.map_err(failed)?;
+    let catalog: serde_json::Value = serde_json::from_slice(&catalog.map_err(failed)?).map_err(failed)?;
+    let catalog = pen_protocol::boundary::parse_catalog(&catalog).map_err(failed)?;
+    let mut screen = screen.map_err(failed)?;
+    screen.renderer.preload(&catalog);
+    let (name, scene, devtools, state_adapter, captions, locales) = content?;
+    let scene = scene.and_then(|bytes| snapshot::decode(&bytes).ok());
+    let captions = captions.map_or_else(Default::default, |bytes| {
+        pen_runtime::captions::Captions::parse(&String::from_utf8_lossy(&bytes)).unwrap_or_else(|error| {
             web_sys::console::warn_1(&format!("{error:#}").into());
             Default::default()
-        }),
-        Err(_) => Default::default(),
-    };
-    let locales = load_locales().await.unwrap_or_else(|error| {
-        web_sys::console::warn_1(&format!("the game's string tables: {error:#}").into());
-        None
+        })
     });
+    #[cfg(not(feature = "compact"))]
     let relay_config =
         js_sys::Reflect::get(&options, &"netRelay".into()).ok().filter(|v| v.is_object()).and_then(|obj| {
             let url = js_sys::Reflect::get(&obj, &"url".into()).ok()?.as_string()?;
@@ -299,7 +352,7 @@ pub async fn start(canvas: HtmlCanvasElement, options: JsValue) -> Result<(), Js
             Some(run::NetRelayConfig { url, room, player, players, token })
         });
     let options = Options {
-        development: flag("development"),
+        development,
         qualify: flag("qualify"),
         name,
         replay: replay::linked(),
@@ -307,21 +360,25 @@ pub async fn start(canvas: HtmlCanvasElement, options: JsValue) -> Result<(), Js
         assets: assets.clone(),
         captions,
         locales,
+        #[cfg(not(feature = "compact"))]
         netplay: None,
     };
-    let mut screen = Screen::new(canvas.clone(), assets.clone()).await.map_err(failed)?;
-    screen.renderer.preload(&catalog);
     let mut log = Log::new(run::LOG_LINES);
     log.push(log_source::SESSION, false, "pen browser host ready");
     let viewport = screen.viewport();
     let game_wasm_for_kernels = game.clone();
+    #[cfg(not(feature = "compact"))]
     let build_hash = pen_runtime::net::wire::hash_bytes(&game);
     let started = {
         let mut host = Starting { viewport, log: &mut log, state_adapter: &state_adapter };
-        Runtime::new(&BrowserBackend, game, catalog.clone(), &mut host, saves::read("pen.autosave").await, scene).await
+        Runtime::new(&BrowserBackend, game, catalog.clone(), &mut host, autosave, scene).await
     };
-    let mut runtime = started.map_err(failed)?;
+    let runtime = started.map_err(failed)?;
+    #[cfg(not(feature = "compact"))]
+    let mut runtime = runtime;
+    #[cfg(not(feature = "compact"))]
     let mut options = options;
+    #[cfg(not(feature = "compact"))]
     if let Some(cfg) = relay_config {
         let link =
             net::BrowserRelayLink::connect(&cfg.url, &cfg.room, cfg.player, cfg.players, cfg.token).map_err(failed)?;
@@ -331,6 +388,7 @@ pub async fn start(canvas: HtmlCanvasElement, options: JsValue) -> Result<(), Js
             Some(pen_runtime::net::Netplay::new(settings, Box::new(link), build_hash, &start, 1).map_err(failed)?);
     }
     let tools = match devtools {
+        Some(_) if cfg!(feature = "compact") => None,
         Some(module) => {
             let saved = saves::read("pen.devtools").await;
             Some(Tools::start(module, &catalog, viewport, saved, &mut log).await.map_err(failed)?)
@@ -354,7 +412,7 @@ pub async fn start(canvas: HtmlCanvasElement, options: JsValue) -> Result<(), Js
 
 /// Browser engine qualification: identical request packets to `pen packets`.
 /// It deliberately skips rendering and platform IO, just as native packet runs do.
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", not(feature = "compact")))]
 #[wasm_bindgen]
 pub async fn qualify(module: Uint8Array, scene: Uint8Array, inputs: js_sys::Array) -> Result<js_sys::Array, JsValue> {
     use pen_runtime::program::{Backend, Operation, Program};
@@ -384,7 +442,7 @@ pub async fn qualify(module: Uint8Array, scene: Uint8Array, inputs: js_sys::Arra
 }
 
 /// Exercises real browser platform adapters without changing a game's saves.
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", not(feature = "compact")))]
 #[wasm_bindgen]
 pub async fn qualify_platform() -> Result<String, JsValue> {
     let result = async {
@@ -429,7 +487,7 @@ pub async fn qualify_platform() -> Result<String, JsValue> {
 /// The simulation services' answers to fixed requests, here in wasm32, as
 /// their digest: the same bits as native's, or an error saying what
 /// differs. Needs no page, so node runs it too (tests/services.mjs).
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", not(feature = "compact")))]
 #[wasm_bindgen]
 pub fn qualify_services() -> Result<String, JsValue> {
     let mut services = pen_runtime::services::Services::<()>::new();
@@ -438,7 +496,7 @@ pub fn qualify_services() -> Result<String, JsValue> {
 }
 
 /// Checks the host boundary with the same binary fixtures as the native tests.
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", not(feature = "compact")))]
 #[wasm_bindgen]
 pub fn qualify_frame(packet: &[f32], schema: u32, catalog: &str) -> Result<String, JsValue> {
     let catalog = serde_json::from_str(catalog).map_err(failed)?;

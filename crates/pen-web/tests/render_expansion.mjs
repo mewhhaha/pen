@@ -431,7 +431,9 @@ try {
   });
 
   await page.route('**/catalog.json', route => route.fulfill({ json: { meshes: [], materials: [], sounds: ['chime.wav'] } }));
-  await page.route('**/game.json', route => route.fulfill({ json: { name: 'render-expansion', title: 'Render Expansion Check' } }));
+  await page.route('**/game.json', route => route.fulfill({ json: {
+    name: 'render-expansion', title: 'Render Expansion Check', web: { saved: true, captions: true, locales: true },
+  } }));
   await page.route('**/game.wasm', route => route.fulfill({ body: Buffer.from(guestBytes), contentType: 'application/wasm' }));
   await page.route('**/assets/saved.json', route => route.fulfill({ json: { format: 'opaque' } }));
   await page.route('**/assets/captions.json', route => route.fulfill({

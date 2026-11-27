@@ -102,10 +102,12 @@ impl PackedReader {
     pub fn open(bytes: Vec<u8>) -> Result<Self> {
         ensure!(bytes.len() >= 16, "packed texture requires a GTEX header");
         let header = parse_header(&bytes[..16])?;
-        let generated = if bytes[4] == 3 {
-            Some(crate::texture_recipe::generate(&bytes[16..], header, bytes[6])?.into_iter())
-        } else {
-            None
+        let generated = match bytes[4] {
+            #[cfg(all(target_arch = "wasm32", feature = "web-compact"))]
+            3 => bail!("use the full browser host for GTEX texture recipes"),
+            #[cfg(not(all(target_arch = "wasm32", feature = "web-compact")))]
+            3 => Some(crate::texture_recipe::generate(&bytes[16..], header, bytes[6])?.into_iter()),
+            _ => None,
         };
         Ok(Self { bytes, at: 16, header, next: i64::from(header.levels) - 1, generated })
     }

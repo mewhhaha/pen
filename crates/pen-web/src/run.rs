@@ -36,6 +36,7 @@ use crate::replay::{self, Recorder};
 use crate::saves;
 use crate::screen::{FRAMES_IN_FLIGHT, Screen};
 use crate::tools::Tools;
+#[cfg(not(feature = "compact"))]
 use crate::video::WebVideoRegistry;
 
 pub type Runtime = GameRuntime<BrowserBackend>;
@@ -210,6 +211,7 @@ fn keep(name: &'static str, saved: SavedState, last: Option<u64>) -> Option<u64>
 }
 
 /// Optional browser WebSocket relay netplay configuration passed via `options.netRelay`.
+#[cfg(not(feature = "compact"))]
 pub struct NetRelayConfig {
     pub url: String,
     pub room: String,
@@ -238,6 +240,7 @@ pub struct Options {
     /// Where the page's link has a recording to play (`replay::linked`).
     pub replay: Option<String>,
     /// Optional WebSocket relay netplay session (`BrowserRelayLink`).
+    #[cfg(not(feature = "compact"))]
     pub netplay: Option<pen_runtime::net::Netplay>,
 }
 
@@ -300,8 +303,10 @@ pub struct Browser {
     /// The recording the page's link names, played first.
     linked: Option<String>,
     /// Active browser WebSocket relay netplay session, when configured via `options.netRelay`.
+    #[cfg(not(feature = "compact"))]
     #[allow(dead_code)]
     netplay: Option<pen_runtime::net::Netplay>,
+    #[cfg(not(feature = "compact"))]
     videos: WebVideoRegistry,
 }
 
@@ -325,7 +330,7 @@ impl Browser {
         if options.development {
             timeline.keep_history(Some(KEEP_SECONDS));
         }
-        let hooks = options.qualify.then(|| Hooks::new(screen.canvas.element.clone()));
+        let hooks = (!cfg!(feature = "compact") && options.qualify).then(|| Hooks::new(screen.canvas.element.clone()));
         let captions = options.captions.shared();
         services.register(Box::new(pen_runtime::captions::CaptionsService(captions.clone())));
         let accessibility = Accessibility::new(input.clone())?;
@@ -336,8 +341,7 @@ impl Browser {
             .unwrap_or_else(|| ("en".into(), false));
         accessibility.set_locale(&tag, rtl)?;
         let kernels = game_wasm.as_deref().and_then(crate::kernels::WebKernelService::maybe_new);
-        let netplay = options.netplay;
-        game.hash_packets(options.qualify);
+        game.hash_packets(hooks.is_some());
         Ok(Browser {
             shown: game.take_drawn().unwrap_or_default(),
             catalog: game.catalog().clone(),
@@ -361,7 +365,7 @@ impl Browser {
             pacer: None,
             log,
             timings: None,
-            development: options.development.then(Development::watch),
+            development: (!cfg!(feature = "compact") && options.development).then(Development::watch),
             hooks,
             autosave: Autosave::default(),
             status: true,
@@ -370,6 +374,7 @@ impl Browser {
             cursor_hidden: false,
             previous: None,
             state_adapter: options.state_adapter,
+            #[cfg(not(feature = "compact"))]
             videos: WebVideoRegistry::new(options.assets.clone()),
             assets: options.assets,
             files: Files::install(),
@@ -377,7 +382,8 @@ impl Browser {
             importing: None,
             recorder: None,
             linked: options.replay,
-            netplay,
+            #[cfg(not(feature = "compact"))]
+            netplay: options.netplay,
         })
     }
 
@@ -407,8 +413,10 @@ impl Browser {
         self.read_mail();
         self.input.borrow_mut().poll_gamepads();
         let hotkeys = self.take_input();
-        self.run_tools(timestamp, interval).await;
-        self.qualification_request().await?;
+        if !cfg!(feature = "compact") {
+            self.run_tools(timestamp, interval).await;
+            self.qualification_request().await?;
+        }
         let started = Instant::now();
         for hotkey in hotkeys {
             self.hotkey(hotkey);
@@ -417,6 +425,9 @@ impl Browser {
         let ran = self.step().await?;
         let overlay = self.tools.as_ref().and_then(|tools| tools.frame.as_ref());
         self.preferences.apply(&mut self.screen.renderer);
+        #[cfg(feature = "compact")]
+        anyhow::ensure!(self.shown.video_streams.is_empty(), "use the full browser host for video textures");
+        #[cfg(not(feature = "compact"))]
         if !self.shown.video_streams.is_empty() {
             for message in self.videos.update(&self.shown, &self.catalog, &mut self.screen.renderer) {
                 say(&mut self.log, log_source::GAME, true, message);
@@ -429,8 +440,6 @@ impl Browser {
                 return Err(err);
             }
         };
-        // The dev tools' assets are their own; the game never hears of them.
-        let _ = self.screen.overlay.take_events();
         if ran.is_some() {
             self.timings = self.game.last_timings().map(|timings| timings.completed(draw_timings, ms(started)));
         }
@@ -576,7 +585,9 @@ impl Browser {
     /// Carries out what was asked of time, then runs the game's frame if
     /// one runs now: Some(whether the game asked to exit) if it did.
     async fn step(&mut self) -> Result<Option<bool>> {
-        if let Some(update) = self.development.as_ref().and_then(Development::take_update) {
+        if !cfg!(feature = "compact")
+            && let Some(update) = self.development.as_ref().and_then(Development::take_update)
+        {
             self.reload(update).await;
         }
         self.arrivals().await;
@@ -1123,7 +1134,7 @@ impl Browser {
         }
         self.screen.renderer.preload(&self.catalog);
         self.screen.renderer.reload_all();
-        self.screen.overlay.reload_all();
+        self.screen.reload_overlay();
         self.audio.reload();
     }
 
@@ -1161,7 +1172,7 @@ impl Browser {
             hooks.drawn([
                 self.timeline.position().to_string(),
                 format!("msaa={} scale={}", quality.msaa, quality.scale),
-                format!("game={} tools={}", self.screen.renderer.pending(), self.screen.overlay.pending()),
+                format!("game={} tools={}", self.screen.renderer.pending(), self.screen.overlay_pending()),
                 self.screen.busy().to_string(),
                 format!("{:016x}", self.game.packet_hash()),
             ])?;
@@ -1376,7 +1387,7 @@ impl devtools::Host for Browser {
     /// Has `pen web` write the game's tuned values into the checkout as
     /// the defaults; the log says how it went. A static export cannot.
     async fn bake(&mut self) -> Answer {
-        if self.development.is_none() {
+        if cfg!(feature = "compact") || self.development.is_none() {
             return Answer::unavailable();
         }
         let Some(saved) = devtools::Host::snapshot(self).await else { return Answer::unavailable() };

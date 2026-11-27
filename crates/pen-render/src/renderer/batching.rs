@@ -273,6 +273,7 @@ impl State {
             self.draw_uniform = uniform_buffer(&self.device, "draws", self.capacity as u64 * self.stride);
             self.groups.clear();
             self.uniform_data = vec![0.0; self.capacity * (self.stride / 4) as usize];
+            self.draw_uniform_uploads.invalidate();
         }
         Ok(())
     }
@@ -1031,17 +1032,7 @@ impl State {
                 });
             }
         }
-        let item_count = scratch.items.len();
-        if item_count > self.capacity {
-            self.capacity = item_count.next_power_of_two();
-            ensure!(
-                self.capacity as u64 * self.stride <= self.device.limits().max_buffer_size,
-                "draw list exceeds device buffer size"
-            );
-            self.draw_uniform = uniform_buffer(&self.device, "draws", self.capacity as u64 * self.stride);
-            self.groups.clear();
-            self.uniform_data = vec![0.0; self.capacity * (self.stride / 4) as usize];
-        }
+        self.grow_draw_uniforms(scratch.items.len())?;
         Ok(())
     }
 
@@ -1406,11 +1397,14 @@ impl State {
         self.morphing.upload(&self.device, &self.queue);
         let ready_count = scratch.ready.len();
         if ready_count > 0 {
-            self.queue.write_buffer(
-                &self.draw_uniform,
-                0,
-                bytemuck::cast_slice(&self.uniform_data[..ready_count * floats]),
-            );
+            let current = &self.uniform_data[..ready_count * floats];
+            for range in self.draw_uniform_uploads.changed_strided(current, floats) {
+                self.queue.write_buffer(
+                    &self.draw_uniform,
+                    range.start as u64 * 4,
+                    bytemuck::cast_slice(&current[range.clone()]),
+                );
+            }
         }
         Ok(())
     }

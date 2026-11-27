@@ -4,7 +4,6 @@
 use std::ops::Range;
 
 const LANES: usize = 20;
-const MERGE_GAP: usize = LANES * 4;
 const MAX_WRITES: usize = 32;
 
 #[derive(Default)]
@@ -19,27 +18,33 @@ impl Uploads {
     }
 
     pub(super) fn changed(&mut self, current: &[f32]) -> &[Range<usize>] {
-        assert_eq!(current.len() % LANES, 0);
+        self.changed_strided(current, LANES)
+    }
+
+    pub(super) fn changed_strided(&mut self, current: &[f32], stride_words: usize) -> &[Range<usize>] {
+        debug_assert!(stride_words > 0);
+        assert_eq!(current.len() % stride_words, 0);
         let words: &[u32] = bytemuck::cast_slice(current);
+        let merge_gap = stride_words * 4;
         self.ranges.clear();
         let common = words.len().min(self.previous.len());
-        for (instance, values) in words[..common].as_chunks::<LANES>().0.iter().enumerate() {
-            let start = instance * LANES;
-            let end = start + LANES;
-            if values == &self.previous[start..end] {
-                continue;
+        let mut start = 0;
+        while start < common {
+            let end = start + stride_words;
+            if words[start..end] != self.previous[start..end] {
+                if let Some(last) = self.ranges.last_mut()
+                    && start - last.end <= merge_gap
+                {
+                    last.end = end;
+                } else {
+                    self.ranges.push(start..end);
+                }
             }
-            if let Some(last) = self.ranges.last_mut()
-                && start - last.end <= MERGE_GAP
-            {
-                last.end = end;
-            } else {
-                self.ranges.push(start..end);
-            }
+            start = end;
         }
         if words.len() > common {
             if let Some(last) = self.ranges.last_mut()
-                && common - last.end <= MERGE_GAP
+                && common - last.end <= merge_gap
             {
                 last.end = words.len();
             } else {
@@ -116,5 +121,22 @@ mod tests {
             current[index * LANES] = 1.0;
         }
         assert_eq!(apply(&mut uploads, &mut gpu, &current), (1, current.len() * 4));
+    }
+
+    #[test]
+    fn strided_uniform_uploads_skip_unchanged_slots() {
+        const STRIDE: usize = 256;
+        let mut uploads = Uploads::default();
+        let mut current = vec![0.0f32; STRIDE * 8];
+        for slot in 0..8 {
+            current[slot * STRIDE] = slot as f32;
+        }
+        let first = uploads.changed_strided(&current, STRIDE);
+        assert_eq!(first, &[0..STRIDE * 8]);
+        assert!(uploads.changed_strided(&current, STRIDE).is_empty());
+        current[5 * STRIDE + 17] = 42.0;
+        let second = uploads.changed_strided(&current, STRIDE);
+        assert_eq!(second, &[5 * STRIDE..6 * STRIDE]);
+        assert!(uploads.changed_strided(&current, STRIDE).is_empty());
     }
 }

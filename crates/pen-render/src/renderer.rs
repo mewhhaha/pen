@@ -892,6 +892,7 @@ pub(crate) struct State {
     capacity: usize,
     draw_uniform: wgpu::Buffer,
     uniform_data: Vec<f32>,
+    draw_uniform_uploads: instance_upload::Uploads,
     // Draw bind groups by their three textures' views and their sampler, and
     // the frame that last drew with each.
     groups: HashMap<([u64; 3], i32), (wgpu::BindGroup, u64)>,
@@ -1320,6 +1321,7 @@ impl State {
             capacity: 1,
             draw_uniform: uniform_buffer(&device, "draws", stride),
             uniform_data: vec![0.0; (stride / 4) as usize],
+            draw_uniform_uploads: instance_upload::Uploads::default(),
             groups: HashMap::new(),
             instance_capacity: 1,
             gpu_instance_base: 0,

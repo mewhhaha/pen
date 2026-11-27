@@ -354,23 +354,67 @@ pub(super) fn determinant4_of(matrix: &Matrix) -> Result<f64> {
 }
 
 pub(super) fn normal_matrix(matrix: &Matrix) -> Result<[f32; 16]> {
-    let m = matrix.map(f64::from);
-    let (a, b, c) = (m[0], m[1], m[2]);
-    let (d, e, f) = (m[4], m[5], m[6]);
-    let (g, h, i) = (m[8], m[9], m[10]);
-    let determinant = determinant_of(matrix)?;
+    // Fast path for orthogonal / uniform-scale transforms (rotations, translations,
+    // reflections, and uniform scaling): M^T M = s^2 I => (M^-1)^T = (1 / s^2) M.
+    let (a0, a1, a2) = (matrix[0], matrix[1], matrix[2]);
+    let (b0, b1, b2) = (matrix[4], matrix[5], matrix[6]);
+    let (c0, c1, c2) = (matrix[8], matrix[9], matrix[10]);
+    let s2_a = a0 * a0 + a1 * a1 + a2 * a2;
+    let s2_b = b0 * b0 + b1 * b1 + b2 * b2;
+    let s2_c = c0 * c0 + c1 * c1 + c2 * c2;
+    if s2_a.is_finite() && (1e-7..=1e12).contains(&s2_a) {
+        let tol = 1e-5 * s2_a;
+        let ab = a0 * b0 + a1 * b1 + a2 * b2;
+        let ac = a0 * c0 + a1 * c1 + a2 * c2;
+        let bc = b0 * c0 + b1 * c1 + b2 * c2;
+        if (s2_b - s2_a).abs() <= tol
+            && (s2_c - s2_a).abs() <= tol
+            && ab.abs() <= tol
+            && ac.abs() <= tol
+            && bc.abs() <= tol
+        {
+            if (s2_a - 1.0).abs() <= 1e-6 {
+                return Ok([a0, a1, a2, 0.0, b0, b1, b2, 0.0, c0, c1, c2, 0.0, 0.0, 0.0, 0.0, 1.0]);
+            }
+            let inv_s2 = 1.0 / s2_a;
+            return Ok([
+                a0 * inv_s2,
+                a1 * inv_s2,
+                a2 * inv_s2,
+                0.0,
+                b0 * inv_s2,
+                b1 * inv_s2,
+                b2 * inv_s2,
+                0.0,
+                c0 * inv_s2,
+                c1 * inv_s2,
+                c2 * inv_s2,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                1.0,
+            ]);
+        }
+    }
+    let (a, b, c) = (f64::from(a0), f64::from(a1), f64::from(a2));
+    let (d, e, f) = (f64::from(b0), f64::from(b1), f64::from(b2));
+    let (g, h, i) = (f64::from(c0), f64::from(c1), f64::from(c2));
+    let determinant = a * (e * i - f * h) - d * (b * i - c * h) + g * (b * f - c * e);
+    ensure!(determinant.is_finite() && determinant.abs() >= 1e-12, "draw transform must be invertible");
+    let inv_det = 1.0 / determinant;
     Ok([
-        (e * i - f * h) / determinant,
-        (f * g - d * i) / determinant,
-        (d * h - e * g) / determinant,
+        (e * i - f * h) * inv_det,
+        (f * g - d * i) * inv_det,
+        (d * h - e * g) * inv_det,
         0.0,
-        (c * h - b * i) / determinant,
-        (a * i - c * g) / determinant,
-        (b * g - a * h) / determinant,
+        (c * h - b * i) * inv_det,
+        (a * i - c * g) * inv_det,
+        (b * g - a * h) * inv_det,
         0.0,
-        (b * f - c * e) / determinant,
-        (c * d - a * f) / determinant,
-        (a * e - b * d) / determinant,
+        (b * f - c * e) * inv_det,
+        (c * d - a * f) * inv_det,
+        (a * e - b * d) * inv_det,
         0.0,
         0.0,
         0.0,
@@ -503,4 +547,61 @@ fn validate_fog(frame: &RenderFrame) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reference_normal_matrix(matrix: &Matrix) -> [f32; 16] {
+        let m = matrix.map(f64::from);
+        let (a, b, c) = (m[0], m[1], m[2]);
+        let (d, e, f) = (m[4], m[5], m[6]);
+        let (g, h, i) = (m[8], m[9], m[10]);
+        let det = a * (e * i - f * h) - d * (b * i - c * h) + g * (b * f - c * e);
+        [
+            (e * i - f * h) / det,
+            (f * g - d * i) / det,
+            (d * h - e * g) / det,
+            0.0,
+            (c * h - b * i) / det,
+            (a * i - c * g) / det,
+            (b * g - a * h) / det,
+            0.0,
+            (b * f - c * e) / det,
+            (c * d - a * f) / det,
+            (a * e - b * d) / det,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+        ]
+        .map(narrow)
+    }
+
+    #[test]
+    fn normal_matrix_fast_path_matches_exact_inverse_transpose() {
+        let angle = 0.73f32;
+        let (s, c) = angle.sin_cos();
+        let cases: [Matrix; 5] = [
+            // Identity + translation
+            [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 3.0, -4.0, 5.0, 1.0],
+            // Pure rotation around Z + translation
+            [c, s, 0.0, 0.0, -s, c, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 1.0, 2.0, 3.0, 1.0],
+            // Uniform scale * rotation
+            [2.5 * c, 2.5 * s, 0.0, 0.0, -2.5 * s, 2.5 * c, 0.0, 0.0, 0.0, 0.0, 2.5, 0.0, 0.0, 0.0, 0.0, 1.0],
+            // Mirrored uniform scale (negative determinant)
+            [-2.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+            // Non-uniform scale + shear (fallback path)
+            [2.0, 0.5, 0.0, 0.0, 0.0, 0.75, -0.25, 0.0, 0.1, 0.0, 3.0, 0.0, 4.0, 5.0, 6.0, 1.0],
+        ];
+        for m in cases {
+            let got = normal_matrix(&m).unwrap();
+            let want = reference_normal_matrix(&m);
+            for (g, w) in got.iter().zip(want.iter()) {
+                assert!((g - w).abs() < 1e-5, "mismatch: got {got:?}, want {want:?}");
+            }
+        }
+    }
 }

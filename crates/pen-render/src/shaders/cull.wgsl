@@ -1,10 +1,10 @@
-// Instanced batches culled on the GPU: one invocation per instance of each
-// batch (the dispatch's y) tests the batch's bounding sphere, placed by the
-// instance's transform, against each view the frame draws, picks its level
-// of detail from the camera's distance, and appends it to the instances its
-// batch draws in each view that sees it at that level, counting it into
-// that draw's indirect arguments. The renderer's culling.rs does the same
-// on the CPU for smaller batches.
+// Instanced batches culled on the GPU: a flattened 1D dispatch (one invocation
+// per instance across all batches) maps each invocation to its batch by binary
+// search on `Batch.start_index`, tests the batch's bounding sphere against each
+// active view bit in `batch.views`, picks its level of detail from camera
+// distance, and appends it into the compacted active-view output and indirect
+// draw slots. The renderer's culling.rs does the same on the CPU for smaller
+// batches.
 struct Instance {
   x: vec4f,
   y: vec4f,
@@ -21,14 +21,15 @@ struct Batch {
   // Its instances in `instances`.
   first: u32,
   count: u32,
-  // The views it may be drawn in, a bit each, and its levels of detail.
+  // Active view bitmask (already masked to `cull.views`), and levels of detail.
   views: u32,
   levels: u32,
-  // Where its culled instances go, `count` for each view and level, and
-  // its first draw's arguments, one for each view and level.
+  // Where its culled instances go (`count` per active view and level), and its
+  // first draw's arguments (one per active view and level).
   out: u32,
   draws: u32,
-  unused0: u32,
+  // Exclusive prefix sum of prior batches' `count` values for 1D dispatch lookup.
+  start_index: u32,
   unused1: u32,
 };
 
@@ -47,6 +48,8 @@ struct Cull {
   // Prior-frame Hi-Z occlusion culling: enabled flag and pyramid mip count.
   hiz_enabled: u32,
   hiz_mips: u32,
+  // (batch_count, total_instances, row_stride, 0) for flattened 1D/2D dispatch.
+  dispatch: vec4u,
   // The camera's view-projection row that gives a point's w.
   row: vec4f,
   // (width, height, 1/width, 1/height) of mip 0 of `hiz`.
@@ -133,11 +136,23 @@ fn occluded(center: vec3f, radius: f32) -> bool {
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) id: vec3u) {
-  let batch = batches[id.y];
-  if (id.x >= batch.count) {
+  let global_idx = id.y * cull.dispatch.z + id.x;
+  if (global_idx >= cull.dispatch.y) {
     return;
   }
-  let instance = instances[batch.first + id.x];
+  var lo = 0u;
+  var hi = cull.dispatch.x;
+  while (lo + 1u < hi) {
+    let mid = (lo + hi) >> 1u;
+    if (batches[mid].start_index <= global_idx) {
+      lo = mid;
+    } else {
+      hi = mid;
+    }
+  }
+  let batch = batches[lo];
+  let local_idx = global_idx - batch.start_index;
+  let instance = instances[batch.first + local_idx];
   let model = mat4x4f(instance.x, instance.y, instance.z, instance.w);
   let center = (model * vec4f(batch.sphere.xyz, 1.0)).xyz;
   // How much the transform stretches the sphere (culling.rs's `stretch`).
@@ -165,14 +180,20 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
       }
     }
   }
-  for (var view = 0u; view < cull.views; view++) {
-    if ((batch.views & (1u << view)) == 0u || !sees(view, center, radius)) {
+  var mask = batch.views;
+  var compact_view = 0u;
+  while (mask != 0u) {
+    let view = countTrailingZeros(mask);
+    mask &= mask - 1u;
+    let draw_view = compact_view;
+    compact_view += 1u;
+    if (!sees(view, center, radius)) {
       continue;
     }
     if (view == 0u && occluded(center, radius)) {
       continue;
     }
-    let draw = view * batch.levels + level;
+    let draw = draw_view * batch.levels + level;
     let slot = atomicAdd(&draws[batch.draws + draw].instance_count, 1u);
     culled[batch.out + draw * batch.count + slot] = instance;
   }
